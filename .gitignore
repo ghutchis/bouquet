@@ -1,3 +1,6 @@
 __pycache__
 gfnff_*
 solutions/*
+# pixi environments
+.pixi/*
+!.pixi/config.toml
