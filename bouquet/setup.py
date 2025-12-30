@@ -7,6 +7,7 @@ import logging
 import os
 
 from ase.io.xyz import read_xyz
+from ase.io import read
 from ase import Atoms
 from openbabel import openbabel as ob
 from openbabel import pybel
@@ -36,12 +37,39 @@ def get_initial_structure_from_file(filename: str) -> Tuple[Atoms, pybel.Molecul
 
     return atoms, mol
 
+
+def get_conformers_from_file(filename: str) -> List[Atoms]:
+    """Read multiple conformers from a file
+
+    Args:
+        filename: Path to a file containing multiple structures (e.g., XYZ with multiple frames)
+    Returns:
+        List of Atoms objects, one for each conformer
+    """
+    extension = os.path.splitext(filename)[1][1:]
+    conformers = []
+
+    if extension == 'xyz':
+        # Use ASE's read function which can handle multi-frame XYZ
+        conformers = read(filename, index=':', format='xyz')
+    else:
+        # For other formats, use pybel
+        for mol in pybel.readfile(extension, filename):
+            atoms = next(read_xyz(StringIO(mol.write('xyz')), slice(None)))
+            atoms.charge = mol.charge
+            atoms.set_initial_charges([a.formalcharge for a in mol.atoms])
+            conformers.append(atoms)
+
+    logger.info(f'Read {len(conformers)} conformers from {filename}')
+    return conformers
+
+
 def get_initial_structure(smiles: str) -> Tuple[Atoms, pybel.Molecule]:
     """Generate an initial guess for a molecular structure
-    
+
     Args:
         smiles: SMILES string
-    Returns: 
+    Returns:
         Generate an Atoms object and a pybel Molecule
     """
 
@@ -68,7 +96,7 @@ def get_initial_structure(smiles: str) -> Tuple[Atoms, pybel.Molecule]:
     atoms = next(read_xyz(StringIO(mol.write('xyz')), slice(None)))
     atoms.charge = mol.charge
     atoms.set_initial_charges([a.formalcharge for a in mol.atoms])
-        
+
     return atoms, mol
 
 
@@ -93,18 +121,18 @@ class DihedralInfo:
 
 def detect_dihedrals(mol: pybel.Molecule) -> List[DihedralInfo]:
     """Detect the bonds to be treated as rotors.
-    
-    We use the more generous definition from RDKit: 
+
+    We use the more generous definition from RDKit:
     https://github.com/rdkit/rdkit/blob/1bf6ef3d65f5c7b06b56862b3fb9116a3839b229/rdkit/Chem/Lipinski.py#L47%3E
-    
+
     It matches pairs of atoms that are connected by a single bond,
     both bonds have at least one other bond that is not a triple bond
     and they are not part of the same ring.
-    
+
     Args:
         mol: Molecule to assess
     Returns:
-        List of dihedral angles. Most are defined 
+        List of dihedral angles. Most are defined
     """
     dihedrals = []
 
@@ -112,7 +140,7 @@ def detect_dihedrals(mol: pybel.Molecule) -> List[DihedralInfo]:
     g = get_bonding_graph(mol)
 
     # Get the indices of backbond atoms
-    backbone = set(i for i, d in g.nodes(data=True) if d['z'] > 1)
+    backbone = {i for i, d in g.nodes(data=True) if d['z'] > 1}
 
     # Step 1: Get the bonds from a simple matching
     smarts = pybel.Smarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
@@ -123,10 +151,10 @@ def detect_dihedrals(mol: pybel.Molecule) -> List[DihedralInfo]:
 
 def get_bonding_graph(mol: pybel.Molecule) -> nx.Graph:
     """Generate a bonding graph from a molecule
-    
+
     Args:
         mol: Molecule to be assessed
-    Returns: 
+    Returns:
         Graph describing the connectivity
     """
 
@@ -145,13 +173,13 @@ def get_bonding_graph(mol: pybel.Molecule) -> nx.Graph:
 def get_dihedral_info(graph: nx.Graph, bond: Tuple[int, int], backbone_atoms: Set[int]) -> DihedralInfo:
     """For a rotatable bond in a model, get the atoms which define the dihedral angle
     and the atoms that should rotate along with the right half of the molecule
-    
+
     Args:
         graph: Bond graph of the molecule
         bond: Left and right indicies of the bond, respectively
         backbone_atoms: List of atoms defined as part of the backbone
     Returns:
-        - Atom indices defining the dihedral. Last atom is the one that will be moved 
+        - Atom indices defining the dihedral. Last atom is the one that will be moved
           by ase's "set_dihedral" function
         - List of atoms being rotated along with set_dihedral
     """
