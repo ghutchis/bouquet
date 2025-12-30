@@ -84,21 +84,24 @@ def select_next_points_botorch(observed_X: List[List[float]], observed_y: List[f
     return candidate.detach().numpy()[0, :]
 
 
-def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int, 
+def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
                      calc: Calculator, relaxCalc: Calculator,
                      init_steps: int, out_dir: Optional[Path], relax: bool = True,
-                     seed: int = 0) -> Atoms:
+                     seed: int = 0, initial_conformers: Optional[List[Atoms]] = None) -> Atoms:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles
 
     Args:
         atoms: Atoms object with the initial geometry
         dihedrals: List of dihedral angles to modify
         n_steps: Number of optimization steps to perform
-        init_steps: Number of initial guesses to evaluate
+        init_steps: Number of initial guesses to evaluate (ignored if initial_conformers provided)
         calc: Calculator to pick the energy
+        relaxCalc: Calculator used for geometry relaxation
         out_dir: Output path for logging information
         relax: Whether to relax non-dihedral degrees of freedom each step
         seed: Random seed to use for initial sampling
+        initial_conformers: Optional list of conformer structures to use as initial guesses
+                           instead of random sampling
     Returns:
         (Atoms) optimized geometry
     """
@@ -138,17 +141,40 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
                 simple_write_xyz(fp, [atoms], comment=f'\t{energy}')
         add_entry(start_coords, start_atoms, start_energy)
 
-    # Make some initial guesses
-    rng = np.random.default_rng(seed)
-    init_guesses = rng.normal(start_coords, 90, size=(init_steps, len(dihedrals)))
-    init_energies = []
-    for i, guess in enumerate(init_guesses):
-        energy, cur_atoms = evaluate_energy(guess, start_atoms, dihedrals, calc, relaxCalc, relax)
-        init_energies.append(energy - start_energy)
-        logger.info(f'Evaluated initial guess {i+1}/{init_steps}. Energy-E0: {energy-start_energy}')
+    # Make initial guesses - either from provided conformers or random
+    if initial_conformers is not None:
+        logger.info(f'Using {len(initial_conformers)} provided conformers as initial guesses')
+        init_guesses = []
+        init_energies = []
 
-        if out_dir is not None:
-            add_entry(guess, cur_atoms, energy)
+        for i, conformer in enumerate(initial_conformers):
+            # Extract dihedral angles from this conformer
+            guess = np.array([d.get_angle(conformer) for d in dihedrals])
+            init_guesses.append(guess)
+
+            # Evaluate the energy
+            energy, cur_atoms = evaluate_energy(guess, start_atoms, dihedrals, calc, relaxCalc, relax)
+            init_energies.append(energy - start_energy)
+            logger.info(f'Evaluated conformer {i+1}/{len(initial_conformers)}. Energy-E0: {energy-start_energy}')
+
+            if out_dir is not None:
+                add_entry(guess, cur_atoms, energy)
+
+        init_guesses = np.array(init_guesses)
+    else:
+        # Random sampling (original behavior)
+        logger.info(f'Generating {init_steps} random initial guesses')
+        rng = np.random.default_rng(seed)
+        init_guesses = rng.normal(start_coords, 90, size=(init_steps, len(dihedrals)))
+        init_energies = []
+
+        for i, guess in enumerate(init_guesses):
+            energy, cur_atoms = evaluate_energy(guess, start_atoms, dihedrals, calc, relaxCalc, relax)
+            init_energies.append(energy - start_energy)
+            logger.info(f'Evaluated initial guess {i+1}/{init_steps}. Energy-E0: {energy-start_energy}')
+
+            if out_dir is not None:
+                add_entry(guess, cur_atoms, energy)
 
     # Save the initial guesses
     observed_coords = np.array([start_coords, *init_guesses.tolist()])

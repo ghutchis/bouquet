@@ -10,7 +10,12 @@ from datetime import datetime
 import numpy as np
 from ase.io.xyz import simple_write_xyz
 
-from bouquet.setup import *
+from bouquet.setup import (
+    get_initial_structure,
+    get_initial_structure_from_file,
+    get_conformers_from_file,
+    detect_dihedrals,
+)
 from bouquet.solver import run_optimization
 
 logger = logging.getLogger('bouquet')
@@ -24,12 +29,15 @@ if __name__ == "__main__":
                         help='SMILES string of molecule to optimize')
     parser.add_argument('--file', type=str,
                         help='File containing the structure to optimize')
-    parser.add_argument('--auto', action='store_true', 
+    parser.add_argument('--conformer-file', type=str,
+                        help='File containing multiple conformers to use as initial guesses '
+                             '(instead of random sampling). Overrides --init-steps.')
+    parser.add_argument('--auto', action='store_true',
                         help='Set the number of steps based on the number of dihedrals')
     parser.add_argument('--num-steps', type=int, default=32,
                         help='Number of optimization steps to take')
     parser.add_argument('--init-steps', type=int, default=5,
-                        help='Number of initial guesses to make')
+                        help='Number of initial guesses to make (ignored if --conformer-file is provided)')
     parser.add_argument('--energy', choices=['ani', 'b3lyp', 'b97',
                         'gfn0', 'gfn2', 'gfnff'], default='gfn2', help='Energy method')
     parser.add_argument('--optimizer', choices=['ani', 'b3lyp', 'b97',
@@ -78,20 +86,34 @@ if __name__ == "__main__":
     dihedrals = detect_dihedrals(mol)
     logger.info(f'Detected {len(dihedrals)} dihedral angles')
 
+    # Load conformers if provided
+    initial_conformers = None
+    if args.conformer_file is not None:
+        initial_conformers = get_conformers_from_file(args.conformer_file)
+        logger.info(f'Loaded {len(initial_conformers)} conformers from {args.conformer_file}')
+        # Validate that conformers have the same number of atoms
+        for i, conf in enumerate(initial_conformers):
+            if len(conf) != len(init_atoms):
+                raise ValueError(f'Conformer {i} has {len(conf)} atoms, expected {len(init_atoms)}')
+
     # check if we should auto-set the number of steps
     if args.auto:
+        # Determine total steps based on dihedral count
         if len(dihedrals) <= 3:
-            # 25 total counting the initial random choices
-            args.num_steps = 25 - args.init_steps
+            total = 25
         elif len(dihedrals) <= 5:
-            # 50 total counting the initial random choices
-            args.num_steps = 50 - args.init_steps
+            total = 50
         elif len(dihedrals) <= 7:
-            # 100 total counting the initial random choices
-            args.num_steps = 100 - args.init_steps
+            total = 100
         else:
-            # 200 total counting the initial random choices
-            args.num_steps = 200 - args.init_steps
+            total = 200
+
+        # Subtract initial evaluations from the total
+        if initial_conformers is not None:
+            initial_count = len(initial_conformers)
+        else:
+            initial_count = args.init_steps
+        args.num_steps = max(0, total - initial_count)
 
     # Save the initial guess
     with out_dir.joinpath('initial.xyz').open('w') as fp:
@@ -120,7 +142,7 @@ if __name__ == "__main__":
                     num_threads=4, multiplicity=1, charge=0)
     else:
         raise ValueError(f'Unrecognized QC method: {args.energy}')
-    
+
     # default to using the same method for relaxation
     relaxCalc = calc
     if args.optimizer == 'ani':
@@ -146,8 +168,9 @@ if __name__ == "__main__":
     else:
         raise ValueError(f'Unrecognized QC method: {args.optimizer}')
 
-    final_atoms = run_optimization(init_atoms, dihedrals, args.num_steps, calc, relaxCalc, args.init_steps,
-                                   out_dir, relax=args.relax)
+    final_atoms = run_optimization(init_atoms, dihedrals, args.num_steps, calc, relaxCalc,
+                                   args.init_steps, out_dir, relax=args.relax, seed=args.seed,
+                                   initial_conformers=initial_conformers)
 
     # Save the final structure
     with out_dir.joinpath('final.xyz').open('w') as fp:
