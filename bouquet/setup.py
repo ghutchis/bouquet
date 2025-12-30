@@ -49,9 +49,17 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
     extension = os.path.splitext(filename)[1][1:]
     conformers = []
 
-    if extension == 'xyz':
+    # Make sure the file exists
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Conformer file not found: {filename}")
+
+    if extension.lower() == 'xyz':
         # Use ASE's read function which can handle multi-frame XYZ
         conformers = read(filename, index=':', format='xyz')
+        # XYZ files don't contain charge info, default to neutral
+        for atoms in conformers:
+            atoms.charge = 0
+            atoms.set_initial_charges([0] * len(atoms))
     else:
         # For other formats, use pybel
         for mol in pybel.readfile(extension, filename):
@@ -59,6 +67,10 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
             atoms.charge = mol.charge
             atoms.set_initial_charges([a.formalcharge for a in mol.atoms])
             conformers.append(atoms)
+
+    # Make sure we found something
+    if len(conformers) == 0:
+        raise ValueError(f"No conformers found in file: {filename}")
 
     logger.info(f'Read {len(conformers)} conformers from {filename}')
     return conformers

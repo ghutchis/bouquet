@@ -10,7 +10,12 @@ from datetime import datetime
 import numpy as np
 from ase.io.xyz import simple_write_xyz
 
-from bouquet.setup import *
+from bouquet.setup import (
+    get_initial_structure,
+    get_initial_structure_from_file,
+    get_conformers_from_file,
+    detect_dihedrals,
+)
 from bouquet.solver import run_optimization
 
 logger = logging.getLogger('bouquet')
@@ -93,30 +98,22 @@ if __name__ == "__main__":
 
     # check if we should auto-set the number of steps
     if args.auto:
+        # Determine total steps based on dihedral count
         if len(dihedrals) <= 3:
-            # 25 total counting the initial random choices/conformers
-            if initial_conformers is not None:
-                args.num_steps = max(0, 25 - len(initial_conformers))
-            else:
-                args.num_steps = 25 - args.init_steps
+            total = 25
         elif len(dihedrals) <= 5:
-            # 50 total counting the initial random choices/conformers
-            if initial_conformers is not None:
-                args.num_steps = max(0, 50 - len(initial_conformers))
-            else:
-                args.num_steps = 50 - args.init_steps
+            total = 50
         elif len(dihedrals) <= 7:
-            # 100 total counting the initial random choices/conformers
-            if initial_conformers is not None:
-                args.num_steps = max(0, 100 - len(initial_conformers))
-            else:
-                args.num_steps = 100 - args.init_steps
+            total = 100
         else:
-            # 200 total counting the initial random choices/conformers
-            if initial_conformers is not None:
-                args.num_steps = max(0, 200 - len(initial_conformers))
-            else:
-                args.num_steps = 200 - args.init_steps
+            total = 200
+
+        # Subtract initial evaluations from the total
+        if initial_conformers is not None:
+            initial_count = len(initial_conformers)
+        else:
+            initial_count = args.init_steps
+        args.num_steps = max(0, total - initial_count)
 
     # Save the initial guess
     with out_dir.joinpath('initial.xyz').open('w') as fp:
