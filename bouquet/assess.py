@@ -1,19 +1,26 @@
 """Tools for computing the energy of a molecule"""
-from typing import List, Tuple, Union
-import os
 
+import os
+from typing import List, Tuple, Union
+
+import numpy as np
+from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.constraints import FixInternals
 from ase.optimize import LBFGS
-from ase import Atoms
-import numpy as np
 
+from bouquet.constants import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS
 from bouquet.setup import DihedralInfo
 
 
-def evaluate_energy(angles: Union[List[float], np.ndarray], atoms: Atoms,
-                    dihedrals: List[DihedralInfo], calc: Calculator,
-                    relaxCalc: Calculator, relax: bool = True) -> Tuple[float, Atoms]:
+def evaluate_energy(
+    angles: Union[List[float], np.ndarray],
+    atoms: Atoms,
+    dihedrals: List[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    relax: bool = True,
+) -> Tuple[float, Atoms]:
     """Compute the energy of a molecule given dihedral angles
 
     Args:
@@ -36,7 +43,7 @@ def evaluate_energy(angles: Union[List[float], np.ndarray], atoms: Atoms,
 
         # Define the constraints
         dih_cnsts.append((a, di.chain))
-        
+
     # If not relaxed, just compute the energy
     if not relax:
         return calc.get_potential_energy(atoms), atoms
@@ -46,12 +53,12 @@ def evaluate_energy(angles: Union[List[float], np.ndarray], atoms: Atoms,
     atoms.set_constraint(FixInternals(dihedrals_deg=dih_cnsts))
 
     # A quick relaxation to get the structure in the right ballpark
-    return relax_structure(atoms, relaxCalc, 50)
+    return relax_structure(atoms, relaxCalc, DEFAULT_RELAXATION_STEPS)
 
 
 def relax_structure(atoms: Atoms, calc: Calculator, steps: int) -> Tuple[float, Atoms]:
     """Relax and return the energy of the ground state
-    
+
     Args:
         atoms: Atoms object to be optimized
         calc: Calculator used to compute energy/gradients
@@ -65,10 +72,10 @@ def relax_structure(atoms: Atoms, calc: Calculator, steps: int) -> Tuple[float, 
     try:
         dyn = LBFGS(atoms, logfile=os.devnull)
         if steps is not None:
-            dyn.run(fmax=1e-3, steps=steps)
+            dyn.run(fmax=DEFAULT_FMAX, steps=steps)
         else:
-            dyn.run(fmax=1e-3)
-    except ValueError: # LBFGS failed to converge, probably high energy
+            dyn.run(fmax=DEFAULT_FMAX)
+    except ValueError:  # LBFGS failed to converge, probably high energy
         pass
 
     return atoms.get_potential_energy(), atoms

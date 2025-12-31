@@ -1,34 +1,40 @@
 """Methods for solving the conformer option problem"""
 import logging
+import warnings
 from csv import DictWriter
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import List, Optional
 
+import botorch
+import numpy as np
+import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.io.xyz import simple_write_xyz
-import torch
-
-import botorch
-from botorch.optim import optimize_acqf
 from botorch.acquisition.analytic import *
-from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
+from botorch.models import SingleTaskGP
+from botorch.optim import optimize_acqf
 from botorch.utils import standardize
-from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch import kernels as gpykernels
+from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import NormalPrior
 
-import numpy as np
-
-import warnings
 warnings.filterwarnings("ignore")
 
 from bouquet.assess import evaluate_energy, relax_structure
+from bouquet.constants import (
+    ACQ_NUM_RESTARTS,
+    ACQ_RAW_SAMPLES,
+    DEFAULT_RELAXATION_STEPS,
+    ENERGY_CLIP_OFFSET,
+    GP_PERIOD_LENGTH_MEAN,
+    GP_PERIOD_LENGTH_STD,
+    INITIAL_GUESS_STD,
+)
 from bouquet.setup import DihedralInfo
-
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +68,7 @@ def select_next_points_botorch(observed_X: List[List[float]], observed_y: List[f
     gp = SingleTaskGP(train_X, train_y,
         covar_module=gpykernels.ScaleKernel(gpykernels.ProductStructureKernel(
         num_dims=train_X.shape[1],
-        base_kernel=gpykernels.PeriodicKernel(period_length_prior=NormalPrior(360, 0.1))
+        base_kernel=gpykernels.PeriodicKernel(period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD))
     )))
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=device)
     fit_gpytorch_mll(mll)
@@ -79,7 +85,7 @@ def select_next_points_botorch(observed_X: List[List[float]], observed_y: List[f
     bounds = torch.zeros(2, train_X.shape[1])
     bounds[1, :] = 360
     candidate, acq_value = optimize_acqf(
-        ei, bounds=bounds, q=1, num_restarts=64, raw_samples=64
+        ei, bounds=bounds, q=1, num_restarts=ACQ_NUM_RESTARTS, raw_samples=ACQ_RAW_SAMPLES
     )
     return candidate.detach().numpy()[0, :]
 
@@ -107,7 +113,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
     """
     # Perform an initial relaxation
     logger.info('Initial relaxation')
-    _, init_atoms = relax_structure(atoms, calc, 50)
+    _, init_atoms = relax_structure(atoms, calc, DEFAULT_RELAXATION_STEPS)
     if out_dir is not None:
         with open(out_dir.joinpath('relaxed.xyz'), 'w') as fp:
             simple_write_xyz(fp, [init_atoms])
@@ -165,7 +171,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
         # Random sampling (original behavior)
         logger.info(f'Generating {init_steps} random initial guesses')
         rng = np.random.default_rng(seed)
-        init_guesses = rng.normal(start_coords, 90, size=(init_steps, len(dihedrals)))
+        init_guesses = rng.normal(start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals)))
         init_energies = []
 
         for i, guess in enumerate(init_guesses):
