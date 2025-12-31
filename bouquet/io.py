@@ -109,7 +109,7 @@ def initialize_structure_log(out_dir: Path) -> Tuple[Path, Path]:
     ens_path = out_dir / "ensemble.xyz"
 
     with log_path.open("w") as fp:
-        writer = DictWriter(fp, ["time", "xyz", "energy", "ediff"])
+        writer = DictWriter(fp, ["time", "coords", "xyz", "energy", "ediff"])
         writer.writeheader()
 
     return log_path, ens_path
