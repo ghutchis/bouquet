@@ -20,7 +20,7 @@ from bouquet.solver import run_optimization
 
 logger = logging.getLogger('bouquet')
 
-if __name__ == "__main__":
+def main():
     # Parse the command line arguments
     parser = ArgumentParser()
     parser.add_argument('--seed', type=int, default=datetime.now().microsecond,
@@ -56,7 +56,7 @@ if __name__ == "__main__":
 
     # Make an output directory
     params_hash = hashlib.sha256(str(args.__dict__).encode()).hexdigest()
-    out_dir = Path(__file__).parent.joinpath(
+    out_dir = Path.cwd().joinpath(
         f'solutions/{name}-{args.seed}-{args.energy}-{params_hash[-6:]}')
     out_dir.mkdir(parents=True, exist_ok=True)
     with out_dir.joinpath('run_params.json').open('w') as fp:
@@ -176,3 +176,6 @@ if __name__ == "__main__":
     with out_dir.joinpath('final.xyz').open('w') as fp:
         simple_write_xyz(fp, [final_atoms])
     logger.info(f'Done. Files are stored in {str(out_dir)}')
+
+if __name__ == "__main__":
+    main()
