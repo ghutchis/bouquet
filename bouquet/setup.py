@@ -1,19 +1,19 @@
 """Tools for assessing the bond structure of a molecule and finding the dihedrals to move"""
 
-from typing import Tuple, Set, Dict, List
-from dataclasses import dataclass
-from io import StringIO
 import logging
 import os
-
-from ase.io.xyz import read_xyz
-from ase.io import read
-from ase import Atoms
-from openbabel import openbabel as ob
-from openbabel import pybel
+from dataclasses import dataclass
+from io import StringIO
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
 
 import networkx as nx
 import numpy as np
+from ase import Atoms
+from ase.io import read
+from ase.io.xyz import read_xyz
+from openbabel import openbabel as ob
+from openbabel import pybel
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +26,11 @@ def get_initial_structure_from_file(filename: str) -> Tuple[Atoms, pybel.Molecul
         Generate an Atoms object and a pybel Molecule
     """
 
+    filepath = Path(filename)
+
     # Make the 3D structure
-    extension = os.path.splitext(filename)[1][1:]
-    mol = next(pybel.readfile(extension, filename))
+    extension = filepath.suffix.lstrip('.')
+    mol = next(pybel.readfile(extension, str(filepath)))
 
     # Convert it to ASE
     atoms = next(read_xyz(StringIO(mol.write('xyz')), slice(None)))
@@ -46,23 +48,24 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
     Returns:
         List of Atoms objects, one for each conformer
     """
-    extension = os.path.splitext(filename)[1][1:]
     conformers = []
+    filepath = Path(filename)
+    extension = filepath.suffix.lstrip('.').lower()
 
     # Make sure the file exists
-    if not os.path.exists(filename):
-        raise FileNotFoundError(f"Conformer file not found: {filename}")
+    if not filepath.exists():
+        raise FileNotFoundError(f"Conformer file not found: {filepath}")
 
     if extension.lower() == 'xyz':
         # Use ASE's read function which can handle multi-frame XYZ
-        conformers = read(filename, index=':', format='xyz')
+        conformers = read(str(filepath), index=':', format='xyz')
         # XYZ files don't contain charge info, default to neutral
         for atoms in conformers:
             atoms.charge = 0
             atoms.set_initial_charges([0] * len(atoms))
     else:
         # For other formats, use pybel
-        for mol in pybel.readfile(extension, filename):
+        for mol in pybel.readfile(extension, str(filepath)):
             atoms = next(read_xyz(StringIO(mol.write('xyz')), slice(None)))
             atoms.charge = mol.charge
             atoms.set_initial_charges([a.formalcharge for a in mol.atoms])
@@ -70,9 +73,9 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
 
     # Make sure we found something
     if len(conformers) == 0:
-        raise ValueError(f"No conformers found in file: {filename}")
+        raise ValueError(f"No conformers found in file: {filepath}")
 
-    logger.info(f'Read {len(conformers)} conformers from {filename}')
+    logger.info(f'Read {len(conformers)} conformers from {filepath}')
     return conformers
 
 
