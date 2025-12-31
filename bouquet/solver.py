@@ -1,18 +1,13 @@
 """Methods for solving the conformer option problem"""
 import logging
 import warnings
-from csv import DictWriter
-from datetime import datetime
-from io import StringIO
 from pathlib import Path
 from typing import List, Optional
 
-import botorch
 import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
-from ase.io.xyz import simple_write_xyz
 from botorch.acquisition.analytic import *
 from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
@@ -29,11 +24,11 @@ from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_RELAXATION_STEPS,
-    ENERGY_CLIP_OFFSET,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
     INITIAL_GUESS_STD,
 )
+from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
@@ -115,8 +110,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
     logger.info('Initial relaxation')
     _, init_atoms = relax_structure(atoms, calc, DEFAULT_RELAXATION_STEPS)
     if out_dir is not None:
-        with open(out_dir.joinpath('relaxed.xyz'), 'w') as fp:
-            simple_write_xyz(fp, [init_atoms])
+        save_structure(out_dir, init_atoms, 'relaxed.xyz')
 
     # Evaluate initial point
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
@@ -124,27 +118,10 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
     logger.info(f'Computed initial energy: {start_energy}')
 
     # Begin a structure log, if output available
+    add_entry = None
     if out_dir is not None:
-        log_path = out_dir.joinpath('structures.csv')
-        ens_path = out_dir.joinpath('ensemble.xyz')
-        with log_path.open('w') as fp:
-            writer = DictWriter(fp, ['time', 'xyz', 'energy', 'ediff'])
-            writer.writeheader()
-
-        def add_entry(coords, atoms, energy):
-            with log_path.open('a') as fp:
-                writer = DictWriter(fp, ['time', 'coords', 'xyz', 'energy', 'ediff'])
-                xyz = StringIO()
-                simple_write_xyz(xyz, [atoms])
-                writer.writerow({
-                    'time': datetime.now().timestamp(),
-                    'coords': coords.tolist(),
-                    'xyz': xyz.getvalue(),
-                    'energy': energy,
-                    'ediff': energy - start_energy
-                })
-            with ens_path.open('a') as fp:
-                simple_write_xyz(fp, [atoms], comment=f'\t{energy}')
+        log_path, ens_path = initialize_structure_log(out_dir)
+        add_entry = create_structure_logger(log_path, ens_path, start_energy)
         add_entry(start_coords, start_atoms, start_energy)
 
     # Make initial guesses - either from provided conformers or random
@@ -163,7 +140,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
             init_energies.append(energy - start_energy)
             logger.info(f'Evaluated conformer {i+1}/{len(initial_conformers)}. Energy-E0: {energy-start_energy}')
 
-            if out_dir is not None:
+            if add_entry is not None:
                 add_entry(guess, cur_atoms, energy)
 
         init_guesses = np.array(init_guesses)
@@ -179,7 +156,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
             init_energies.append(energy - start_energy)
             logger.info(f'Evaluated initial guess {i+1}/{init_steps}. Energy-E0: {energy-start_energy}')
 
-            if out_dir is not None:
+            if add_entry is not None:
                 add_entry(guess, cur_atoms, energy)
 
     # Save the initial guesses
@@ -197,14 +174,14 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
         # Compute the energies of those points
         energy, cur_atoms = evaluate_energy(next_coords, start_atoms, dihedrals, calc, relaxCalc, relax)
         logger.info(f'Evaluated energy in step {step+1}/{n_steps}. Energy-E0: {energy-start_energy}')
-        if energy - start_energy < np.min(observed_energies) and out_dir is not None:
+        if energy - start_energy < np.min(observed_energies):
             best_step = step
             best_atoms = cur_atoms.copy()
-            with open(out_dir.joinpath('current_best.xyz'), 'w') as fp:
-                simple_write_xyz(fp, [cur_atoms])
+            if out_dir is not None:
+                save_structure(out_dir, cur_atoms, 'current_best.xyz')
 
         # Update the log
-        if out_dir is not None:
+        if add_entry is not None:
             add_entry(start_coords, cur_atoms, energy)
 
         # Update the search space
@@ -216,7 +193,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
     best_energy, best_atoms = evaluate_energy(best_coords, best_atoms, dihedrals, calc, relaxCalc)
     logger.info('Performed final relaxation with dihedral constraints.'
                 f'E: {best_energy}. E-E0: {best_energy - start_energy}')
-    if out_dir is not None:
+    if add_entry is not None:
         add_entry(np.array(best_coords), best_atoms, best_energy)
 
     # Relaxations
@@ -226,6 +203,6 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
                 f' E: {best_energy}. E-E0: {best_energy - start_energy}')
     logger.info(f'Best energy found on step {best_step+1}')
     best_coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
-    if out_dir is not None:
+    if add_entry is not None:
         add_entry(best_coords, best_atoms, best_energy)
     return best_atoms

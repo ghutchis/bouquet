@@ -1,12 +1,7 @@
-import hashlib
-import json
 import logging
-import sys
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
-
-from ase.io.xyz import simple_write_xyz
 
 from bouquet.calculator import CalculatorFactory
 from bouquet.config import (
@@ -16,6 +11,12 @@ from bouquet.config import (
     DEFAULT_OPTIMIZER_METHOD,
     Configuration,
 )
+from bouquet.io import (
+    create_output_directory,
+    save_run_parameters,
+    save_structure,
+    setup_logging,
+)
 from bouquet.setup import (
     detect_dihedrals,
     get_conformers_from_file,
@@ -23,8 +24,6 @@ from bouquet.setup import (
     get_initial_structure_from_file,
 )
 from bouquet.solver import run_optimization
-
-logger = logging.getLogger("bouquet")
 
 
 def main():
@@ -98,27 +97,15 @@ def main():
     )
 
     # Make an output directory
-    params_hash = hashlib.sha256(str(args.__dict__).encode()).hexdigest()
-    out_dir = Path.cwd().joinpath(
-        f"solutions/{config.name}-{config.seed}-{config.energy_method}-{params_hash[-6:]}"
+    out_dir = create_output_directory(
+        config.name, config.seed, config.energy_method, args.__dict__
     )
-    out_dir.mkdir(parents=True, exist_ok=True)
     config.out_dir = out_dir
 
-    with out_dir.joinpath("run_params.json").open("w") as fp:
-        json.dump(args.__dict__, fp)
+    save_run_parameters(out_dir, args.__dict__)
 
     # Set up the logging
-    handlers = [
-        logging.FileHandler(out_dir.joinpath("runtime.log")),
-        logging.StreamHandler(sys.stdout),
-    ]
-
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-        handlers=handlers,
-    )
+    logger = setup_logging(out_dir)
     logger.info(f"Started optimizing the conformers for {config.name}")
 
     # Make the initial guess
@@ -156,8 +143,7 @@ def main():
     num_steps = config.compute_auto_steps(len(dihedrals), initial_count)
 
     # Save the initial guess
-    with out_dir.joinpath("initial.xyz").open("w") as fp:
-        simple_write_xyz(fp, [init_atoms])
+    save_structure(out_dir, init_atoms, "initial.xyz")
 
     # Create calculators using the factory
     calc = CalculatorFactory.from_config(config, for_optimizer=False)
@@ -177,8 +163,7 @@ def main():
     )
 
     # Save the final structure
-    with out_dir.joinpath("final.xyz").open("w") as fp:
-        simple_write_xyz(fp, [final_atoms])
+    save_structure(out_dir, final_atoms, "final.xyz")
     logger.info(f"Done. Files are stored in {str(out_dir)}")
 
 
