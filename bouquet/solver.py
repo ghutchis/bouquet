@@ -182,7 +182,7 @@ def run_optimization(atoms: Atoms, dihedrals: List[DihedralInfo], n_steps: int,
 
         # Update the log
         if add_entry is not None:
-            add_entry(start_coords, cur_atoms, energy)
+            add_entry(next_coords, cur_atoms, energy)
 
         # Update the search space
         observed_coords = np.vstack([observed_coords, next_coords])
