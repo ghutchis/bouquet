@@ -38,10 +38,10 @@ class CalculatorFactory:
 
             return torchani.models.ANI2x().ase()
 
-        elif method in ("xtb", "gfn2"):
+        elif method == "gfn2":
             from xtb.ase.calculator import XTB
 
-            return XTB()
+            return XTB(method="gfn2")
 
         elif method == "gfn0":
             from xtb.ase.calculator import XTB
