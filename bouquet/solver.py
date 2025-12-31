@@ -25,7 +25,7 @@ from gpytorch.priors import NormalPrior
 warnings.filterwarnings("ignore")
 
 from bouquet.assess import evaluate_energy, relax_structure
-from bouquet.constants import (
+from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_RELAXATION_STEPS,
