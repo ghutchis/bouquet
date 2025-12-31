@@ -9,7 +9,7 @@ from ase.calculators.calculator import Calculator
 from ase.constraints import FixInternals
 from ase.optimize import LBFGS
 
-from bouquet.constants import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS
+from bouquet.config import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS
 from bouquet.setup import DihedralInfo
 
 
