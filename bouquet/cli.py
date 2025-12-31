@@ -56,7 +56,7 @@ def main():
 
     # Make an output directory
     params_hash = hashlib.sha256(str(args.__dict__).encode()).hexdigest()
-    out_dir = Path(__file__).parent.joinpath(
+    out_dir = Path.cwd().joinpath(
         f'solutions/{name}-{args.seed}-{args.energy}-{params_hash[-6:]}')
     out_dir.mkdir(parents=True, exist_ok=True)
     with out_dir.joinpath('run_params.json').open('w') as fp:
