@@ -290,7 +290,11 @@ def _perform_final_relaxation(
 
     # go through the energies and find the first one within 0.001 of the best energy
     # .. we'll need to subtract the number of initial guesses from the step count
+    first_low_energy = False
     for i in range(len(state.observed_energies)):
+        if not first_low_energy and abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < kcal * 10.0:
+            first_low_energy = True
+            logger.info(f"Found low energy on step {i - state.init_steps}")
         if abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < kcal:
             logger.info(f"Found first good energy on step {i - state.init_steps}")
             break

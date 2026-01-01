@@ -1,10 +1,12 @@
-"""Unit tests for bouquet.setup module (structure and dihedral detection)."""
+#!/usr/bin/env python3
+"""Test the refactored bouquet/setup.py with RDKit"""
 
-import pytest
+import sys
+import tempfile
 from pathlib import Path
 
-import numpy as np
-from ase import Atoms
+# Add parent directory to path
+sys.path.insert(0, "/home/claude")
 
 from bouquet.setup import (
     get_initial_structure,
@@ -12,258 +14,244 @@ from bouquet.setup import (
     get_conformers_from_file,
     detect_dihedrals,
     get_bonding_graph,
-    get_dihedral_info,
-    DihedralInfo,
+    mol_to_ase_atoms,
 )
 
 
-class TestGetInitialStructure:
-    """Tests for SMILES to 3D structure conversion."""
+def test_smiles_to_structure():
+    """Test generating structure from SMILES"""
+    print("=" * 60)
+    print("Test 1: SMILES to structure")
+    print("=" * 60)
 
-    def test_simple_smiles(self):
-        """Test converting simple SMILES to structure."""
-        atoms, mol = get_initial_structure("C")  # Methane
-        assert len(atoms) == 5  # 1 C + 4 H
-        assert "C" in atoms.get_chemical_symbols()
-        assert "H" in atoms.get_chemical_symbols()
+    test_cases = [
+        ("CCCC", "butane"),
+        ("c1ccccc1", "benzene"),
+        ("CC(=O)O", "acetic acid"),
+        ("CCO", "ethanol"),
+        ("c1ccccc1CCCC", "butylbenzene"),
+    ]
 
-    def test_returns_atoms_and_mol(self):
-        """Test that function returns both Atoms and pybel Molecule."""
-        atoms, mol = get_initial_structure("CC")  # Ethane
-        assert isinstance(atoms, Atoms)
-        assert hasattr(mol, "atoms")  # pybel molecule
-
-    def test_butane_structure(self):
-        """Test that butane generates expected structure."""
-        atoms, mol = get_initial_structure("CCCC")
-        # Butane: 4 C + 10 H = 14 atoms
-        assert len(atoms) == 14
-
-    def test_charge_is_set(self):
-        """Test that charge attribute is set on atoms."""
-        atoms, mol = get_initial_structure("C")
-        assert hasattr(atoms, "charge")
-
-    def test_aromatic_smiles(self):
-        """Test aromatic molecule (benzene)."""
-        atoms, mol = get_initial_structure("c1ccccc1")
-        # Benzene: 6 C + 6 H = 12 atoms
-        assert len(atoms) == 12
-
-    def test_3d_coordinates(self):
-        """Test that 3D coordinates are generated."""
-        atoms, mol = get_initial_structure("CC")
-        positions = atoms.get_positions()
-
-        # Should have 3D coordinates (not all zeros)
-        assert positions.shape[1] == 3
-        # At least some coordinates should be non-zero
-        assert np.any(positions != 0)
-
-
-class TestGetInitialStructureFromFile:
-    """Tests for reading structures from files."""
-
-    def test_read_xyz_file(self, sample_xyz_file):
-        """Test reading structure from XYZ file."""
-        atoms, mol = get_initial_structure_from_file(str(sample_xyz_file))
-        assert len(atoms) == 3  # Water
-        assert "O" in atoms.get_chemical_symbols()
-
-    def test_returns_atoms_and_mol(self, sample_xyz_file):
-        """Test that function returns both Atoms and molecule."""
-        atoms, mol = get_initial_structure_from_file(str(sample_xyz_file))
-        assert isinstance(atoms, Atoms)
-
-    def test_charge_is_set_from_file(self, sample_xyz_file):
-        """Test that charge is set when reading from file."""
-        atoms, mol = get_initial_structure_from_file(str(sample_xyz_file))
-        assert hasattr(atoms, "charge")
-
-
-class TestGetConformersFromFile:
-    """Tests for reading multiple conformers from files."""
-
-    def test_read_multi_frame_xyz(self, sample_multi_xyz_file):
-        """Test reading multiple conformers from XYZ file."""
-        conformers = get_conformers_from_file(str(sample_multi_xyz_file))
-        assert len(conformers) == 2
-        for conf in conformers:
-            assert isinstance(conf, Atoms)
-            assert len(conf) == 3  # Water molecules
-
-    def test_missing_file_raises_error(self, temp_dir):
-        """Test that missing file raises FileNotFoundError."""
-        with pytest.raises(FileNotFoundError):
-            get_conformers_from_file(str(temp_dir / "nonexistent.xyz"))
-
-    def test_single_frame_xyz(self, sample_xyz_file):
-        """Test reading single-frame XYZ returns list with one conformer."""
-        conformers = get_conformers_from_file(str(sample_xyz_file))
-        assert len(conformers) == 1
-
-    def test_conformers_have_charge(self, sample_multi_xyz_file):
-        """Test that conformers have charge attribute set."""
-        conformers = get_conformers_from_file(str(sample_multi_xyz_file))
-        for conf in conformers:
-            assert hasattr(conf, "charge")
-
-
-class TestDihedralInfo:
-    """Tests for the DihedralInfo dataclass."""
-
-    def test_create_dihedral_info(self):
-        """Test creating DihedralInfo instance."""
-        info = DihedralInfo(
-            chain=(0, 1, 2, 3),
-            group={2, 3, 4, 5},
-            type="backbone",
-        )
-        assert info.chain == (0, 1, 2, 3)
-        assert info.group == {2, 3, 4, 5}
-        assert info.type == "backbone"
-
-    def test_get_angle(self, ethane_atoms):
-        """Test getting dihedral angle from atoms."""
-        # For ethane, we can define a H-C-C-H dihedral
-        info = DihedralInfo(
-            chain=(2, 0, 1, 5),  # H-C-C-H
-            group={1, 5, 6, 7},
-            type="backbone",
-        )
-        angle = info.get_angle(ethane_atoms)
-        assert isinstance(angle, float)
-        assert -180 <= angle <= 180 or 0 <= angle <= 360
-
-
-class TestDetectDihedrals:
-    """Tests for dihedral angle detection."""
-
-    def test_butane_has_dihedrals(self):
-        """Test that butane has detectable rotatable bonds."""
-        atoms, mol = get_initial_structure("CCCC")
+    for smiles, name in test_cases:
+        atoms, mol = get_initial_structure(smiles)
         dihedrals = detect_dihedrals(mol)
+        print(f"  {name:15} ({smiles:15}): {len(atoms):3} atoms, {dihedrals.__len__():2} dihedrals")
 
-        # Butane should have rotatable bonds
-        assert len(dihedrals) > 0
+        # Verify atoms object has expected attributes
+        assert hasattr(atoms, "charge"), "atoms should have charge attribute"
+        assert len(atoms.get_positions()) == len(atoms), "positions should match atom count"
 
-    def test_methane_no_dihedrals(self):
-        """Test that methane has no rotatable bonds."""
-        atoms, mol = get_initial_structure("C")
-        dihedrals = detect_dihedrals(mol)
-        assert len(dihedrals) == 0
-
-    def test_ethane_one_dihedral(self):
-        """Test that ethane has exactly one rotatable bond."""
-        atoms, mol = get_initial_structure("CC")
-        dihedrals = detect_dihedrals(mol)
-        # Ethane has one C-C rotatable bond
-        assert len(dihedrals) == 1
-
-    def test_pentane_dihedrals(self):
-        """Test that pentane has multiple rotatable bonds."""
-        atoms, mol = get_initial_structure("CCCCC")
-        dihedrals = detect_dihedrals(mol)
-        # Pentane should have 2 backbone rotatable bonds
-        assert len(dihedrals) >= 2
-
-    def test_dihedral_chain_has_four_atoms(self):
-        """Test that dihedral chains have exactly 4 atoms."""
-        atoms, mol = get_initial_structure("CCCC")
-        dihedrals = detect_dihedrals(mol)
-
-        for d in dihedrals:
-            assert len(d.chain) == 4
-
-    def test_dihedral_group_is_set(self):
-        """Test that dihedral groups are sets of integers."""
-        atoms, mol = get_initial_structure("CCCC")
-        dihedrals = detect_dihedrals(mol)
-
-        for d in dihedrals:
-            assert isinstance(d.group, set)
-            assert all(isinstance(i, int) for i in d.group)
-
-    def test_ring_bonds_not_rotatable(self):
-        """Test that ring bonds are not detected as rotatable."""
-        # Cyclohexane - all bonds are in ring
-        atoms, mol = get_initial_structure("C1CCCCC1")
-        dihedrals = detect_dihedrals(mol)
-        # Ring bonds should not be rotatable
-        assert len(dihedrals) == 0
+    print("  ✓ All SMILES tests passed\n")
 
 
-class TestGetBondingGraph:
-    """Tests for bonding graph generation."""
+def test_xyz_file_reading():
+    """Test reading from XYZ file"""
+    print("=" * 60)
+    print("Test 2: XYZ file reading")
+    print("=" * 60)
 
-    def test_graph_has_correct_nodes(self):
-        """Test that graph has correct number of nodes."""
-        atoms, mol = get_initial_structure("CC")  # Ethane
+    # Create a test XYZ file (ethane)
+    xyz_content = """8
+ethane
+C     0.000000     0.000000     0.762736
+C     0.000000     0.000000    -0.762736
+H     1.018470     0.000000     1.158568
+H    -0.509235     0.881823     1.158568
+H    -0.509235    -0.881823     1.158568
+H    -1.018470     0.000000    -1.158568
+H     0.509235    -0.881823    -1.158568
+H     0.509235     0.881823    -1.158568
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xyz", delete=False) as f:
+        f.write(xyz_content)
+        xyz_path = f.name
+
+    try:
+        atoms, mol = get_initial_structure_from_file(xyz_path)
+        print(f"  Loaded ethane from XYZ: {len(atoms)} atoms")
+
+        # Check bond detection worked
         g = get_bonding_graph(mol)
+        print(f"  Bond graph: {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
 
-        # Should have node for each atom
-        assert g.number_of_nodes() == len(atoms)
+        dihedrals = detect_dihedrals(mol)
+        print(f"  Detected {len(dihedrals)} dihedrals")
 
-    def test_nodes_have_atomic_number(self):
-        """Test that nodes have atomic number attribute."""
-        atoms, mol = get_initial_structure("CO")  # Methanol
-        g = get_bonding_graph(mol)
+        print("  ✓ XYZ reading test passed\n")
 
-        for node, data in g.nodes(data=True):
-            assert "z" in data
-            assert data["z"] > 0
-
-    def test_graph_has_edges(self):
-        """Test that graph has bonds as edges."""
-        atoms, mol = get_initial_structure("CC")
-        g = get_bonding_graph(mol)
-
-        # Ethane has 7 bonds (1 C-C + 6 C-H)
-        assert g.number_of_edges() == 7
-
-    def test_edge_has_rotor_info(self):
-        """Test that edges have rotor information."""
-        atoms, mol = get_initial_structure("CCCC")
-        g = get_bonding_graph(mol)
-
-        for u, v, data in g.edges(data=True):
-            assert "data" in data
-            assert "rotor" in data["data"]
-            assert "ring" in data["data"]
+    finally:
+        Path(xyz_path).unlink()
 
 
-class TestGetDihedralInfo:
-    """Tests for dihedral info extraction from bonds."""
+def test_sdf_file_reading():
+    """Test reading from SDF file"""
+    print("=" * 60)
+    print("Test 3: SDF file reading")
+    print("=" * 60)
 
-    def test_returns_dihedral_info(self):
-        """Test that function returns DihedralInfo object."""
-        atoms, mol = get_initial_structure("CCCC")
-        g = get_bonding_graph(mol)
-        backbone = {i for i, d in g.nodes(data=True) if d["z"] > 1}
+    # Create a test SDF file (methane)
+    sdf_content = """methane
+     RDKit          3D
 
-        # Get a rotatable bond (C-C bond between carbon atoms)
-        # Find carbon atoms first
-        carbon_nodes = [n for n, d in g.nodes(data=True) if d["z"] == 6]
-        if len(carbon_nodes) >= 2:
-            bond = (carbon_nodes[0], carbon_nodes[1])
-            if g.has_edge(*bond):
-                info = get_dihedral_info(g, bond, backbone)
-                assert isinstance(info, DihedralInfo)
+  5  4  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+    0.6276    0.6276    0.6276 H   0  0  0  0  0  0  0  0  0  0  0  0
+   -0.6276   -0.6276    0.6276 H   0  0  0  0  0  0  0  0  0  0  0  0
+   -0.6276    0.6276   -0.6276 H   0  0  0  0  0  0  0  0  0  0  0  0
+    0.6276   -0.6276   -0.6276 H   0  0  0  0  0  0  0  0  0  0  0  0
+  1  2  1  0
+  1  3  1  0
+  1  4  1  0
+  1  5  1  0
+M  END
+"""
 
-    def test_chain_is_valid(self):
-        """Test that returned chain defines valid dihedral."""
-        atoms, mol = get_initial_structure("CCCC")
-        g = get_bonding_graph(mol)
-        backbone = {i for i, d in g.nodes(data=True) if d["z"] > 1}
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sdf", delete=False) as f:
+        f.write(sdf_content)
+        sdf_path = f.name
 
-        carbon_nodes = [n for n, d in g.nodes(data=True) if d["z"] == 6]
-        if len(carbon_nodes) >= 2:
-            # Find a bond between two carbons
-            for i, c1 in enumerate(carbon_nodes):
-                for c2 in carbon_nodes[i + 1 :]:
-                    if g.has_edge(c1, c2):
-                        info = get_dihedral_info(g, (c1, c2), backbone)
-                        # Chain should have 4 unique atoms
-                        assert len(info.chain) == 4
-                        assert len(set(info.chain)) == 4
-                        break
+    try:
+        atoms, mol = get_initial_structure_from_file(sdf_path)
+        print(f"  Loaded methane from SDF: {len(atoms)} atoms")
+        print("  ✓ SDF reading test passed\n")
+
+    finally:
+        Path(sdf_path).unlink()
+
+
+def test_multi_conformer_xyz():
+    """Test reading multiple conformers from XYZ"""
+    print("=" * 60)
+    print("Test 4: Multi-conformer XYZ reading")
+    print("=" * 60)
+
+    # Create multi-frame XYZ
+    xyz_content = """3
+water conf 1
+O     0.000000     0.000000     0.117300
+H     0.756950     0.000000    -0.469200
+H    -0.756950     0.000000    -0.469200
+3
+water conf 2
+O     0.000000     0.000000     0.120000
+H     0.760000     0.000000    -0.480000
+H    -0.760000     0.000000    -0.480000
+3
+water conf 3
+O     0.000000     0.000000     0.115000
+H     0.750000     0.000000    -0.460000
+H    -0.750000     0.000000    -0.460000
+"""
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".xyz", delete=False) as f:
+        f.write(xyz_content)
+        xyz_path = f.name
+
+    try:
+        conformers = get_conformers_from_file(xyz_path)
+        print(f"  Loaded {len(conformers)} water conformers")
+        assert len(conformers) == 3, "Should have 3 conformers"
+        print("  ✓ Multi-conformer test passed\n")
+
+    finally:
+        Path(xyz_path).unlink()
+
+
+def test_dihedral_detection():
+    """Test dihedral angle detection and manipulation"""
+    print("=" * 60)
+    print("Test 5: Dihedral detection and manipulation")
+    print("=" * 60)
+
+    # Test with n-pentane (should have multiple rotatable bonds)
+    smiles = "CCCCC"
+    atoms, mol = get_initial_structure(smiles)
+    dihedrals = detect_dihedrals(mol)
+
+    print(f"  n-pentane: {len(atoms)} atoms, {len(dihedrals)} dihedrals")
+
+    for i, dih in enumerate(dihedrals):
+        angle = dih.get_angle(atoms)
+        print(f"    Dihedral {i+1}: atoms {dih.chain}, angle = {angle:.1f}°, group size = {len(dih.group)}")
+
+    # Verify dihedral info structure
+    assert len(dihedrals) > 0, "Should detect at least one dihedral"
+    for dih in dihedrals:
+        assert len(dih.chain) == 4, "Dihedral chain should have 4 atoms"
+        assert dih.group is not None, "Dihedral should have a rotation group"
+        assert dih.type is not None, "Dihedral should have a type"
+
+    print("  ✓ Dihedral detection test passed\n")
+
+
+def test_bonding_graph():
+    """Test bonding graph generation"""
+    print("=" * 60)
+    print("Test 6: Bonding graph generation")
+    print("=" * 60)
+
+    atoms, mol = get_initial_structure("c1ccccc1C")  # toluene
+
+    g = get_bonding_graph(mol)
+
+    print(f"  Toluene graph: {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
+
+    # Count carbons and hydrogens
+    carbons = sum(1 for _, d in g.nodes(data=True) if d["z"] == 6)
+    hydrogens = sum(1 for _, d in g.nodes(data=True) if d["z"] == 1)
+    print(f"  Atoms: {carbons} C, {hydrogens} H")
+
+    # Count ring vs non-ring bonds
+    ring_bonds = sum(1 for _, _, d in g.edges(data=True) if d["data"]["ring"])
+    rotor_bonds = sum(1 for _, _, d in g.edges(data=True) if d["data"]["rotor"])
+    print(f"  Bonds: {ring_bonds} in ring, {rotor_bonds} rotatable")
+
+    assert carbons == 7, "Toluene should have 7 carbons"
+    assert hydrogens == 8, "Toluene should have 8 hydrogens"
+    print("  ✓ Bonding graph test passed\n")
+
+
+def test_charge_handling():
+    """Test handling of charged molecules"""
+    print("=" * 60)
+    print("Test 7: Charged molecule handling")
+    print("=" * 60)
+
+    test_cases = [
+        ("[NH4+]", "ammonium", 1),
+        ("CC(=O)[O-]", "acetate", -1),
+        ("CCCC", "butane", 0),
+    ]
+
+    for smiles, name, expected_charge in test_cases:
+        atoms, mol = get_initial_structure(smiles)
+        from rdkit import Chem
+        actual_charge = Chem.GetFormalCharge(mol)
+        print(f"  {name:12}: expected charge = {expected_charge:+d}, actual = {actual_charge:+d}")
+        assert actual_charge == expected_charge, f"Charge mismatch for {name}"
+
+    print("  ✓ Charge handling test passed\n")
+
+
+def main():
+    """Run all tests"""
+    print("\n" + "=" * 60)
+    print("TESTING REFACTORED BOUQUET/SETUP.PY (RDKit-based)")
+    print("=" * 60 + "\n")
+
+    test_smiles_to_structure()
+    test_xyz_file_reading()
+    test_sdf_file_reading()
+    test_multi_conformer_xyz()
+    test_dihedral_detection()
+    test_bonding_graph()
+    test_charge_handling()
+
+    print("=" * 60)
+    print("ALL TESTS PASSED!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

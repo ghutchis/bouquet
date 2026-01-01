@@ -19,6 +19,9 @@ class Configuration:
     input_file: Optional[Path] = None
     conformer_file: Optional[Path] = None
 
+    # Output name
+    name: Optional[str] = None
+
     # Calculation methods
     energy_method: MethodType = "gfn2"
     optimizer_method: MethodType = "gfnff"
@@ -50,13 +53,6 @@ class Configuration:
             self.conformer_file = Path(self.conformer_file)
         if isinstance(self.out_dir, str):
             self.out_dir = Path(self.out_dir)
-
-    @property
-    def name(self) -> str:
-        """Get a name for this run based on input."""
-        if self.smiles is not None:
-            return self.smiles
-        return self.input_file.stem
 
     def compute_auto_steps(self, num_dihedrals: int, num_initial: int) -> int:
         """Compute the number of optimization steps based on dihedral count.
