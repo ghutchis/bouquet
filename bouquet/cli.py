@@ -41,6 +41,9 @@ def main():
         "--file", type=str, help="File containing the structure to optimize"
     )
     parser.add_argument(
+        "--name", type=str, help="Output name (defaults to SMILES or input file name)"
+    )
+    parser.add_argument(
         "--conformer-file",
         type=str,
         help="File containing multiple conformers to use as initial guesses "
@@ -82,10 +85,15 @@ def main():
     )
     args = parser.parse_args()
 
+    name = args.name or args.smiles or Path(args.file).stem
+    if name is None:
+        raise ValueError("Must provide either --smiles, --file, or --name")
+
     # Create configuration from parsed arguments
     config = Configuration(
         smiles=args.smiles,
         input_file=Path(args.file) if args.file else None,
+        name=name,
         conformer_file=Path(args.conformer_file) if args.conformer_file else None,
         energy_method=args.energy,
         optimizer_method=args.optimizer,
@@ -98,7 +106,7 @@ def main():
 
     # Make an output directory
     out_dir = create_output_directory(
-        config.name, config.seed, config.energy_method, args.__dict__
+        name, config.seed, config.energy_method, args.__dict__
     )
     config.out_dir = out_dir
 
