@@ -96,7 +96,7 @@ class TestSmilesOptimization:
         initial_energy = atoms.get_potential_energy()
 
         # Relax structure
-        final_energy, relaxed_atoms = relax_structure(atoms.copy(), gfnff_calc, steps=50)
+        final_energy, relaxed_atoms = relax_structure(atoms.copy(), gfnff_calc, gfnff_calc, steps=50)
 
         # Energy should decrease or stay the same
         assert final_energy <= initial_energy + 0.01  # Small tolerance
@@ -121,7 +121,7 @@ class TestSmilesOptimization:
         assert (out_dir / "initial.xyz").exists()
 
         # Relax initial structure
-        energy, relaxed = relax_structure(atoms.copy(), gfnff_calc, steps=20)
+        energy, relaxed = relax_structure(atoms.copy(), gfnff_calc, gfnff_calc, steps=20)
         save_structure(out_dir, relaxed, "relaxed.xyz", comment=f"E={energy}")
         assert (out_dir / "relaxed.xyz").exists()
 
@@ -170,7 +170,7 @@ class TestXyzFileOptimization:
         assert len(atoms) == 17  # 5 C + 12 H
 
         # Relax and verify
-        energy, relaxed = relax_structure(atoms.copy(), gfnff_calc, steps=20)
+        energy, relaxed = relax_structure(atoms.copy(), gfnff_calc, gfnff_calc, steps=20)
         assert np.isfinite(energy)
 
     def test_xyz_preserves_connectivity(self, pentane_xyz_file):
