@@ -20,7 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 ani = ["torchani"]
 all = ["torchani"]
-test = ["pytest>=7.0", "pytest-cov"]
+test = ["pytest>=9.0", "pytest-cov>=7.0"]
 
 [project.urls]
 Repository = "https://github.com/ghutchis/bouquet"
