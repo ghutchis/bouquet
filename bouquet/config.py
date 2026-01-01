@@ -5,8 +5,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Literal, Optional
 
-from ase import Atoms
-
 
 # Type alias for supported methods
 MethodType = Literal["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"]
