@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 ani = ["torchani"]
 all = ["torchani"]
+test = ["pytest>=9.0", "pytest-cov>=7.0"]
 
 [project.urls]
 Repository = "https://github.com/ghutchis/bouquet"
@@ -43,3 +44,26 @@ openbabel = "*"
 xtb-python = "*"
 psi4 = "*"
 gcp-correction = "*"
+pytest = ">=9.0.2,<10"
+pytest-cov = ">=7.0.0,<8"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (run with --slow to include)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["bouquet"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
