@@ -85,9 +85,7 @@ def main():
     )
     args = parser.parse_args()
 
-    name = args.name or args.smiles or Path(args.file).stem
-    if name is None:
-        raise ValueError("Must provide either --smiles, --file, or --name")
+    name = args.name or args.smiles or (Path(args.file).stem if args.file else None)
 
     # Create configuration from parsed arguments
     config = Configuration(
