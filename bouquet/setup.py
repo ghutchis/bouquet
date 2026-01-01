@@ -160,7 +160,9 @@ def detect_dihedrals(mol: pybel.Molecule) -> List[DihedralInfo]:
     # Step 1: Get the bonds from a simple matching
     smarts = pybel.Smarts('[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]')
     for i, j in smarts.findall(mol):
-        dihedrals.append(get_dihedral_info(g, (i - 1, j - 1), backbone))
+        info = get_dihedral_info(g, (i - 1, j - 1), backbone)
+        if info is not None:
+            dihedrals.append(info)
     return dihedrals
 
 
@@ -217,7 +219,11 @@ def get_dihedral_info(graph: nx.Graph, bond: Tuple[int, int], backbone_atoms: Se
     # Get the points that will rotate along with the bond
     h = graph.copy()
     h.remove_edge(*bond)
-    a, b = nx.connected_components(h)
+    try:
+        a, b = nx.connected_components(h)
+    except ValueError:
+        return None
+
     if bond[1] in a:
         return DihedralInfo(chain=points, group=a, type='backbone')
     else:
