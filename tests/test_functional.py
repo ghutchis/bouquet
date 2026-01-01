@@ -218,7 +218,7 @@ class TestEnergyEvaluation:
         # Check that dihedral was set correctly
         actual_angle = dihedrals[0].get_angle(result_atoms)
         # Angle should be close to target (within ~1 degree)
-        angle_diff = min(abs(actual_angle - target_angle), abs(actual_angle - target_angle + 360))
+        angle_diff = abs((actual_angle - target_angle + 180) % 360 - 180)
         assert angle_diff < 5.0
 
     def test_relaxation_preserves_dihedral(self, gfnff_calc):
@@ -239,7 +239,7 @@ class TestEnergyEvaluation:
 
         # Dihedral should still be close to target
         actual_angle = dihedrals[0].get_angle(result_atoms)
-        angle_diff = min(abs(actual_angle - target_angle), abs(actual_angle - target_angle + 360))
+        angle_diff = abs((actual_angle - target_angle + 180) % 360 - 180)
         assert angle_diff < 10.0  # Allow some tolerance due to relaxation
 
 
