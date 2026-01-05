@@ -145,16 +145,24 @@ def get_initial_structure_from_file(filename: str) -> Tuple[Atoms, Chem.Mol]:
     if mol is None:
         raise ValueError(f"Could not read molecule from file: {filepath}")
 
-    # Ensure we have 3D coordinates
-    if mol.GetNumConformers() == 0:
-        logger.info("No conformer found in file, generating 3D coordinates")
-        AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-        AllChem.MMFFOptimizeMolecule(mol)
-
     # Add hydrogens if not present
     if not any(atom.GetAtomicNum() == 1 for atom in mol.GetAtoms()):
         logger.info("No hydrogens found, adding hydrogens")
         mol = Chem.AddHs(mol, addCoords=True)
+
+    # Ensure we have 3D coordinates
+    if mol.GetNumConformers() == 0:
+        logger.info("No conformer found in file, generating 3D coordinates")
+        embed_result = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        if embed_result == -1:
+            # Fallback to random coordinates
+            AllChem.EmbedMolecule(mol, AllChem.EmbedParameters())
+        if mol.GetNumConformers() == 0:
+            raise ValueError(f"Could not generate 3D coordinates for molecule from: {filepath}")
+        try:
+            AllChem.MMFFOptimizeMolecule(mol)
+        except Exception:
+            pass  # Optimization failure is non-fatal
 
     atoms = mol_to_ase_atoms(mol)
     return atoms, mol
@@ -198,7 +206,7 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
                     continue
                 conformers.append(mol_to_ase_atoms(mol))
 
-    elif ext == ".mol2" or ext == ".pdb" or ext == ".mol" or ext == ".mdl":
+    elif ext in (".mol2", ".pdb", ".mol", ".mdl"):
         # in principle, these could contain multiple conformers
         # For now, just read the first molecule
         atoms, _ = get_initial_structure_from_file(filename)
