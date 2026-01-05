@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 # Add parent directory to path
-sys.path.insert(0, "/home/claude")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bouquet.setup import (
     get_initial_structure,
@@ -35,11 +35,15 @@ def test_smiles_to_structure():
     for smiles, name in test_cases:
         atoms, mol = get_initial_structure(smiles)
         dihedrals = detect_dihedrals(mol)
-        print(f"  {name:15} ({smiles:15}): {len(atoms):3} atoms, {dihedrals.__len__():2} dihedrals")
+        print(
+            f"  {name:15} ({smiles:15}): {len(atoms):3} atoms, {len(dihedrals):2} dihedrals"
+        )
 
         # Verify atoms object has expected attributes
         assert hasattr(atoms, "charge"), "atoms should have charge attribute"
-        assert len(atoms.get_positions()) == len(atoms), "positions should match atom count"
+        assert len(atoms.get_positions()) == len(
+            atoms
+        ), "positions should match atom count"
 
     print("  ✓ All SMILES tests passed\n")
 
@@ -173,7 +177,9 @@ def test_dihedral_detection():
 
     for i, dih in enumerate(dihedrals):
         angle = dih.get_angle(atoms)
-        print(f"    Dihedral {i+1}: atoms {dih.chain}, angle = {angle:.1f}°, group size = {len(dih.group)}")
+        print(
+            f"    Dihedral {i+1}: atoms {dih.chain}, angle = {angle:.1f}°, group size = {len(dih.group)}"
+        )
 
     # Verify dihedral info structure
     assert len(dihedrals) > 0, "Should detect at least one dihedral"
@@ -227,8 +233,11 @@ def test_charge_handling():
     for smiles, name, expected_charge in test_cases:
         atoms, mol = get_initial_structure(smiles)
         from rdkit import Chem
+
         actual_charge = Chem.GetFormalCharge(mol)
-        print(f"  {name:12}: expected charge = {expected_charge:+d}, actual = {actual_charge:+d}")
+        print(
+            f"  {name:12}: expected charge = {expected_charge:+d}, actual = {actual_charge:+d}"
+        )
         assert actual_charge == expected_charge, f"Charge mismatch for {name}"
 
     print("  ✓ Charge handling test passed\n")
