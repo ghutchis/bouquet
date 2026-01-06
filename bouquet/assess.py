@@ -46,8 +46,14 @@ def evaluate_energy(
         dihedral_constraints.append((a, di.chain))
 
     # If not relaxed, just compute the energy
-    if not relax:
-        return calc.get_potential_energy(atoms), atoms
+    try:
+        energy = calc.get_potential_energy(atoms)
+    except:
+        energy = 1000.0
+
+    if not relax or energy >= 1000.0:
+        # too high energy, just return
+        return energy, atoms
 
     # set the dihedral constraints and relax
     atoms.set_constraint()
@@ -82,4 +88,9 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
     except ValueError:  # LBFGS failed to converge, probably high energy
         pass
 
-    return energyCalc.get_potential_energy(atoms), atoms
+    try:
+        energy = energyCalc.get_potential_energy(atoms)
+    except:
+        energy = 1000.0
+
+    return energy, atoms
