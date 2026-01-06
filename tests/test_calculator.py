@@ -75,7 +75,7 @@ class TestCalculatorFactory:
 
             mock_create.assert_called_once_with(
                 method="gfn2",
-                num_threads=config.psi4_num_threads,
+                num_threads=config.num_threads,
                 charge=config.charge,
                 multiplicity=config.multiplicity,
             )
@@ -96,7 +96,7 @@ class TestCalculatorFactory:
 
             mock_create.assert_called_once_with(
                 method="gfnff",
-                num_threads=config.psi4_num_threads,
+                num_threads=config.num_threads,
                 charge=config.charge,
                 multiplicity=config.multiplicity,
             )
@@ -108,7 +108,7 @@ class TestCalculatorFactory:
             energy_method="b3lyp",
             charge=1,
             multiplicity=2,
-            psi4_num_threads=8,
+            num_threads=8,
         )
 
         with patch.object(CalculatorFactory, "create") as mock_create:

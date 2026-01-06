@@ -37,7 +37,7 @@ class Configuration:
     out_dir: Optional[Path] = None
 
     # Psi4 settings (for DFT methods)
-    psi4_num_threads: int = 4
+    num_threads: int = 4
     charge: int = 0
     multiplicity: int = 1
 
@@ -112,4 +112,4 @@ DEFAULT_ENERGY_METHOD = "gfn2"
 DEFAULT_OPTIMIZER_METHOD = "gfnff"
 
 # Psi4 settings
-PSI4_NUM_THREADS = 4
+NUM_THREADS = 4

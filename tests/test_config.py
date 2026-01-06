@@ -46,7 +46,7 @@ class TestConfiguration:
         assert config.init_steps == DEFAULT_INIT_STEPS
         assert config.auto_steps is False
         assert config.relax is True
-        assert config.psi4_num_threads == 4
+        assert config.num_threads == 4
         assert config.charge == 0
         assert config.multiplicity == 1
 

@@ -2,6 +2,7 @@ import logging
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
+from rdkit import Chem
 
 from bouquet.calculator import CalculatorFactory
 from bouquet.config import (
@@ -124,7 +125,8 @@ def main():
         init_atoms, mol = get_initial_structure_from_file(str(config.input_file))
     logger.info(f"Determined initial structure with {len(init_atoms)} atoms")
 
-    # TODO: have optional cleanups
+    # charge
+    config.charge = Chem.GetFormalCharge(mol)
 
     # Detect the dihedral angles
     dihedrals = detect_dihedrals(mol)
