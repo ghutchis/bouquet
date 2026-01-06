@@ -11,6 +11,7 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator
 from botorch.acquisition.analytic import *
 from botorch.fit import fit_gpytorch_mll
+from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
 from botorch.utils import standardize
@@ -72,7 +73,7 @@ class OptimizationState:
 def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) -> np.ndarray:
     """Generate the next sample to evaluate with the energy calculator
 
-    Uses BOTorch to pick the next sample using Expected Improvement
+    Uses BOTorch to pick the next sample using an acquisition function
 
     Args:
         train_X: Observed coordinates as torch tensor (n_obs, n_dims)
@@ -95,20 +96,25 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
         base_kernel=gpykernels.PeriodicKernel(period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD))
     )))
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_X.device)
-    fit_gpytorch_mll(mll)
+    fit_gpytorch_mll_torch(
+        mll,
+        step_limit=200,
+        optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
+    )
 
     # Solve the optimization problem
     n_sampled, n_dim = train_X.shape
+    # acqf = ExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
+    # So far, this seems to be the best of the functions in botorch
     acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
     # alternative acquisition functions, e.g.
-    # TODO: See if different acqf give better results
     # Following boss, we use Eq. 5 of https://arxiv.org/pdf/1012.2599.pdf
     #    with delta=0.1
     #kappa = np.sqrt(2 * np.log10(
     #    np.power(n_sampled, n_dim / 2 + 2) * np.pi ** 2 / (3.0 * 0.1)
     #))  # Results in more exploration over time
     # kappa = 1.2
-    # acqf = UpperConfidenceBound(gp, kappa)
+    #acqf = UpperConfidenceBound(gp, kappa)
     bounds = torch.zeros(2, train_X.shape[1])
     bounds[1, :] = 360
     candidate, acq_value = optimize_acqf(
@@ -139,10 +145,13 @@ def _setup_initial_state(
     Returns:
         OptimizationState with initial values
     """
-    logger.info('Initial relaxation')
-    _, init_atoms = relax_structure(atoms, calc, relaxCalc, DEFAULT_RELAXATION_STEPS)
-    if out_dir is not None:
-        save_structure(out_dir, init_atoms, 'relaxed.xyz')
+    if relax:
+        logger.info('Initial relaxation')
+        _, init_atoms = relax_structure(atoms, calc, relaxCalc, DEFAULT_RELAXATION_STEPS)
+        if out_dir is not None:
+            save_structure(out_dir, init_atoms, 'relaxed.xyz')
+    else:
+        init_atoms = atoms
 
     # Evaluate initial point
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
