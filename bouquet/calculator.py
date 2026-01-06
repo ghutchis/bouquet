@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from bouquet.config import PSI4_NUM_THREADS, MethodType
+from bouquet.config import NUM_THREADS, MethodType
 
 if TYPE_CHECKING:
     from ase.calculators.calculator import Calculator
@@ -15,11 +15,11 @@ class CalculatorFactory:
     @staticmethod
     def create(
         method: MethodType,
-        num_threads: int = PSI4_NUM_THREADS,
+        num_threads: int = NUM_THREADS,
         charge: int = 0,
         multiplicity: int = 1,
     ) -> "Calculator":
-        """Create an ASE calculator for the specified method.
+        """Create an ASE-compatible calculator for the specified method.
 
         Args:
             method: The calculation method to use
@@ -41,12 +41,12 @@ class CalculatorFactory:
         elif method == "gfn2":
             from xtb.ase.calculator import XTB
 
-            return XTB()
+            return XTB(method="GFN2xTB")
 
         elif method == "gfn0":
             from xtb.ase.calculator import XTB
 
-            return XTB(method="gfn0")
+            return XTB(method="GFN0xTB")
 
         elif method == "gfnff":
             from xtb.ase.calculator import XTB
@@ -93,7 +93,7 @@ class CalculatorFactory:
         method = config.optimizer_method if for_optimizer else config.energy_method
         return cls.create(
             method=method,
-            num_threads=config.psi4_num_threads,
+            num_threads=config.num_threads,
             charge=config.charge,
             multiplicity=config.multiplicity,
         )
