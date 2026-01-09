@@ -151,6 +151,8 @@ class BivariateVonMisesMixture(nn.Module):
         super().__init__()
 
         weights_t = torch.tensor(weights, dtype=torch.float64)
+        if weights.sum() == 0:
+            raise ValueError(f"Weights must sum to a non-zero value")
         weights_t = weights_t / weights_t.sum()
         self.register_buffer("weights", weights_t)
         self.register_buffer("log_weights", torch.log(weights_t))
@@ -273,6 +275,8 @@ class DihedralPriorModule(nn.Module):
         )
         concs = torch.tensor(type_def["concentrations"], dtype=torch.float64)
         weights = torch.tensor(type_def["weights"], dtype=torch.float64)
+        if weights.sum() == 0:
+            raise ValueError(f"Weights must sum to a non-zero value for dim {d}")
         weights = weights / weights.sum()
 
         # Always return MixtureSameFamily for consistency
