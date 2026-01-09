@@ -29,15 +29,13 @@ from bouquet.config import (
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
     INITIAL_GUESS_STD,
+    KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
 
-# kcal/mol in eV
-# ASE uses eV by default
-KCAL_TO_EV = 1.0 / 23.0605
 
 def _get_device() -> torch.device:
     """Get the appropriate torch device (CUDA if available, else CPU)."""
