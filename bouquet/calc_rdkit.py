@@ -26,9 +26,14 @@ class RDKitCalculator(Calculator, ABC):
         self.mol = Chem.Mol(mol)  # Make a copy
 
         # Ensure we have a conformer to work with
+        # (shouldn't ever happen, but just in case)
         if self.mol.GetNumConformers() == 0:
-            AllChem.EmbedMolecule(self.mol)
-
+            result = AllChem.EmbedMolecule(self.mol)
+            if result == -1:
+                raise ValueError(
+                    "Could not generate 3D conformer for molecule. "
+                    "Ensure the molecule has valid connectivity."
+                )
         # Subclasses should initialize their force field properties
         self._setup_force_field()
 
@@ -119,7 +124,9 @@ class RDKitMMFFCalculator(RDKitCalculator):
 
     def _create_force_field(self, conf_id: int = 0):
         """Create an MMFF force field instance."""
-        return AllChem.MMFFGetMoleculeForceField(self.mol, self.mmff_props, confId=conf_id)
+        return AllChem.MMFFGetMoleculeForceField(
+            self.mol, self.mmff_props, confId=conf_id
+        )
 
 
 class RDKitUFFCalculator(RDKitCalculator):
