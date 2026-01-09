@@ -8,12 +8,14 @@ if TYPE_CHECKING:
     from rdkit import Chem
 
 # Type alias for supported methods - this is the single source of truth
+# If you add new calculators below, update this list
 MethodType = Literal["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff", "mmff", "uff"]
 
 # Derive SUPPORTED_METHODS from MethodType for runtime checks
 SUPPORTED_METHODS: frozenset[str] = frozenset(get_args(MethodType))
 
 # Default number of threads (matches config.NUM_THREADS)
+# (currently only used for Psi4)
 _DEFAULT_NUM_THREADS = 4
 
 
