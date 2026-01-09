@@ -151,7 +151,7 @@ class BivariateVonMisesMixture(nn.Module):
         super().__init__()
 
         weights_t = torch.tensor(weights, dtype=torch.float64)
-        if weights.sum() == 0:
+        if weights_t.sum() == 0:
             raise ValueError(f"Weights must sum to a non-zero value")
         weights_t = weights_t / weights_t.sum()
         self.register_buffer("weights", weights_t)
