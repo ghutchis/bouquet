@@ -3,11 +3,13 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Optional
 
+# Import MethodType and SUPPORTED_METHODS from calculator (single source of truth)
+from bouquet.calculator import MethodType, SUPPORTED_METHODS
 
-# Type alias for supported methods
-MethodType = Literal["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"]
+# Re-export for backwards compatibility
+__all__ = ["MethodType", "SUPPORTED_METHODS", "Configuration"]
 
 
 @dataclass(slots=True)
@@ -104,8 +106,7 @@ ACQ_RAW_SAMPLES = 64
 # Initial guess sampling
 INITIAL_GUESS_STD = 90
 
-# Supported energy/optimizer methods
-SUPPORTED_METHODS = frozenset({"ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"})
+KCAL_TO_EV = 1.0 / 23.0605
 
 # Default methods
 DEFAULT_ENERGY_METHOD = "gfn2"

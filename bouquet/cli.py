@@ -69,13 +69,13 @@ def main():
     )
     parser.add_argument(
         "--energy",
-        choices=["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"],
+        choices=sorted(CalculatorFactory.SUPPORTED_METHODS),
         default=DEFAULT_ENERGY_METHOD,
         help="Energy method",
     )
     parser.add_argument(
         "--optimizer",
-        choices=["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"],
+        choices=sorted(CalculatorFactory.SUPPORTED_METHODS),
         default=DEFAULT_OPTIMIZER_METHOD,
         help="Optimizer method",
     )
@@ -154,8 +154,8 @@ def main():
     save_structure(out_dir, init_atoms, "initial.xyz")
 
     # Create calculators using the factory
-    calc = CalculatorFactory.from_config(config, for_optimizer=False)
-    relaxCalc = CalculatorFactory.from_config(config, for_optimizer=True)
+    calc = CalculatorFactory.from_config(config, for_optimizer=False, mol=mol)
+    relaxCalc = CalculatorFactory.from_config(config, for_optimizer=True, mol=mol)
 
     final_atoms = run_optimization(
         init_atoms,
