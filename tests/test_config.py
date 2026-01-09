@@ -3,13 +3,13 @@
 import pytest
 from pathlib import Path
 
+from bouquet.calculator import CalculatorFactory
 from bouquet.config import (
     Configuration,
     DEFAULT_NUM_STEPS,
     DEFAULT_INIT_STEPS,
     AUTO_STEPS_THRESHOLDS,
     AUTO_STEPS_DEFAULT,
-    SUPPORTED_METHODS,
 )
 
 
@@ -142,8 +142,8 @@ class TestConstants:
 
     def test_supported_methods(self):
         """Test that supported methods are correctly defined."""
-        expected = {"ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"}
-        assert SUPPORTED_METHODS == expected
+        expected = {"ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff", "mmff", "uff"}
+        assert CalculatorFactory.SUPPORTED_METHODS == expected
 
     def test_auto_steps_thresholds_ordering(self):
         """Test that auto_steps thresholds are properly ordered."""

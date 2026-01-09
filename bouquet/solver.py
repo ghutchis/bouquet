@@ -29,13 +29,13 @@ from bouquet.config import (
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
     INITIAL_GUESS_STD,
+    KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
 
-kcal = 1.0 / 627.5094740631 # kcal/mol in Hartree
 
 def _get_device() -> torch.device:
     """Get the appropriate torch device (CUDA if available, else CPU)."""
@@ -43,7 +43,7 @@ def _get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-@dataclass
+@dataclass(slots=True)
 class OptimizationState:
     """Tracks the state of a Bayesian optimization run."""
     start_atoms: Atoms
@@ -81,6 +81,10 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
     Returns:
         Next coordinates to try (in dihedral space)
     """
+    # make a copy of the train_X to standardize
+    # we know these are in degrees already
+    train_x = train_X.clone() / 360.0
+
     # Clip the energies if needed
     train_y = torch.clamp(train_y, max=2 + torch.log10(torch.clamp(train_y, min=1)))
 
@@ -90,12 +94,12 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
 
     # Make the GP
     # TODO: make the GP only once and reuse
-    gp = SingleTaskGP(train_X, train_y,
+    gp = SingleTaskGP(train_x, train_y,
         covar_module=gpykernels.ScaleKernel(gpykernels.ProductStructureKernel(
-        num_dims=train_X.shape[1],
+        num_dims=train_x.shape[1],
         base_kernel=gpykernels.PeriodicKernel(period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD))
     )))
-    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_X.device)
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
     fit_gpytorch_mll_torch(
         mll,
         step_limit=200,
@@ -103,25 +107,28 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
     )
 
     # Solve the optimization problem
-    n_sampled, n_dim = train_X.shape
+    n_sampled, n_dim = train_x.shape
     # acqf = ExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
     # So far, this seems to be the best of the functions in botorch
     acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
     # alternative acquisition functions, e.g.
     # Following boss, we use Eq. 5 of https://arxiv.org/pdf/1012.2599.pdf
     #    with delta=0.1
-    #kappa = np.sqrt(2 * np.log10(
+    # kappa = np.sqrt(2 * np.log10(
     #    np.power(n_sampled, n_dim / 2 + 2) * np.pi ** 2 / (3.0 * 0.1)
-    #))  # Results in more exploration over time
+    # ))  # Results in more exploration over time
     # kappa = 1.2
-    #acqf = UpperConfidenceBound(gp, kappa)
-    bounds = torch.zeros(2, train_X.shape[1])
-    bounds[1, :] = 360
+    # acqf = UpperConfidenceBound(gp, kappa)
+
+    # bounds are [0, 1] for each dihedral since we standardized above
+    bounds = torch.zeros(2, train_x.shape[1])
+    bounds[1, :] = 1.0
     candidate, acq_value = optimize_acqf(
         # at the moment use q = 1 for no batching
         acqf, bounds=bounds, q=1, num_restarts=ACQ_NUM_RESTARTS, raw_samples=ACQ_RAW_SAMPLES
     )
-    return candidate.detach().numpy()[0, :]
+    # make sure to convert the candidate back to degrees
+    return candidate.detach().numpy()[0, :] * 360.0
 
 
 def _setup_initial_state(
@@ -155,6 +162,7 @@ def _setup_initial_state(
 
     # Evaluate initial point
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
+    logger.info(f'Initial dihedral angles: {start_coords}')
     start_energy, start_atoms = evaluate_energy(start_coords, atoms, dihedrals, calc, relaxCalc, relax)
     logger.info(f'Computed initial energy: {start_energy}')
 
@@ -224,6 +232,9 @@ def _evaluate_initial_guesses(
         init_guesses = rng.normal(state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals)))
 
         for i, guess in enumerate(init_guesses):
+            # make sure angles are between 0 and 360
+            # to standardize later
+            guess = guess % 360.0
             energy, cur_atoms = evaluate_energy(guess, state.start_atoms, dihedrals, calc, relaxCalc, relax)
             rel_energy = energy - state.start_energy
             logger.info(f'Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}')
@@ -256,6 +267,7 @@ def _run_optimization_loop(
     """
     for step in range(n_steps):
         next_coords = _select_next_points_botorch(state.observed_coords, state.observed_energies)
+        # logger.info(f'Selected next point: {next_coords}')
 
         energy, cur_atoms = evaluate_energy(next_coords, state.start_atoms, dihedrals, calc, relaxCalc, relax)
         rel_energy = energy - state.start_energy
@@ -301,10 +313,10 @@ def _perform_final_relaxation(
     # .. we'll need to subtract the number of initial guesses from the step count
     first_low_energy = False
     for i in range(len(state.observed_energies)):
-        if not first_low_energy and abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < kcal * 10.0:
+        if not first_low_energy and abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < KCAL_TO_EV * 10.0:
             first_low_energy = True
             logger.info(f"Found low energy on step {i - state.init_steps}")
-        if abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < kcal:
+        if abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < KCAL_TO_EV:
             logger.info(f"Found first good energy on step {i - state.init_steps}")
             break
 
