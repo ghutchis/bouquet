@@ -10,7 +10,7 @@ from typing import List, Literal, Optional
 MethodType = Literal["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"]
 
 
-@dataclass
+@dataclass(slots=True)
 class Configuration:
     """Configuration for a Bouquet optimization run."""
 

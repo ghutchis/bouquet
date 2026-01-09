@@ -222,7 +222,7 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
     return conformers
 
 
-@dataclass()
+@dataclass(slots=True)
 class DihedralInfo:
     """Describes a dihedral angle within a molecule."""
 
