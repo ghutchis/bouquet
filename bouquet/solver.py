@@ -9,8 +9,7 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
-from botorch.acquisition.analytic import *
-from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition.analytic import LogExpectedImprovement
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
@@ -108,17 +107,8 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
 
     # Solve the optimization problem
     n_sampled, n_dim = train_x.shape
-    # acqf = ExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
     # So far, this seems to be the best of the functions in botorch
     acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
-    # alternative acquisition functions, e.g.
-    # Following boss, we use Eq. 5 of https://arxiv.org/pdf/1012.2599.pdf
-    #    with delta=0.1
-    # kappa = np.sqrt(2 * np.log10(
-    #    np.power(n_sampled, n_dim / 2 + 2) * np.pi ** 2 / (3.0 * 0.1)
-    # ))  # Results in more exploration over time
-    # kappa = 1.2
-    # acqf = UpperConfidenceBound(gp, kappa)
 
     # bounds are [0, 1] for each dihedral since we standardized above
     bounds = torch.zeros(2, train_x.shape[1])

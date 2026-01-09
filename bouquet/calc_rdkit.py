@@ -12,7 +12,16 @@ from bouquet.config import KCAL_TO_EV
 
 
 class RDKitCalculator(Calculator, ABC):
-    """Base ASE Calculator wrapper for RDKit force fields."""
+    """Base ASE Calculator wrapper for RDKit force fields.
+
+    Implemented properties:
+        - energy (in eV)
+        - forces
+
+    Subclasses should implement:
+        - _setup_force_field
+        - _create_force_field
+    """
 
     implemented_properties = ["energy", "forces"]
 

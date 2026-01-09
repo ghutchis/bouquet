@@ -24,7 +24,7 @@ def evaluate_energy(
     """Compute the energy of a molecule given dihedral angles
 
     Args:
-        angles: List of dihedral angles
+        angles: List of dihedral angles in degrees
         atoms: Structure to optimize
         dihedrals: Description of the dihedral angles
         calc: Calculator used to compute energy
@@ -32,7 +32,7 @@ def evaluate_energy(
         relax: Whether to relax the non-dihedral degrees of freedom
     Returns:
         - (float) energy of the structure
-        - (Atoms) Relaxed structure
+        - (Atoms) relaxed structure
     """
     # Make a copy of the input
     atoms = atoms.copy()
@@ -45,7 +45,9 @@ def evaluate_energy(
         # Define the constraints
         dihedral_constraints.append((a, di.chain))
 
-    # If not relaxed, just compute the energy
+    # First, try to compute the energy
+    # if it doesn't converge, return a high energy
+    # (e.g. 1000 eV)
     try:
         energy = calc.get_potential_energy(atoms)
     except:
@@ -64,9 +66,13 @@ def evaluate_energy(
 
 
 def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: int) -> Tuple[float, Atoms]:
-    """Relax and return the energy of the ground state
+    """Relax and return the energy and geometry of the ground state
 
-    No constraints on the dihedral angles are applied
+    Any constraints on the dihedral angles should be applied (or removed) on atoms
+    before calling.
+
+    One calculator will be used to relax the geometry, and another to compute the energy
+    of the final structure
 
     Args:
         atoms: Atoms object to be optimized
@@ -88,6 +94,7 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
     except ValueError:  # LBFGS failed to converge, probably high energy
         pass
 
+    # if the energy calculation fails, return a high energy
     try:
         energy = energyCalc.get_potential_energy(atoms)
     except:
