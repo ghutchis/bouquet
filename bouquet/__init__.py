@@ -1,5 +1,3 @@
 """Utilities for conformer optimization"""
 
-from . import assess
-from . import setup
-from . import solver
+from . import assess, calculator, config, io, setup, solver
