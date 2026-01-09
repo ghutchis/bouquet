@@ -70,15 +70,15 @@ class OptimizationState:
 
 
 def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) -> np.ndarray:
-    """Generate the next sample to evaluate with the energy calculator
-
-    Uses BOTorch to pick the next sample using an acquisition function
-
-    Args:
-        train_X: Observed coordinates as torch tensor (n_obs, n_dims)
-        train_y: Observed energies as torch tensor (n_obs,)
+    """
+    Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
+    
+    Parameters:
+        train_X (torch.Tensor): Observed dihedral coordinates, shape (n_observations, n_dims), in degrees.
+        train_y (torch.Tensor): Observed energies corresponding to train_X, shape (n_observations,).
+    
     Returns:
-        Next coordinates to try (in dihedral space)
+        np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
     """
     # make a copy of the train_X to standardize
     # we know these are in degrees already
