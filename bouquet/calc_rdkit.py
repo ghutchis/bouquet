@@ -52,7 +52,7 @@ class RDKitCalculator(Calculator, ABC):
     def calculate(
         self,
         atoms=None,
-        properties: List[str] = ["energy"],
+        properties: List[str] = None,
         system_changes=all_changes,
     ):
         """Calculate energy (and optionally forces) using the force field.
@@ -62,6 +62,8 @@ class RDKitCalculator(Calculator, ABC):
             properties: List of properties to calculate
             system_changes: List of changes since last calculation
         """
+        if properties is None:
+            properties = ["energy"]
         super().calculate(atoms, properties, system_changes)
 
         # Update RDKit conformer with current ASE positions
