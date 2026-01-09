@@ -275,9 +275,7 @@ class DihedralPriorModule(nn.Module):
         weights = torch.tensor(type_def["weights"], dtype=torch.float64)
         weights = weights / weights.sum()
 
-        if len(means) == 1:
-            return VonMises(means[0], concs[0])
-
+        # Always return MixtureSameFamily for consistency
         return MixtureSameFamily(Categorical(weights), VonMises(means, concs))
 
     def _build_bivariate(self):
