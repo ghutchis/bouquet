@@ -10,6 +10,7 @@ import json
 import logging
 import math
 from dataclasses import dataclass
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
@@ -31,6 +32,33 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 PriorTypeId = Union[str, int]
+
+
+class BivariateTopology(Enum):
+    """Defines how matched atoms map to two dihedrals in a bivariate pattern.
+
+    Each topology specifies:
+    - The minimum number of atoms in the SMARTS match
+    - Which atom indices form the first dihedral (4 atoms)
+    - Which atom indices form the second dihedral (4 atoms)
+
+    Topologies:
+        ADJACENT: 5 atoms, dihedrals share 3 atoms (1-2-3-4 and 2-3-4-5)
+        SKIP_ONE: 6 atoms, dihedrals share central bond only (1-2-3-4 and 3-4-5-6)
+        W_SHAPE: 6 atoms, branched/W pattern (1-2-3-4 and 4-3-5-6)
+    """
+
+    ADJACENT = "adjacent"
+    SKIP_ONE = "skip_one"
+    W_SHAPE = "w_shape"
+
+
+# Mapping from topology to (min_atoms, dihedral1_indices, dihedral2_indices)
+TOPOLOGY_DEFINITIONS: Dict[BivariateTopology, Tuple[int, Tuple[int, ...], Tuple[int, ...]]] = {
+    BivariateTopology.ADJACENT: (5, (0, 1, 2, 3), (1, 2, 3, 4)),
+    BivariateTopology.SKIP_ONE: (6, (0, 1, 2, 3), (2, 3, 4, 5)),
+    BivariateTopology.W_SHAPE: (6, (0, 1, 2, 3), (3, 2, 4, 5)),
+}
 
 
 def _try_int(value: Any) -> PriorTypeId:
@@ -103,10 +131,17 @@ class UnivariateSMARTS:
 
 @dataclass
 class BivariateSMARTS:
-    """SMARTS pattern for identifying correlated dihedral pairs (5 atoms)."""
+    """SMARTS pattern for identifying correlated dihedral pairs.
+
+    The topology field determines how the matched atoms map to two dihedrals:
+    - ADJACENT (default): 5 atoms, dihedrals 0-1-2-3 and 1-2-3-4
+    - SKIP_ONE: 6 atoms, dihedrals 0-1-2-3 and 2-3-4-5
+    - W_SHAPE: 6 atoms, dihedrals 0-1-2-3 and 3-2-4-5 (branched)
+    """
 
     smarts: str
     prior_type: PriorTypeId
+    topology: BivariateTopology = BivariateTopology.ADJACENT
     description: str = ""
     priority: int = 0
 
@@ -421,13 +456,16 @@ class DihedralPriorMatcher:
             if smarts_mol is None:
                 continue
 
+            # Get topology definition for this pattern
+            min_atoms, dih1_indices, dih2_indices = TOPOLOGY_DEFINITIONS[pattern.topology]
+
             for match in mol.GetSubstructMatches(smarts_mol):
-                if len(match) < 5:
+                if len(match) < min_atoms:
                     continue
 
-                # 5 atoms define two adjacent dihedrals
-                dih1 = tuple(match[0:4])
-                dih2 = tuple(match[1:5])
+                # Extract dihedrals based on topology
+                dih1 = tuple(match[i] for i in dih1_indices)
+                dih2 = tuple(match[i] for i in dih2_indices)
 
                 # Find indices in our dihedral list
                 idx1 = idx2 = None
@@ -550,10 +588,15 @@ def load_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
         )
 
     for entry in data.get("bivariate_smarts", []):
+        # Parse topology, defaulting to ADJACENT for backward compatibility
+        topology_str = entry.get("topology", "adjacent")
+        topology = BivariateTopology(topology_str)
+
         result["bivariate_smarts"].append(
             BivariateSMARTS(
                 smarts=entry["smarts"],
                 prior_type=_try_int(entry["prior_type"]),
+                topology=topology,
                 description=entry.get("description", ""),
                 priority=entry.get("priority", 50),
             )
