@@ -3,7 +3,7 @@
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Union
 
 import networkx as nx
 import numpy as np
@@ -231,6 +231,11 @@ class DihedralInfo:
     group: Set[int] = None
     """List of atoms that should rotate along with this dihedral"""
     type: str = None
+    """Optinal classification of the dihedral (e.g., 'backbone', 'sidechain')"""
+    prior_type: Union[str, int, None] = None
+    """Prior type ID for PiBO (assigned by SMARTS matching)"""
+    correlated_with: Optional[int] = None
+    """Index of correlated dihedral (for bivariate priors)"""
 
     def get_angle(self, atoms: Atoms) -> float:
         """Get the value of the specified dihedral angle.

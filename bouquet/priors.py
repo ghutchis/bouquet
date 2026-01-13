@@ -100,19 +100,6 @@ BUILTIN_UNIVARIATE_PRIORS: Dict[PriorTypeId, Dict[str, Any]] = {
     },
 }
 
-BUILTIN_BIVARIATE_PRIORS: Dict[PriorTypeId, Dict[str, Any]] = {
-    # Generic correlated pattern
-    "generic_correlated": {
-        "description": "Generic correlated adjacent dihedrals",
-        "components": [
-            {"mu1_deg": 60.0, "mu2_deg": 60.0, "kappa1": 4.0, "kappa2": 4.0, "correlation": 1.0},
-            {"mu1_deg": 180.0, "mu2_deg": 180.0, "kappa1": 5.0, "kappa2": 5.0, "correlation": 1.0},
-            {"mu1_deg": 300.0, "mu2_deg": 300.0, "kappa1": 4.0, "kappa2": 4.0, "correlation": 1.0},
-        ],
-        "weights": [0.3, 0.4, 0.3],
-    },
-}
-
 
 # ============================================================================
 # Built-in SMARTS Patterns (Generic)
@@ -159,17 +146,6 @@ BUILTIN_UNIVARIATE_SMARTS: List[UnivariateSMARTS] = [
         prior_type="sp3_sp2",
         description="sp3-sp2 rotation",
         priority=15,
-    ),
-]
-
-# Generic 2D patterns (low priority)
-BUILTIN_BIVARIATE_SMARTS: List[BivariateSMARTS] = [
-    # Adjacent sp3-sp3 bonds
-    BivariateSMARTS(
-        smarts="[CX4:1]-[CX4:2]-[CX4:3]-[CX4:4]-[CX4:5]",
-        prior_type="generic_correlated",
-        description="Adjacent sp3-sp3 bonds",
-        priority=5,
     ),
 ]
 
@@ -273,7 +249,6 @@ class DihedralPriorModule(nn.Module):
 
         # Merge built-in with custom priors
         self.univariate_priors = {**BUILTIN_UNIVARIATE_PRIORS, **univariate_priors}
-        self.bivariate_priors = {**BUILTIN_BIVARIATE_PRIORS, **bivariate_priors}
 
         # Build distributions
         self._build_univariate()
@@ -344,13 +319,16 @@ class DihedralPriorModule(nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         """
-        Compute log probability of X under the prior.
+        Compute probability of X under the prior.
+
+        PriorGuidedAcquisitionFunction expects probabilities in [0, 1], not log
+        probabilities. It multiplies: acqf_value * prior(X)^exponent
 
         Args:
             X: Shape (..., q, dim) - dihedral values
 
         Returns:
-            Log probability, shape (..., q)
+            Probability (normalized to [0, 1]), shape (..., q)
         """
         log_prob = torch.zeros(X.shape[:-1], dtype=X.dtype, device=X.device)
 
@@ -367,7 +345,14 @@ class DihedralPriorModule(nn.Module):
             angle2 = self._to_radians(X[..., d2])
             log_prob = log_prob + dist.log_prob(angle1, angle2)
 
-        return log_prob
+        # Convert log probability to probability in (0, 1]
+        # Clamp to avoid underflow when exponentiating very negative log probs
+        # -20 corresponds to prob ~2e-9, which is effectively zero but still
+        # provides gradients
+        log_prob_clamped = torch.clamp(log_prob, min=-20.0)
+        prob = torch.exp(log_prob_clamped)
+
+        return prob
 
     def describe(self) -> str:
         """Human-readable description of assignments."""
@@ -517,44 +502,31 @@ class DihedralPriorMatcher:
 # ============================================================================
 
 
-def load_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
+def load_univariate_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
     """
-    Load prior definitions from a JSON file.
+    Load univariate prior definitions from a JSON file.
 
     Expected format:
     {
-        "univariate": {
-            "type_id": {
-                "description": "...",
-                "means_deg": [...],
-                "concentrations": [...],
-                "weights": [...]
-            },
-            ...
+        "type_id": {
+            "smarts": "[*:1]~[CX4:2]!@[n:3]~[*:4]",
+            "description": "Fit from N obs.",
+            "means_deg": [...],
+            "concentrations": [...],
+            "weights": [...]
         },
-        "bivariate": {
-            "type_id": {
-                "description": "...",
-                "components": [
-                    {"mu1_deg": ..., "mu2_deg": ..., "kappa1": ..., "kappa2": ..., "correlation": ...},
-                    ...
-                ],
-                "weights": [...]
-            },
-            ...
-        },
-        "univariate_smarts": [
-            {"smarts": "...", "prior_type": "...", "description": "...", "priority": 50},
-            ...
-        ],
-        "bivariate_smarts": [
-            {"smarts": "...", "prior_type": "...", "description": "...", "priority": 50},
-            ...
-        ]
+        ...
     }
 
+    Each entry contains both the SMARTS pattern and the fitted parameters.
+
+    Args:
+        filepath: Path to the JSON file
+
     Returns:
-        Dict with keys: univariate, bivariate, univariate_smarts, bivariate_smarts
+        Dict with keys:
+            - "priors": {type_id: prior_definition} - the fit parameters
+            - "smarts": List[UnivariateSMARTS] - SMARTS patterns for matching
     """
     filepath = Path(filepath)
 
@@ -562,51 +534,109 @@ def load_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
         data = json.load(f)
 
     result = {
-        "univariate": {},
-        "bivariate": {},
-        "univariate_smarts": [],
-        "bivariate_smarts": [],
+        "priors": {},
+        "smarts": [],
     }
 
-    # Parse univariate priors
-    for type_id, defn in data.get("univariate", {}).items():
-        result["univariate"][_try_int(type_id)] = defn
+    for type_id, defn in data.items():
+        type_key = _try_int(type_id)
 
-    # Parse bivariate priors
-    for type_id, defn in data.get("bivariate", {}).items():
-        result["bivariate"][_try_int(type_id)] = defn
-
-    # Parse SMARTS patterns
-    for entry in data.get("univariate_smarts", []):
-        result["univariate_smarts"].append(
-            UnivariateSMARTS(
-                smarts=entry["smarts"],
-                prior_type=_try_int(entry["prior_type"]),
-                description=entry.get("description", ""),
-                priority=entry.get("priority", 50),
+        # Extract SMARTS pattern from the entry
+        smarts = defn.get("smarts")
+        if smarts:
+            result["smarts"].append(
+                UnivariateSMARTS(
+                    smarts=smarts,
+                    prior_type=type_key,
+                    description=defn.get("description", ""),
+                    priority=50,  # Default priority for loaded patterns
+                )
             )
-        )
 
-    for entry in data.get("bivariate_smarts", []):
-        # Parse topology, defaulting to ADJACENT for backward compatibility
-        topology_str = entry.get("topology", "adjacent")
-        topology = BivariateTopology(topology_str)
-
-        result["bivariate_smarts"].append(
-            BivariateSMARTS(
-                smarts=entry["smarts"],
-                prior_type=_try_int(entry["prior_type"]),
-                topology=topology,
-                description=entry.get("description", ""),
-                priority=entry.get("priority", 50),
-            )
-        )
+        # Store the prior definition (without smarts, for the prior module)
+        result["priors"][type_key] = {
+            "description": defn.get("description", ""),
+            "means_deg": defn.get("means_deg", []),
+            "concentrations": defn.get("concentrations", []),
+            "weights": defn.get("weights", []),
+        }
 
     logger.info(
-        f"Loaded {len(result['univariate'])} univariate, "
-        f"{len(result['bivariate'])} bivariate priors, "
-        f"{len(result['univariate_smarts'])} 1D SMARTS, "
-        f"{len(result['bivariate_smarts'])} 2D SMARTS from {filepath}"
+        f"Loaded {len(result['priors'])} univariate priors with "
+        f"{len(result['smarts'])} SMARTS patterns from {filepath}"
+    )
+
+    return result
+
+
+def load_bivariate_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Load bivariate prior definitions from a JSON file.
+
+    Expected format:
+    {
+        "type_id": {
+            "smarts": "[CX4:1]-[CX4:2]-[CX4:3]-[CX4:4]-[CX4:5]",
+            "topology": "adjacent",
+            "description": "...",
+            "components": [
+                {"mu1_deg": ..., "mu2_deg": ..., "kappa1": ..., "kappa2": ..., "correlation": ...},
+                ...
+            ],
+            "weights": [...]
+        },
+        ...
+    }
+
+    Each entry contains the SMARTS pattern, topology, and fitted parameters.
+
+    Args:
+        filepath: Path to the JSON file
+
+    Returns:
+        Dict with keys:
+            - "priors": {type_id: prior_definition} - the fit parameters
+            - "smarts": List[BivariateSMARTS] - SMARTS patterns for matching
+    """
+    filepath = Path(filepath)
+
+    with filepath.open("r") as f:
+        data = json.load(f)
+
+    result = {
+        "priors": {},
+        "smarts": [],
+    }
+
+    for type_id, defn in data.items():
+        type_key = _try_int(type_id)
+
+        # Extract SMARTS pattern from the entry
+        smarts = defn.get("smarts")
+        if smarts:
+            topology_str = defn.get("topology", "adjacent")
+            topology = BivariateTopology(topology_str)
+
+            result["smarts"].append(
+                BivariateSMARTS(
+                    smarts=smarts,
+                    prior_type=type_key,
+                    topology=topology,
+                    description=defn.get("description", ""),
+                    priority=50,  # Default priority for loaded patterns
+                )
+            )
+
+        # Store the prior definition
+        result["priors"][type_key] = {
+            "description": defn.get("description", ""),
+            "components": defn.get("components", []),
+            "weights": defn.get("weights", []),
+        }
+
+    logger.info(
+        f"Loaded {len(result['priors'])} bivariate priors with "
+        f"{len(result['smarts'])} SMARTS patterns from {filepath}"
     )
 
     return result
@@ -615,7 +645,8 @@ def load_priors_from_json(filepath: Union[str, Path]) -> Dict[str, Any]:
 def create_prior_module(
     mol: Chem.Mol,
     dihedrals: List[Tuple[int, int, int, int]],
-    priors_file: Optional[Union[str, Path]] = None,
+    univariate_file: Optional[Union[str, Path]] = None,
+    bivariate_file: Optional[Union[str, Path]] = None,
     fallback_type: PriorTypeId = "sp3_sp3",
 ) -> DihedralPriorModule:
     """
@@ -624,7 +655,8 @@ def create_prior_module(
     Args:
         mol: RDKit molecule
         dihedrals: List of dihedral atom tuples (from detect_dihedrals)
-        priors_file: Optional JSON file with custom priors
+        univariate_file: Optional JSON file with univariate priors
+        bivariate_file: Optional JSON file with bivariate priors
         fallback_type: Default prior type for unmatched dihedrals
 
     Returns:
@@ -636,19 +668,21 @@ def create_prior_module(
     custom_uni_smarts = []
     custom_bi_smarts = []
 
-    if priors_file is not None:
-        loaded = load_priors_from_json(priors_file)
-        univariate_priors = loaded["univariate"]
-        bivariate_priors = loaded["bivariate"]
-        custom_uni_smarts = loaded["univariate_smarts"]
-        custom_bi_smarts = loaded["bivariate_smarts"]
+    if univariate_file is not None:
+        loaded = load_univariate_priors_from_json(univariate_file)
+        univariate_priors = loaded["priors"]
+        custom_uni_smarts = loaded["smarts"]
+
+    if bivariate_file is not None:
+        loaded = load_bivariate_priors_from_json(bivariate_file)
+        bivariate_priors = loaded["priors"]
+        custom_bi_smarts = loaded["smarts"]
 
     # Combine built-in and custom SMARTS
     all_uni_smarts = BUILTIN_UNIVARIATE_SMARTS + custom_uni_smarts
-    all_bi_smarts = BUILTIN_BIVARIATE_SMARTS + custom_bi_smarts
 
     # Match patterns to dihedrals
-    matcher = DihedralPriorMatcher(all_uni_smarts, all_bi_smarts)
+    matcher = DihedralPriorMatcher(all_uni_smarts, custom_bi_smarts)
     univariate_assignments, bivariate_assignments = matcher.assign_all(mol, dihedrals)
 
     logger.info(

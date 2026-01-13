@@ -1,15 +1,17 @@
 """Methods for solving the conformer option problem"""
+
 import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from botorch.acquisition.analytic import LogExpectedImprovement
+from botorch.acquisition.prior_guided import PriorGuidedAcquisitionFunction
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from botorch.optim import optimize_acqf
@@ -31,6 +33,7 @@ from bouquet.config import (
     KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
+from bouquet.priors import DihedralPriorModule, create_prior_module
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
@@ -45,6 +48,7 @@ def _get_device() -> torch.device:
 @dataclass(slots=True)
 class OptimizationState:
     """Tracks the state of a Bayesian optimization run."""
+
     start_atoms: Atoms
     start_coords: np.ndarray
     start_energy: float
@@ -56,6 +60,11 @@ class OptimizationState:
     best_step: int = 0
     add_entry: Optional[Callable] = None
 
+    # PiBO fields
+    prior_module: Optional[DihedralPriorModule] = None
+    prior_exponent: float = 2.0
+    prior_decay: float = 0.9
+
     def append_observation(self, coords: np.ndarray, energy: float) -> None:
         """Append a new observation to the tracked data.
 
@@ -63,20 +72,29 @@ class OptimizationState:
             coords: Dihedral coordinates as numpy array
             energy: Relative energy value
         """
-        new_coords = torch.tensor(coords, dtype=torch.float64, device=self.device).unsqueeze(0)
+        new_coords = torch.tensor(
+            coords, dtype=torch.float64, device=self.device
+        ).unsqueeze(0)
         new_energy = torch.tensor([energy], dtype=torch.float64, device=self.device)
         self.observed_coords = torch.cat([self.observed_coords, new_coords], dim=0)
         self.observed_energies = torch.cat([self.observed_energies, new_energy], dim=0)
 
 
-def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) -> np.ndarray:
+def _select_next_points_botorch(
+    train_X: torch.Tensor,
+    train_y: torch.Tensor,
+    prior_module: Optional[DihedralPriorModule] = None,
+    prior_exponent: float = 0.0,
+) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
-    
+
     Parameters:
         train_X (torch.Tensor): Observed dihedral coordinates, shape (n_observations, n_dims), in degrees.
         train_y (torch.Tensor): Observed energies corresponding to train_X, shape (n_observations,).
-    
+        prior_module: Optional DihedralPriorModule for PiBO
+        prior_exponent: Prior strength (0 = no prior influence)
+
     Returns:
         np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
     """
@@ -92,12 +110,21 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
     train_y = standardize(-1 * train_y)  # make this a maximization problem
 
     # Make the GP
-    # TODO: make the GP only once and reuse
-    gp = SingleTaskGP(train_x, train_y,
-        covar_module=gpykernels.ScaleKernel(gpykernels.ProductStructureKernel(
-        num_dims=train_x.shape[1],
-        base_kernel=gpykernels.PeriodicKernel(period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD))
-    )))
+    # TODO: make the GP only once and reuse via updates
+    gp = SingleTaskGP(
+        train_x,
+        train_y,
+        covar_module=gpykernels.ScaleKernel(
+            gpykernels.ProductStructureKernel(
+                num_dims=train_x.shape[1],
+                base_kernel=gpykernels.PeriodicKernel(
+                    period_length_prior=NormalPrior(
+                        GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD
+                    )
+                ),
+            )
+        ),
+    )
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
     fit_gpytorch_mll_torch(
         mll,
@@ -108,14 +135,41 @@ def _select_next_points_botorch(train_X: torch.Tensor, train_y: torch.Tensor) ->
     # Solve the optimization problem
     n_sampled, n_dim = train_x.shape
     # So far, this seems to be the best of the functions in botorch
-    acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
+    # Create base acquisition function
+    base_acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
+
+    # Wrap with PiBO if prior is provided and exponent > 0
+    if prior_module is not None and prior_exponent > 0:
+        # Create a wrapper that converts [0,1] to degrees for the prior
+        class NormalizedPriorWrapper(torch.nn.Module):
+            def __init__(self, prior: DihedralPriorModule):
+                super().__init__()
+                self.prior = prior
+
+            def forward(self, X: torch.Tensor) -> torch.Tensor:
+                # X is in [0, 1], convert to degrees for prior
+                X_deg = X * 360.0
+                return self.prior(X_deg)
+
+        wrapped_prior = NormalizedPriorWrapper(prior_module)
+        acqf = PriorGuidedAcquisitionFunction(
+            acq_function=base_acqf,
+            prior_module=wrapped_prior,
+            prior_exponent=prior_exponent,
+        )
+    else:
+        acqf = base_acqf
 
     # bounds are [0, 1] for each dihedral since we standardized above
     bounds = torch.zeros(2, train_x.shape[1])
     bounds[1, :] = 1.0
     candidate, acq_value = optimize_acqf(
         # at the moment use q = 1 for no batching
-        acqf, bounds=bounds, q=1, num_restarts=ACQ_NUM_RESTARTS, raw_samples=ACQ_RAW_SAMPLES
+        acqf,
+        bounds=bounds,
+        q=1,
+        num_restarts=ACQ_NUM_RESTARTS,
+        raw_samples=ACQ_RAW_SAMPLES,
     )
     # make sure to convert the candidate back to degrees
     return candidate.detach().numpy()[0, :] * 360.0
@@ -143,18 +197,22 @@ def _setup_initial_state(
         OptimizationState with initial values
     """
     if relax:
-        logger.info('Initial relaxation')
-        _, init_atoms = relax_structure(atoms, calc, relaxCalc, DEFAULT_RELAXATION_STEPS)
+        logger.info("Initial relaxation")
+        _, init_atoms = relax_structure(
+            atoms, calc, relaxCalc, DEFAULT_RELAXATION_STEPS
+        )
         if out_dir is not None:
-            save_structure(out_dir, init_atoms, 'relaxed.xyz')
+            save_structure(out_dir, init_atoms, "relaxed.xyz")
     else:
         init_atoms = atoms
 
     # Evaluate initial point
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
-    logger.info(f'Initial dihedral angles: {start_coords}')
-    start_energy, start_atoms = evaluate_energy(start_coords, atoms, dihedrals, calc, relaxCalc, relax)
-    logger.info(f'Computed initial energy: {start_energy}')
+    logger.info(f"Initial dihedral angles: {start_coords}")
+    start_energy, start_atoms = evaluate_energy(
+        start_coords, atoms, dihedrals, calc, relaxCalc, relax
+    )
+    logger.info(f"Computed initial energy: {start_energy}")
 
     # Set up logging if output directory provided
     add_entry = None
@@ -169,7 +227,9 @@ def _setup_initial_state(
         start_coords=start_coords,
         start_energy=start_energy,
         init_steps=0,
-        observed_coords=torch.tensor([start_coords], dtype=torch.float64, device=device),
+        observed_coords=torch.tensor(
+            [start_coords], dtype=torch.float64, device=device
+        ),
         observed_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
         device=device,
         best_atoms=start_atoms.copy(),
@@ -204,12 +264,16 @@ def _evaluate_initial_guesses(
     """
     if initial_conformers is not None:
         state.init_steps = len(initial_conformers)
-        logger.info(f'Using {state.init_steps} provided conformers as initial guesses')
+        logger.info(f"Using {state.init_steps} provided conformers as initial guesses")
         for i, conformer in enumerate(initial_conformers):
             guess = np.array([d.get_angle(conformer) for d in dihedrals])
-            energy, cur_atoms = evaluate_energy(guess, state.start_atoms, dihedrals, calc, relaxCalc, relax)
+            energy, cur_atoms = evaluate_energy(
+                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            )
             rel_energy = energy - state.start_energy
-            logger.info(f'Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}')
+            logger.info(
+                f"Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}"
+            )
 
             state.append_observation(guess, rel_energy)
 
@@ -217,17 +281,23 @@ def _evaluate_initial_guesses(
                 state.add_entry(guess, cur_atoms, energy)
     else:
         state.init_steps = init_steps
-        logger.info(f'Generating {init_steps} random initial guesses')
+        logger.info(f"Generating {init_steps} random initial guesses")
         rng = np.random.default_rng(seed)
-        init_guesses = rng.normal(state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals)))
+        init_guesses = rng.normal(
+            state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals))
+        )
 
         for i, guess in enumerate(init_guesses):
             # make sure angles are between 0 and 360
             # to standardize later
             guess = guess % 360.0
-            energy, cur_atoms = evaluate_energy(guess, state.start_atoms, dihedrals, calc, relaxCalc, relax)
+            energy, cur_atoms = evaluate_energy(
+                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            )
             rel_energy = energy - state.start_energy
-            logger.info(f'Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}')
+            logger.info(
+                f"Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}"
+            )
 
             state.append_observation(guess, rel_energy)
 
@@ -256,23 +326,36 @@ def _run_optimization_loop(
         out_dir: Output path for saving best structure
     """
     for step in range(n_steps):
-        next_coords = _select_next_points_botorch(state.observed_coords, state.observed_energies)
+        next_coords = _select_next_points_botorch(
+            state.observed_coords, state.observed_energies,
+            prior_module=state.prior_module,
+            prior_exponent=state.prior_exponent,
+        )
         # logger.info(f'Selected next point: {next_coords}')
 
-        energy, cur_atoms = evaluate_energy(next_coords, state.start_atoms, dihedrals, calc, relaxCalc, relax)
+        energy, cur_atoms = evaluate_energy(
+            next_coords, state.start_atoms, dihedrals, calc, relaxCalc, relax
+        )
         rel_energy = energy - state.start_energy
-        logger.info(f'Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}')
+        logger.info(
+            f"Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}"
+        )
 
         if rel_energy < state.observed_energies.min().item():
             state.best_step = step
             state.best_atoms = cur_atoms.copy()
             if out_dir is not None:
-                save_structure(out_dir, cur_atoms, 'current_best.xyz')
+                save_structure(out_dir, cur_atoms, "current_best.xyz")
 
         if state.add_entry is not None:
             state.add_entry(next_coords, cur_atoms, energy)
 
         state.append_observation(next_coords, rel_energy)
+
+        # Decay prior exponent
+        if state.prior_module is not None:
+            state.prior_exponent *= state.prior_decay
+
 
 
 def _perform_final_relaxation(
@@ -297,33 +380,50 @@ def _perform_final_relaxation(
     best_idx = state.observed_energies.argmin().item()
     best_coords = state.observed_coords[best_idx].cpu().numpy()
 
-    logger.info(f'Best energy found on step {state.best_step + 1}')
+    logger.info(f"Best energy found on step {state.best_step + 1}")
 
     # go through the energies and find the first one within 0.001 of the best energy
     # .. we'll need to subtract the number of initial guesses from the step count
     first_low_energy = False
     for i in range(len(state.observed_energies)):
-        if not first_low_energy and abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < KCAL_TO_EV * 10.0:
+        if (
+            not first_low_energy
+            and abs(
+                state.observed_energies[i].item()
+                - state.observed_energies[best_idx].item()
+            )
+            < KCAL_TO_EV * 10.0
+        ):
             first_low_energy = True
             logger.info(f"Found low energy on step {i - state.init_steps}")
-        if abs(state.observed_energies[i].item() - state.observed_energies[best_idx].item()) < KCAL_TO_EV:
+        if (
+            abs(
+                state.observed_energies[i].item()
+                - state.observed_energies[best_idx].item()
+            )
+            < KCAL_TO_EV
+        ):
             logger.info(f"Found first good energy on step {i - state.init_steps}")
             break
 
-    best_energy, best_atoms = evaluate_energy(best_coords, state.best_atoms, dihedrals, calc, relaxCalc)
+    best_energy, best_atoms = evaluate_energy(
+        best_coords, state.best_atoms, dihedrals, calc, relaxCalc
+    )
     logger.info(
-        f'Performed final relaxation with dihedral constraints. '
-        f'E: {best_energy}. E-E0: {best_energy - state.start_energy}'
+        f"Performed final relaxation with dihedral constraints. "
+        f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
     )
     if state.add_entry is not None:
         state.add_entry(best_coords, best_atoms, best_energy)
 
     # Relaxation without dihedral constraints
     best_atoms.set_constraint()
-    best_energy, best_atoms = evaluate_energy(best_coords, best_atoms, dihedrals, calc, relaxCalc)
+    best_energy, best_atoms = evaluate_energy(
+        best_coords, best_atoms, dihedrals, calc, relaxCalc
+    )
     logger.info(
-        f'Performed final relaxation without dihedral constraints. '
-        f'E: {best_energy}. E-E0: {best_energy - state.start_energy}'
+        f"Performed final relaxation without dihedral constraints. "
+        f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
     )
 
     best_coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
@@ -344,6 +444,10 @@ def run_optimization(
     relax: bool = True,
     seed: int = 0,
     initial_conformers: Optional[List[Atoms]] = None,
+    # New PiBO parameters
+    prior_module: Optional[DihedralPriorModule] = None,
+    initial_prior_exponent: float = 2.0,
+    prior_exponent_decay: float = 0.9,
 ) -> Atoms:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
@@ -365,6 +469,11 @@ def run_optimization(
     """
     # Setup initial state (relaxation, starting point, logging)
     state = _setup_initial_state(atoms, dihedrals, calc, relaxCalc, relax, out_dir)
+
+    # Add prior settings to state
+    state.prior_module = prior_module
+    state.prior_exponent = initial_prior_exponent
+    state.prior_decay = prior_exponent_decay
 
     # Evaluate initial guesses (conformers or random)
     _evaluate_initial_guesses(
