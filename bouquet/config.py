@@ -35,6 +35,12 @@ class Configuration:
     relax: bool = True
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
+    # Prior settings
+    priors_file: Optional[Path] = None
+    use_priors: bool = False
+    initial_prior_exponent: float = 2.0
+    prior_exponent_decay: float = 0.9
+
     # Output
     out_dir: Optional[Path] = None
 
@@ -55,6 +61,8 @@ class Configuration:
             self.conformer_file = Path(self.conformer_file)
         if isinstance(self.out_dir, str):
             self.out_dir = Path(self.out_dir)
+        if isinstance(self.priors_file, str):
+            self.priors_file = Path(self.priors_file)
 
     def compute_auto_steps(self, num_dihedrals: int, num_initial: int) -> int:
         """Compute the number of optimization steps based on dihedral count.

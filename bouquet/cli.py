@@ -84,6 +84,23 @@ def main():
         action="store_true",
         help="Relax the non-dihedral degrees of freedom before computing energy",
     )
+    parser.add_argument(
+        "--priors",
+        type=str,
+        help="JSON file with dihedral prior definitions",
+    )
+    parser.add_argument(
+        "--prior-exponent",
+        type=float,
+        default=2.0,
+        help="Initial prior exponent for PiBO (0 to disable)",
+    )
+    parser.add_argument(
+        "--prior-decay",
+        type=float,
+        default=0.9,
+        help="Prior exponent decay rate per iteration",
+    )
     args = parser.parse_args()
 
     name = args.name or args.smiles or (Path(args.file).stem if args.file else None)
@@ -101,6 +118,10 @@ def main():
         auto_steps=args.auto,
         relax=args.relax,
         seed=args.seed,
+        priors_file=Path(args.priors) if args.priors else None,
+        use_priors=args.priors is not None,
+        initial_prior_exponent=args.prior_exponent,
+        prior_exponent_decay=args.prior_decay,
     )
 
     # Make an output directory
@@ -157,6 +178,21 @@ def main():
     calc = CalculatorFactory.from_config(config, for_optimizer=False, mol=mol)
     relaxCalc = CalculatorFactory.from_config(config, for_optimizer=True, mol=mol)
 
+    # Create prior module if priors file provided
+    prior_module = None
+    if config.priors_file is not None:
+        from bouquet.priors import create_prior_module
+
+        # Get dihedral atom tuples
+        dihedral_tuples = [d.chain for d in dihedrals]
+        prior_module = create_prior_module(
+            mol=mol,
+            dihedrals=dihedral_tuples,
+            univariate_file=config.priors_file,
+        )
+        logger.info(f"Created prior module from {config.priors_file}")
+        logger.info(prior_module.describe())
+
     final_atoms = run_optimization(
         init_atoms,
         dihedrals,
@@ -168,6 +204,9 @@ def main():
         relax=config.relax,
         seed=config.seed,
         initial_conformers=initial_conformers,
+        prior_module=prior_module,
+        initial_prior_exponent=config.initial_prior_exponent,
+        prior_exponent_decay=config.prior_exponent_decay,
     )
 
     # Save the final structure
