@@ -4,7 +4,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ from bouquet.config import (
     KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
-from bouquet.priors import DihedralPriorModule, create_prior_module
+from bouquet.priors import DihedralPriorModule
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
@@ -140,21 +140,20 @@ def _select_next_points_botorch(
 
     # Wrap with PiBO if prior is provided and exponent > 0
     if prior_module is not None and prior_exponent > 0:
-        # Create a wrapper that converts [0,1] to degrees for the prior
-        class NormalizedPriorWrapper(torch.nn.Module):
-            def __init__(self, prior: DihedralPriorModule):
-                super().__init__()
-                self.prior = prior
-
-            def forward(self, X: torch.Tensor) -> torch.Tensor:
-                # X is in [0, 1], convert to degrees for prior
-                X_deg = X * 360.0
-                return self.prior(X_deg)
-
-        wrapped_prior = NormalizedPriorWrapper(prior_module)
+        # botorch optimizes over normalized [0, 1] bounds (see below), so the
+        # prior must interpret its inputs the same way. A module built directly
+        # with the DihedralPriorModule default (input_in_degrees=True) would
+        # silently mis-scale; require the normalized convention from
+        # create_prior_module instead of failing quietly.
+        if getattr(prior_module, "input_in_degrees", False):
+            raise ValueError(
+                "prior_module expects inputs in degrees, but the acquisition "
+                "optimizer operates in normalized [0, 1] space. Build the "
+                "module with create_prior_module (or input_in_degrees=False)."
+            )
         acqf = PriorGuidedAcquisitionFunction(
             acq_function=base_acqf,
-            prior_module=wrapped_prior,
+            prior_module=prior_module,
             prior_exponent=prior_exponent,
         )
     else:
@@ -357,7 +356,6 @@ def _run_optimization_loop(
             state.prior_exponent *= state.prior_decay
 
 
-
 def _perform_final_relaxation(
     state: OptimizationState,
     dihedrals: List[DihedralInfo],
@@ -407,7 +405,7 @@ def _perform_final_relaxation(
             break
 
     best_energy, best_atoms = evaluate_energy(
-        best_coords, state.best_atoms, dihedrals, calc, relaxCalc
+        best_coords, state.best_atoms, dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation with dihedral constraints. "
@@ -419,7 +417,7 @@ def _perform_final_relaxation(
     # Relaxation without dihedral constraints
     best_atoms.set_constraint()
     best_energy, best_atoms = evaluate_energy(
-        best_coords, best_atoms, dihedrals, calc, relaxCalc
+        best_coords, best_atoms, dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation without dihedral constraints. "

@@ -231,7 +231,7 @@ class DihedralInfo:
     group: Set[int] = None
     """List of atoms that should rotate along with this dihedral"""
     type: str = None
-    """Optinal classification of the dihedral (e.g., 'backbone', 'sidechain')"""
+    """Optional classification of the dihedral (e.g., 'backbone', 'sidechain')"""
     prior_type: Union[str, int, None] = None
     """Prior type ID for PiBO (assigned by SMARTS matching)"""
     correlated_with: Optional[int] = None

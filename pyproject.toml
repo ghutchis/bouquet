@@ -14,7 +14,7 @@ dependencies = [
     "torch",
     "gpytorch",
     "botorch",
-    "ase",
+    "ase>=3.23",  # ABC-FIRE (FIRE2 use_abc) added in 3.23
 ]
 
 [project.optional-dependencies]
@@ -40,12 +40,13 @@ channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
-openbabel = "*"
+tblite = "*"
 xtb-python = "*"
 psi4 = "*"
 gcp-correction = "*"
 pytest = ">=9.0.2,<10"
 pytest-cov = ">=7.0.0,<8"
+python = "==3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
