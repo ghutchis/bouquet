@@ -13,6 +13,8 @@ from typing import Callable, List, Optional, Tuple
 from ase import Atoms
 from ase.io.xyz import simple_write_xyz
 
+from bouquet.config import KCAL_TO_EV
+
 
 def setup_logging(out_dir: Path, logger_name: str = "bouquet") -> logging.Logger:
     """Configure logging to both file and stdout.
@@ -145,3 +147,46 @@ def create_structure_logger(
             simple_write_xyz(fp, [atoms], comment=f"\t{energy}")
 
     return add_entry
+
+
+def save_ensemble(
+    out_dir: Path, ensemble: List[Tuple[Atoms, float, float]]
+) -> None:
+    """Write the final Boltzmann ensemble to disk.
+
+    Produces two files in ``out_dir``:
+      * ``ensemble_final.xyz`` â one frame per conformer (sorted by energy),
+        each comment line carrying the relative energy (kcal/mol, measured from
+        the lowest ensemble member) and the Boltzmann population; and
+      * ``ensemble.csv`` â a summary table of index, relative energy, and weight.
+
+    Args:
+        out_dir: Output directory.
+        ensemble: List of ``(atoms, relative_energy_eV, weight)`` sorted by
+            energy ascending (as returned by the solver). The energies are
+            relative to the run start; this routine re-references them to the
+            lowest member for reporting.
+    """
+    if not ensemble:
+        return
+
+    # Re-reference energies to the lowest member and convert eV -> kcal/mol once.
+    e_min = min(e for _, e, _ in ensemble)
+    rows = [
+        (atoms, (energy - e_min) / KCAL_TO_EV, weight)
+        for atoms, energy, weight in ensemble
+    ]
+
+    with (out_dir / "ensemble_final.xyz").open("w") as fp:
+        for atoms, rel_kcal, weight in rows:
+            simple_write_xyz(
+                fp, [atoms], comment=f"E_rel={rel_kcal:.3f} kcal/mol  pop={weight:.3f}"
+            )
+
+    with (out_dir / "ensemble.csv").open("w") as fp:
+        writer = DictWriter(fp, ["index", "rel_energy_kcal", "weight"])
+        writer.writeheader()
+        for i, (atoms, rel_kcal, weight) in enumerate(rows):
+            writer.writerow(
+                {"index": i, "rel_energy_kcal": rel_kcal, "weight": weight}
+            )

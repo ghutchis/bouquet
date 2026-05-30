@@ -40,6 +40,9 @@ class Configuration:
     initial_prior_exponent: float = 2.0
     prior_exponent_decay: float = 0.9
 
+    # Ensemble selection
+    ensemble: bool = False
+
     # Output
     out_dir: Optional[Path] = None
 
@@ -115,6 +118,26 @@ ACQ_RAW_SAMPLES = 64
 INITIAL_GUESS_STD = 90
 
 KCAL_TO_EV = 1.0 / 23.0605
+
+# --- Ensemble selection ---
+# Reporting window W (also used at selection); sized for ZPE / level-of-theory
+# reordering of the final ensemble.
+ENSEMBLE_WINDOW_KCAL = 6.0
+# Minimum probability that a candidate's true energy lands inside the window.
+ENSEMBLE_P_THRESHOLD = 0.01
+# Numerical floor on the posterior sigma used for the inclusion test.
+ENSEMBLE_SIGMA_FLOOR_KCAL = 0.1
+# Geometric deduplication (CREST-like): RMSD in Angstrom, paired with an
+# energy gate so only structures that are BOTH close are merged.
+ENSEMBLE_RMSD_THRESHOLD = 0.125
+ENSEMBLE_ENERGY_TOL_KCAL = 0.1
+# Temperature (K) for Boltzmann populations.
+ENSEMBLE_TEMPERATURE = 298.15
+# Relative energies above this (eV) indicate a failed evaluation and are dropped
+# before fitting the selection GP and before tight optimization.
+FAILURE_ENERGY_EV = 100.0
+# Boltzmann constant in eV/K.
+KB_EV_PER_K = 8.617333262e-5
 
 # Default methods
 DEFAULT_ENERGY_METHOD = "gfn2"
