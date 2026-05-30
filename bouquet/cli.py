@@ -119,7 +119,6 @@ def main():
         relax=args.relax,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
-        use_priors=args.priors is not None,
         initial_prior_exponent=args.prior_exponent,
         prior_exponent_decay=args.prior_decay,
     )

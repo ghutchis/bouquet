@@ -38,7 +38,7 @@ class CalculatorFactory:
         Args:
             method: The calculation method to use
             mol: RDKit molecule (required for mmff/uff methods)
-            num_threads: Number of threads for Psi4 calculations
+            num_threads: Number of threads for calculations
             charge: Molecular charge
             multiplicity: Spin multiplicity
 

@@ -4,7 +4,7 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import numpy as np
 import torch
@@ -33,7 +33,7 @@ from bouquet.config import (
     KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
-from bouquet.priors import DihedralPriorModule, create_prior_module
+from bouquet.priors import DihedralPriorModule
 from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
@@ -140,21 +140,9 @@ def _select_next_points_botorch(
 
     # Wrap with PiBO if prior is provided and exponent > 0
     if prior_module is not None and prior_exponent > 0:
-        # Create a wrapper that converts [0,1] to degrees for the prior
-        class NormalizedPriorWrapper(torch.nn.Module):
-            def __init__(self, prior: DihedralPriorModule):
-                super().__init__()
-                self.prior = prior
-
-            def forward(self, X: torch.Tensor) -> torch.Tensor:
-                # X is in [0, 1], convert to degrees for prior
-                X_deg = X * 360.0
-                return self.prior(X_deg)
-
-        wrapped_prior = NormalizedPriorWrapper(prior_module)
         acqf = PriorGuidedAcquisitionFunction(
             acq_function=base_acqf,
-            prior_module=wrapped_prior,
+            prior_module=prior_module,
             prior_exponent=prior_exponent,
         )
     else:
@@ -355,7 +343,6 @@ def _run_optimization_loop(
         # Decay prior exponent
         if state.prior_module is not None:
             state.prior_exponent *= state.prior_decay
-
 
 
 def _perform_final_relaxation(

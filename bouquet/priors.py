@@ -63,10 +63,11 @@ TOPOLOGY_DEFINITIONS: Dict[BivariateTopology, Tuple[int, Tuple[int, ...], Tuple[
 
 def _try_int(value: Any) -> PriorTypeId:
     """Convert to int if possible, otherwise return as-is."""
-    try:
-        return int(value)
-    except (ValueError, TypeError):
+    if isinstance(value, int):
         return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
 
 
 def _matches_dihedral(match: Tuple, dihedral: Tuple) -> bool:
@@ -261,12 +262,11 @@ class DihedralPriorModule(nn.Module):
 
     def _build_univariate(self):
         """Build 1D von Mises mixture distributions."""
-        self.univariate_dists: Dict[int, Optional[MixtureSameFamily]] = {}
-
-        for d in range(self.dim):
-            if d in self.bivariate_dims:
-                continue
-            self.univariate_dists[d] = self._create_univariate_dist(d)
+        self.univariate_dists: Dict[int, Optional[MixtureSameFamily]] = {
+            d: self._create_univariate_dist(d)
+            for d in range(self.dim)
+            if d not in self.bivariate_dims
+        }
 
     def _create_univariate_dist(self, d: int) -> Optional[MixtureSameFamily]:
         """Create a univariate von Mises distribution for a dimension."""
@@ -423,7 +423,17 @@ class DihedralPriorMatcher:
                 continue
 
             for match in mol.GetSubstructMatches(smarts_mol):
-                if len(match) >= 4 and _matches_dihedral(match[:4], dihedral):
+                # these SMARTS have atom maps, so convert them
+                # http://www.rdkit.org/docs/GettingStartedInPython.html#atom-map-indices-in-smarts
+                index_map = {}
+                for atom in smarts_mol.GetAtoms():
+                    map_num = atom.GetAtomMapNum()
+                    if map_num:
+                        index_map[map_num-1] = atom.GetIdx()
+                map_list = [index_map[x] for x in sorted(index_map)]
+                mapped = [match[x] for x in map_list]
+
+                if len(mapped) >= 4 and _matches_dihedral(mapped, dihedral):
                     return pattern.prior_type
 
         return None
@@ -697,5 +707,5 @@ def create_prior_module(
         univariate_priors=univariate_priors,
         bivariate_priors=bivariate_priors,
         fallback_type=fallback_type,
-        input_in_degrees=True,  # bouquet uses degrees internally
+        input_in_degrees=False,  # PiBO operates in [0,1] normalized space
     )

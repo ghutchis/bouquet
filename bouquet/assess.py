@@ -23,7 +23,7 @@ def evaluate_energy(
 ) -> Tuple[float, Atoms]:
     """
     Compute the potential energy for a set of dihedral angles and optionally relax non-dihedral degrees of freedom.
-    
+
     Parameters:
         angles (Union[List[float], np.ndarray]): Dihedral angles in degrees, in the same order as `dihedrals`.
         atoms (Atoms): Atomic structure to copy and modify; returned Atoms is the copy after any applied constraints/relaxation.
@@ -31,7 +31,7 @@ def evaluate_energy(
         calc (Calculator): Calculator used to evaluate the potential energy of the (constrained) structure.
         relaxCalc (Calculator): Calculator assigned to the Atoms for geometry optimization when relaxation is enabled.
         relax (bool): If True, relax non-dihedral degrees of freedom after fixing dihedrals; if False, return the energy of the constrained structure as-is.
-    
+
     Returns:
         Tuple[float, Atoms]: energy (in eV) and the Atoms object after applying dihedral constraints and optional relaxation. An energy value of 1000.0 is used to indicate a failed energy evaluation.
     """
@@ -69,15 +69,15 @@ def evaluate_energy(
 def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: int) -> Tuple[float, Atoms]:
     """
     Relax the atomic geometry using the provided optimizer and evaluate its potential energy.
-    
+
     Constraints on dihedral angles should be applied to `atoms` before calling. `calc` is used to perform the geometry optimization; `energyCalc` is used to evaluate the final potential energy.
-    
+
     Parameters:
     	atoms (Atoms): The atomic configuration to relax.
     	energyCalc (Calculator): Calculator used to compute the potential energy after relaxation.
     	calc (Calculator): Calculator used for the geometry optimization.
     	steps (int or None): Maximum number of optimization steps to perform; if `None`, run until convergence.
-    
+
     Returns:
     	tuple: A pair `(energy, atoms)` where `energy` is the potential energy of the (possibly relaxed) structure and `atoms` is the resulting Atoms object. If the energy evaluation fails, `energy` will be `1000.0`.
     """
@@ -89,7 +89,7 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
         if steps is not None:
             dyn.run(fmax=DEFAULT_FMAX, steps=steps)
         else:
-            dyn.run(fmax=DEFAULT_FMAX)
+            dyn.run(fmax=TIGHT_FMAX)
     except ValueError:  # LBFGS failed to converge, probably high energy
         pass
 

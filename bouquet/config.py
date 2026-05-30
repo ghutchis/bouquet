@@ -37,7 +37,6 @@ class Configuration:
 
     # Prior settings
     priors_file: Optional[Path] = None
-    use_priors: bool = False
     initial_prior_exponent: float = 2.0
     prior_exponent_decay: float = 0.9
 
@@ -89,8 +88,9 @@ class Configuration:
 # Optimization defaults
 DEFAULT_NUM_STEPS = 32
 DEFAULT_INIT_STEPS = 5
-DEFAULT_RELAXATION_STEPS = 50
-DEFAULT_FMAX = 1e-3
+DEFAULT_RELAXATION_STEPS = 10
+DEFAULT_FMAX = 5e-2
+TIGHT_FMAX = 1e-3
 
 # Auto-scaling thresholds for optimization steps based on dihedral count
 AUTO_STEPS_THRESHOLDS = {
@@ -120,5 +120,5 @@ KCAL_TO_EV = 1.0 / 23.0605
 DEFAULT_ENERGY_METHOD = "gfn2"
 DEFAULT_OPTIMIZER_METHOD = "gfnff"
 
-# Psi4 settings
+# multithreading (e.g., Psi4)
 NUM_THREADS = 4
