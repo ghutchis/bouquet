@@ -14,7 +14,7 @@ dependencies = [
     "torch",
     "gpytorch",
     "botorch",
-    "ase",
+    "ase>=3.23",  # ABC-FIRE (FIRE2 use_abc) added in 3.23
 ]
 
 [project.optional-dependencies]

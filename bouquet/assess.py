@@ -1,15 +1,15 @@
 """Tools for computing the energy of a molecule"""
 
 import os
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 from ase.constraints import FixInternals
-from ase.optimize import LBFGS
+from ase.optimize import FIRE2, LBFGS
 
-from bouquet.config import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS
+from bouquet.config import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS, TIGHT_FMAX
 from bouquet.setup import DihedralInfo
 
 
@@ -20,6 +20,7 @@ def evaluate_energy(
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool = True,
+    steps: Optional[int] = DEFAULT_RELAXATION_STEPS,
 ) -> Tuple[float, Atoms]:
     """
     Compute the potential energy for a set of dihedral angles and optionally relax non-dihedral degrees of freedom.
@@ -31,6 +32,7 @@ def evaluate_energy(
         calc (Calculator): Calculator used to evaluate the potential energy of the (constrained) structure.
         relaxCalc (Calculator): Calculator assigned to the Atoms for geometry optimization when relaxation is enabled.
         relax (bool): If True, relax non-dihedral degrees of freedom after fixing dihedrals; if False, return the energy of the constrained structure as-is.
+        steps (int or None): Maximum number of relaxation steps. A positive limit selects the quick FIRE2/ABC-FIRE relaxation (`DEFAULT_FMAX`); `None` selects the tight L-BFGS relaxation (`TIGHT_FMAX`, no step limit).
 
     Returns:
         Tuple[float, Atoms]: energy (in eV) and the Atoms object after applying dihedral constraints and optional relaxation. An energy value of 1000.0 is used to indicate a failed energy evaluation.
@@ -62,13 +64,20 @@ def evaluate_energy(
     atoms.set_constraint()
     atoms.set_constraint(FixInternals(dihedrals_deg=dihedral_constraints))
 
-    # A quick relaxation to get the structure in the right ballpark
-    return relax_structure(atoms, calc, relaxCalc, DEFAULT_RELAXATION_STEPS)
+    # Relax non-dihedral degrees of freedom (quick when `steps` is a limit,
+    # tight when `steps` is None).
+    return relax_structure(atoms, calc, relaxCalc, steps)
 
 
-def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: int) -> Tuple[float, Atoms]:
+def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: Optional[int]) -> Tuple[float, Atoms]:
     """
     Relax the atomic geometry using the provided optimizer and evaluate its potential energy.
+
+    Two relaxation regimes are selected by `steps`:
+      * a positive step limit runs a quick FIRE2 / ABC-FIRE relaxation to
+        `DEFAULT_FMAX`, used during the Bayesian-optimization search; and
+      * `None` runs a tight L-BFGS relaxation to `TIGHT_FMAX` with no step
+        limit, used for the final geometry.
 
     Constraints on dihedral angles should be applied to `atoms` before calling. `calc` is used to perform the geometry optimization; `energyCalc` is used to evaluate the final potential energy.
 
@@ -76,21 +85,25 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
     	atoms (Atoms): The atomic configuration to relax.
     	energyCalc (Calculator): Calculator used to compute the potential energy after relaxation.
     	calc (Calculator): Calculator used for the geometry optimization.
-    	steps (int or None): Maximum number of optimization steps to perform; if `None`, run until convergence.
+    	steps (int or None): Maximum number of optimization steps to perform; if `None`, run a tight relaxation until convergence.
 
     Returns:
     	tuple: A pair `(energy, atoms)` where `energy` is the potential energy of the (possibly relaxed) structure and `atoms` is the resulting Atoms object. If the energy evaluation fails, `energy` will be `1000.0`.
     """
 
-    atoms.set_calculator(calc)
+    atoms.calc = calc
 
     try:
-        dyn = LBFGS(atoms, logfile=os.devnull)
         if steps is not None:
+            # Quick relaxation during the search: ABC-FIRE for fast, robust
+            # progress within a tight step budget.
+            dyn = FIRE2(atoms, logfile=os.devnull, use_abc=True)
             dyn.run(fmax=DEFAULT_FMAX, steps=steps)
         else:
+            # Tight final relaxation: L-BFGS to TIGHT_FMAX, no step limit.
+            dyn = LBFGS(atoms, logfile=os.devnull)
             dyn.run(fmax=TIGHT_FMAX)
-    except ValueError:  # LBFGS failed to converge, probably high energy
+    except ValueError:  # optimizer failed to converge, probably high energy
         pass
 
     # if the energy calculation fails, return a high energy

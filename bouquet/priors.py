@@ -431,7 +431,7 @@ class DihedralPriorMatcher:
                     if map_num:
                         index_map[map_num-1] = atom.GetIdx()
                 map_list = [index_map[x] for x in sorted(index_map)]
-                mapped = [match[x] for x in map_list]
+                mapped = tuple(match[x] for x in map_list)
 
                 if len(mapped) >= 4 and _matches_dihedral(mapped, dihedral):
                     return pattern.prior_type

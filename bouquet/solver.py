@@ -140,6 +140,17 @@ def _select_next_points_botorch(
 
     # Wrap with PiBO if prior is provided and exponent > 0
     if prior_module is not None and prior_exponent > 0:
+        # botorch optimizes over normalized [0, 1] bounds (see below), so the
+        # prior must interpret its inputs the same way. A module built directly
+        # with the DihedralPriorModule default (input_in_degrees=True) would
+        # silently mis-scale; require the normalized convention from
+        # create_prior_module instead of failing quietly.
+        if getattr(prior_module, "input_in_degrees", False):
+            raise ValueError(
+                "prior_module expects inputs in degrees, but the acquisition "
+                "optimizer operates in normalized [0, 1] space. Build the "
+                "module with create_prior_module (or input_in_degrees=False)."
+            )
         acqf = PriorGuidedAcquisitionFunction(
             acq_function=base_acqf,
             prior_module=prior_module,
@@ -394,7 +405,7 @@ def _perform_final_relaxation(
             break
 
     best_energy, best_atoms = evaluate_energy(
-        best_coords, state.best_atoms, dihedrals, calc, relaxCalc
+        best_coords, state.best_atoms, dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation with dihedral constraints. "
@@ -406,7 +417,7 @@ def _perform_final_relaxation(
     # Relaxation without dihedral constraints
     best_atoms.set_constraint()
     best_energy, best_atoms = evaluate_energy(
-        best_coords, best_atoms, dihedrals, calc, relaxCalc
+        best_coords, best_atoms, dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation without dihedral constraints. "
