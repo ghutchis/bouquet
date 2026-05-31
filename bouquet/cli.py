@@ -10,10 +10,13 @@ from bouquet.config import (
     DEFAULT_INIT_STEPS,
     DEFAULT_NUM_STEPS,
     DEFAULT_OPTIMIZER_METHOD,
+    DEFAULT_PRIOR_DECAY,
+    DEFAULT_PRIOR_EXPONENT,
     Configuration,
 )
 from bouquet.io import (
     create_output_directory,
+    save_ensemble,
     save_run_parameters,
     save_structure,
     setup_logging,
@@ -92,14 +95,20 @@ def main():
     parser.add_argument(
         "--prior-exponent",
         type=float,
-        default=2.0,
+        default=DEFAULT_PRIOR_EXPONENT,
         help="Initial prior exponent for PiBO (0 to disable)",
     )
     parser.add_argument(
         "--prior-decay",
         type=float,
-        default=0.9,
+        default=DEFAULT_PRIOR_DECAY,
         help="Prior exponent decay rate per iteration",
+    )
+    parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="Select a Boltzmann ensemble of low-energy conformers, tightly "
+        "optimize them all, and write ensemble_final.xyz + ensemble.csv",
     )
     args = parser.parse_args()
 
@@ -121,6 +130,7 @@ def main():
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
         prior_exponent_decay=args.prior_decay,
+        ensemble=args.ensemble,
     )
 
     # Make an output directory
@@ -192,7 +202,7 @@ def main():
         logger.info(f"Created prior module from {config.priors_file}")
         logger.info(prior_module.describe())
 
-    final_atoms = run_optimization(
+    result = run_optimization(
         init_atoms,
         dihedrals,
         num_steps,
@@ -206,7 +216,15 @@ def main():
         prior_module=prior_module,
         initial_prior_exponent=config.initial_prior_exponent,
         prior_exponent_decay=config.prior_exponent_decay,
+        return_ensemble=config.ensemble,
     )
+
+    if config.ensemble:
+        final_atoms, ensemble = result
+        save_ensemble(out_dir, ensemble)
+        logger.info(f"Wrote {len(ensemble)}-conformer ensemble to {out_dir}")
+    else:
+        final_atoms = result
 
     # Save the final structure
     save_structure(out_dir, final_atoms, "final.xyz")

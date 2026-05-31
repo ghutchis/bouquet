@@ -4,21 +4,35 @@ import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from ase import Atoms
+from ase.build import minimize_rotation_and_translation
 from ase.calculators.calculator import Calculator
 from botorch.acquisition.analytic import LogExpectedImprovement
 from botorch.acquisition.prior_guided import PriorGuidedAcquisitionFunction
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
 from botorch.optim import optimize_acqf
 from botorch.utils import standardize
 from gpytorch import kernels as gpykernels
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import NormalPrior
+
+# iRMSD (rotation- and permutation-invariant RMSD) is an optional dependency:
+# it ships binary wheels only for some platforms, so we use it when a real
+# install is present and otherwise fall back to a Kabsch-aligned RMSD. The
+# hasattr guard also rejects the empty PyPI placeholder package.
+try:
+    import irmsd as _irmsd
+
+    _HAVE_IRMSD = hasattr(_irmsd, "get_irmsd_ase")
+except ImportError:  # pragma: no cover - exercised only without irmsd installed
+    _irmsd = None
+    _HAVE_IRMSD = False
 
 warnings.filterwarnings("ignore")
 
@@ -27,9 +41,17 @@ from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_RELAXATION_STEPS,
+    ENSEMBLE_ENERGY_TOL_KCAL,
+    ENSEMBLE_P_THRESHOLD,
+    ENSEMBLE_RMSD_THRESHOLD,
+    ENSEMBLE_SIGMA_FLOOR_KCAL,
+    ENSEMBLE_TEMPERATURE,
+    ENSEMBLE_WINDOW_KCAL,
+    FAILURE_ENERGY_EV,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
     INITIAL_GUESS_STD,
+    KB_EV_PER_K,
     KCAL_TO_EV,
 )
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
@@ -54,6 +76,8 @@ class OptimizationState:
     start_energy: float
     observed_coords: torch.Tensor  # Shape: (n_observations, n_dihedrals)
     observed_energies: torch.Tensor  # Shape: (n_observations,)
+    # Per-observation Atoms, aligned index-for-index with the tensors above.
+    observed_atoms: List[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
     best_atoms: Optional[Atoms] = None
@@ -65,12 +89,15 @@ class OptimizationState:
     prior_exponent: float = 2.0
     prior_decay: float = 0.9
 
-    def append_observation(self, coords: np.ndarray, energy: float) -> None:
-        """Append a new observation to the tracked data.
+    def append_observation(
+        self, coords: np.ndarray, energy: float, atoms: Atoms
+    ) -> None:
+        """Append a new observation, keeping observed_atoms index-aligned.
 
         Args:
             coords: Dihedral coordinates as numpy array
             energy: Relative energy value
+            atoms: Structure at this observation (copied for retention)
         """
         new_coords = torch.tensor(
             coords, dtype=torch.float64, device=self.device
@@ -78,6 +105,22 @@ class OptimizationState:
         new_energy = torch.tensor([energy], dtype=torch.float64, device=self.device)
         self.observed_coords = torch.cat([self.observed_coords, new_coords], dim=0)
         self.observed_energies = torch.cat([self.observed_energies, new_energy], dim=0)
+        self.observed_atoms.append(atoms.copy())
+
+
+def _periodic_covar_module(num_dims: int) -> gpykernels.ScaleKernel:
+    """Build the periodic GP covariance module shared by the acquisition GP and
+    the ensemble-selection GP (a scaled product of per-dihedral periodic kernels)."""
+    return gpykernels.ScaleKernel(
+        gpykernels.ProductStructureKernel(
+            num_dims=num_dims,
+            base_kernel=gpykernels.PeriodicKernel(
+                period_length_prior=NormalPrior(
+                    GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD
+                )
+            ),
+        )
+    )
 
 
 def _select_next_points_botorch(
@@ -114,16 +157,7 @@ def _select_next_points_botorch(
     gp = SingleTaskGP(
         train_x,
         train_y,
-        covar_module=gpykernels.ScaleKernel(
-            gpykernels.ProductStructureKernel(
-                num_dims=train_x.shape[1],
-                base_kernel=gpykernels.PeriodicKernel(
-                    period_length_prior=NormalPrior(
-                        GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD
-                    )
-                ),
-            )
-        ),
+        covar_module=_periodic_covar_module(train_x.shape[1]),
     )
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
     fit_gpytorch_mll_torch(
@@ -221,7 +255,7 @@ def _setup_initial_state(
         add_entry(start_coords, start_atoms, start_energy)
 
     device = _get_device()
-    return OptimizationState(
+    state = OptimizationState(
         start_atoms=start_atoms,
         start_coords=start_coords,
         start_energy=start_energy,
@@ -235,6 +269,9 @@ def _setup_initial_state(
         best_step=0,
         add_entry=add_entry,
     )
+    # Keep observed_atoms aligned with the initial [0.0] observation.
+    state.observed_atoms.append(start_atoms.copy())
+    return state
 
 
 def _evaluate_initial_guesses(
@@ -274,7 +311,7 @@ def _evaluate_initial_guesses(
                 f"Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}"
             )
 
-            state.append_observation(guess, rel_energy)
+            state.append_observation(guess, rel_energy, cur_atoms)
 
             if state.add_entry is not None:
                 state.add_entry(guess, cur_atoms, energy)
@@ -298,7 +335,7 @@ def _evaluate_initial_guesses(
                 f"Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}"
             )
 
-            state.append_observation(guess, rel_energy)
+            state.append_observation(guess, rel_energy, cur_atoms)
 
             if state.add_entry is not None:
                 state.add_entry(guess, cur_atoms, energy)
@@ -349,7 +386,7 @@ def _run_optimization_loop(
         if state.add_entry is not None:
             state.add_entry(next_coords, cur_atoms, energy)
 
-        state.append_observation(next_coords, rel_energy)
+        state.append_observation(next_coords, rel_energy, cur_atoms)
 
         # Decay prior exponent
         if state.prior_module is not None:
@@ -404,8 +441,11 @@ def _perform_final_relaxation(
             logger.info(f"Found first good energy on step {i - state.init_steps}")
             break
 
+    # Seed from the actual best observation (aligned with best_idx/best_coords),
+    # which may come from the initial point, a seeded conformer, a random guess,
+    # or the BO loop -- not from state.best_atoms, which only tracks BO-loop wins.
     best_energy, best_atoms = evaluate_energy(
-        best_coords, state.best_atoms, dihedrals, calc, relaxCalc, steps=None
+        best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation with dihedral constraints. "
@@ -431,6 +471,197 @@ def _perform_final_relaxation(
     return best_atoms
 
 
+def _build_selection_gp(
+    train_X_deg: torch.Tensor, train_y_eV: torch.Tensor
+) -> SingleTaskGP:
+    """Fit a GP for ensemble selection.
+
+    Reuses the acquisition GP's kernel and [0, 1] input normalization, but fits
+    energies in their natural (minimization) sense with a ``Standardize`` outcome
+    transform, so the posterior is returned directly in eV (relative energies).
+    """
+    train_x = train_X_deg.clone() / 360.0
+    train_y = train_y_eV.clone().unsqueeze(-1)  # (n, 1), eV, lower = better
+    gp = SingleTaskGP(
+        train_x,
+        train_y,
+        covar_module=_periodic_covar_module(train_x.shape[1]),
+        outcome_transform=Standardize(m=1),
+    )
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
+    fit_gpytorch_mll_torch(
+        mll, step_limit=200, optimizer=lambda p: torch.optim.Adam(p, lr=0.01)
+    )
+    return gp
+
+
+def _select_ensemble_candidates(
+    state: OptimizationState,
+    window_eV: float,
+    p_threshold: float,
+    sigma_floor_eV: float,
+    failure_energy_eV: float,
+) -> List[Tuple[np.ndarray, Atoms]]:
+    """Select observed conformers to tightly optimize, ordered by predicted energy.
+
+    A conformer ``i`` is included iff its GP posterior gives
+    ``P(E_i <= E_min + window) >= p_threshold``. The posterior sigma supplies a
+    per-candidate, data-driven buffer: tight where the surface is well sampled,
+    wide where it is sparse. No candidate cap is applied.
+    """
+    assert len(state.observed_atoms) == state.observed_energies.shape[0], (
+        "observed_atoms is misaligned with observed_energies"
+    )
+
+    energies = state.observed_energies
+    coords = state.observed_coords
+
+    # Drop failed evaluations BEFORE fitting (the ~1000 eV sentinel wrecks the GP).
+    valid = energies < failure_energy_eV
+    idx = torch.nonzero(valid, as_tuple=False).flatten()
+    if idx.numel() == 0:
+        logger.warning("No valid observations for ensemble selection.")
+        return []
+    e = energies[idx]
+    x = coords[idx]
+
+    # Fit selection GP and evaluate the posterior at the observed coordinates.
+    if idx.numel() < 3:
+        # Too few points for a meaningful posterior: fall back to a flat window.
+        mu, sigma = e, torch.full_like(e, sigma_floor_eV)
+    else:
+        gp = _build_selection_gp(x, e)
+        gp.eval()
+        with torch.no_grad():
+            post = gp.posterior(x / 360.0)
+        mu = post.mean.flatten()
+        sigma = post.variance.clamp_min(0.0).sqrt().flatten()
+    sigma = sigma.clamp_min(sigma_floor_eV)
+
+    # Probabilistic inclusion: P(E_i <= E_min + window) >= p_threshold.
+    e_min = e.min()
+    z = (e_min + window_eV - mu) / sigma
+    keep = torch.special.ndtr(z) >= p_threshold  # standard-normal CDF
+
+    # Map survivors back to global indices, ordered by predicted energy
+    # (no cap on the number kept).
+    sel_global = idx[keep][torch.argsort(mu[keep])]
+
+    logger.info(
+        f"Ensemble selection: {sel_global.numel()} candidates "
+        f"(from {idx.numel()} valid observations)."
+    )
+    return [
+        (coords[i].cpu().numpy(), state.observed_atoms[i])
+        for i in sel_global.tolist()
+    ]
+
+
+def _rmsd(a: Atoms, b: Atoms) -> float:
+    """RMSD between two structures, in Angstrom.
+
+    When the iRMSD backend is available this is the rotation- and
+    permutation-invariant RMSD (atom ordering is canonicalized, so
+    symmetry-equivalent conformers are not counted as distinct). Otherwise it
+    falls back to a Kabsch-aligned all-atom RMSD that assumes identical atom
+    ordering.
+    """
+    if _HAVE_IRMSD:
+        return float(_irmsd.get_irmsd_ase(a, b)[0])
+
+    b = b.copy()
+    minimize_rotation_and_translation(a, b)  # mutates b in place toward a
+    d = a.get_positions() - b.get_positions()
+    return float(np.sqrt((d**2).sum(axis=1).mean()))
+
+
+def _dedup(
+    pairs: List[Tuple[Atoms, float]], rmsd_thr: float, e_tol_eV: float
+) -> List[Tuple[Atoms, float]]:
+    """Deduplicate (atoms, energy_eV) pairs, assumed sorted by energy ascending.
+
+    A structure is a duplicate iff it is BOTH energy-close AND geometry-close to
+    an already-kept structure.
+    """
+    unique: List[Tuple[Atoms, float]] = []
+    for atoms, energy in pairs:
+        if any(
+            abs(energy - ue) < e_tol_eV and _rmsd(ua, atoms) < rmsd_thr
+            for ua, ue in unique
+        ):
+            continue
+        unique.append((atoms, energy))
+    return unique
+
+
+def _boltzmann_weights(energies_eV: np.ndarray, temperature: float) -> np.ndarray:
+    """Boltzmann populations from relative electronic energies (eV)."""
+    kT = KB_EV_PER_K * temperature
+    e = np.asarray(energies_eV, dtype=float)
+    e = e - e.min()
+    w = np.exp(-e / kT)
+    return w / w.sum()
+
+
+def _perform_ensemble_relaxation(
+    state: OptimizationState,
+    dihedrals: List[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+) -> List[Tuple[Atoms, float, float]]:
+    """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
+
+    Returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy ascending,
+    where ``relative_energy_eV`` is measured against the run's start energy.
+    """
+    window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
+    sigma_floor_eV = ENSEMBLE_SIGMA_FLOOR_KCAL * KCAL_TO_EV
+    e_tol_eV = ENSEMBLE_ENERGY_TOL_KCAL * KCAL_TO_EV
+
+    candidates = _select_ensemble_candidates(
+        state,
+        window_eV=window_eV,
+        p_threshold=ENSEMBLE_P_THRESHOLD,
+        sigma_floor_eV=sigma_floor_eV,
+        failure_energy_eV=FAILURE_ENERGY_EV,
+    )
+
+    # Tight, UNCONSTRAINED optimization of each candidate (no step limit).
+    optimized: List[Tuple[Atoms, float]] = []
+    for k, (coords, atoms) in enumerate(candidates):
+        a = atoms.copy()
+        a.set_constraint()  # remove any dihedral constraints
+        energy, a = relax_structure(a, calc, relaxCalc, steps=None)
+        rel = energy - state.start_energy
+        if rel >= FAILURE_ENERGY_EV:  # relative cutoff, as in candidate selection
+            continue
+        optimized.append((a, rel))
+        if state.add_entry is not None:
+            state.add_entry(
+                np.array([d.get_angle(a) for d in dihedrals]), a, energy
+            )
+        logger.info(f"Tight opt {k+1}/{len(candidates)}: E-E0 = {rel:12.6f} eV")
+
+    if not optimized:
+        return []
+
+    # Post-optimization dedup: pre-opt duplicates can split, distinct points merge.
+    optimized.sort(key=lambda t: t[1])
+    unique = _dedup(optimized, rmsd_thr=ENSEMBLE_RMSD_THRESHOLD, e_tol_eV=e_tol_eV)
+
+    # Final reporting cut + Boltzmann populations on the deduped set.
+    e_min = min(e for _, e in unique)
+    unique = [(a, e) for a, e in unique if (e - e_min) <= window_eV]
+    energies = np.array([e for _, e in unique])
+    weights = _boltzmann_weights(energies, ENSEMBLE_TEMPERATURE)
+
+    logger.info(
+        f"Final ensemble: {len(unique)} unique conformer(s) within "
+        f"{ENSEMBLE_WINDOW_KCAL} kcal/mol."
+    )
+    return [(a, e, float(w)) for (a, e), w in zip(unique, weights)]
+
+
 def run_optimization(
     atoms: Atoms,
     dihedrals: List[DihedralInfo],
@@ -446,7 +677,8 @@ def run_optimization(
     prior_module: Optional[DihedralPriorModule] = None,
     initial_prior_exponent: float = 2.0,
     prior_exponent_decay: float = 0.9,
-) -> Atoms:
+    return_ensemble: bool = False,
+) -> Union[Atoms, Tuple[Atoms, List[Tuple[Atoms, float, float]]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
     Args:
@@ -461,9 +693,16 @@ def run_optimization(
         seed: Random seed to use for initial sampling
         initial_conformers: Optional list of conformer structures to use as initial guesses
                            instead of random sampling
+        return_ensemble: If True, also select and tightly optimize a Boltzmann
+            ensemble of low-energy conformers and return it alongside the best
+            structure.
 
     Returns:
-        Optimized geometry as an Atoms object
+        If ``return_ensemble`` is False, the optimized lowest-energy geometry as
+        an Atoms object. If True, a tuple ``(best_atoms, ensemble)`` where
+        ``ensemble`` is a list of ``(atoms, relative_energy_eV, weight)`` sorted
+        by energy ascending (``best_atoms`` is the lowest-energy ensemble member,
+        or the single-best relaxation if the ensemble is empty).
     """
     # Setup initial state (relaxation, starting point, logging)
     state = _setup_initial_state(atoms, dihedrals, calc, relaxCalc, relax, out_dir)
@@ -480,6 +719,17 @@ def run_optimization(
 
     # Run Bayesian optimization loop
     _run_optimization_loop(state, n_steps, dihedrals, calc, relaxCalc, relax, out_dir)
+
+    if return_ensemble:
+        # Select and tightly optimize the low-energy ensemble. The best member
+        # is the lowest-energy conformer; fall back to single-best relaxation if
+        # the ensemble comes back empty (e.g. all evaluations failed).
+        ensemble = _perform_ensemble_relaxation(state, dihedrals, calc, relaxCalc)
+        if ensemble:
+            best_atoms = ensemble[0][0]
+        else:
+            best_atoms = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+        return best_atoms, ensemble
 
     # Final relaxation and return best structure
     return _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
