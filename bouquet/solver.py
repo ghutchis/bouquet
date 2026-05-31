@@ -441,8 +441,11 @@ def _perform_final_relaxation(
             logger.info(f"Found first good energy on step {i - state.init_steps}")
             break
 
+    # Seed from the actual best observation (aligned with best_idx/best_coords),
+    # which may come from the initial point, a seeded conformer, a random guess,
+    # or the BO loop -- not from state.best_atoms, which only tracks BO-loop wins.
     best_energy, best_atoms = evaluate_energy(
-        best_coords, state.best_atoms, dihedrals, calc, relaxCalc, steps=None
+        best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
     )
     logger.info(
         f"Performed final relaxation with dihedral constraints. "
@@ -629,9 +632,9 @@ def _perform_ensemble_relaxation(
         a = atoms.copy()
         a.set_constraint()  # remove any dihedral constraints
         energy, a = relax_structure(a, calc, relaxCalc, steps=None)
-        if energy >= FAILURE_ENERGY_EV:
-            continue
         rel = energy - state.start_energy
+        if rel >= FAILURE_ENERGY_EV:  # relative cutoff, as in candidate selection
+            continue
         optimized.append((a, rel))
         if state.add_entry is not None:
             state.add_entry(

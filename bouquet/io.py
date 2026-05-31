@@ -110,7 +110,7 @@ def initialize_structure_log(out_dir: Path) -> Tuple[Path, Path]:
     log_path = out_dir / "structures.csv"
     ens_path = out_dir / "ensemble.xyz"
 
-    with log_path.open("w") as fp:
+    with log_path.open("w", newline="") as fp:
         writer = DictWriter(fp, ["time", "coords", "xyz", "energy", "ediff"])
         writer.writeheader()
 
@@ -132,7 +132,7 @@ def create_structure_logger(
     """
 
     def add_entry(coords, atoms: Atoms, energy: float) -> None:
-        with log_path.open("a") as fp:
+        with log_path.open("a", newline="") as fp:
             writer = DictWriter(fp, ["time", "coords", "xyz", "energy", "ediff"])
             writer.writerow(
                 {
@@ -183,7 +183,7 @@ def save_ensemble(
                 fp, [atoms], comment=f"E_rel={rel_kcal:.3f} kcal/mol  pop={weight:.3f}"
             )
 
-    with (out_dir / "ensemble.csv").open("w") as fp:
+    with (out_dir / "ensemble.csv").open("w", newline="") as fp:
         writer = DictWriter(fp, ["index", "rel_energy_kcal", "weight"])
         writer.writeheader()
         for i, (atoms, rel_kcal, weight) in enumerate(rows):
