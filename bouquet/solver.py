@@ -22,6 +22,18 @@ from gpytorch import kernels as gpykernels
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import NormalPrior
 
+# iRMSD (rotation- and permutation-invariant RMSD) is an optional dependency:
+# it ships binary wheels only for some platforms, so we use it when a real
+# install is present and otherwise fall back to a Kabsch-aligned RMSD. The
+# hasattr guard also rejects the empty PyPI placeholder package.
+try:
+    import irmsd as _irmsd
+
+    _HAVE_IRMSD = hasattr(_irmsd, "get_irmsd_ase")
+except ImportError:  # pragma: no cover - exercised only without irmsd installed
+    _irmsd = None
+    _HAVE_IRMSD = False
+
 warnings.filterwarnings("ignore")
 
 from bouquet.assess import evaluate_energy, relax_structure
@@ -543,7 +555,17 @@ def _select_ensemble_candidates(
 
 
 def _rmsd(a: Atoms, b: Atoms) -> float:
-    """Kabsch-aligned RMSD over all atoms. Assumes identical atom ordering."""
+    """RMSD between two structures, in Angstrom.
+
+    When the iRMSD backend is available this is the rotation- and
+    permutation-invariant RMSD (atom ordering is canonicalized, so
+    symmetry-equivalent conformers are not counted as distinct). Otherwise it
+    falls back to a Kabsch-aligned all-atom RMSD that assumes identical atom
+    ordering.
+    """
+    if _HAVE_IRMSD:
+        return float(_irmsd.get_irmsd_ase(a, b)[0])
+
     b = b.copy()
     minimize_rotation_and_translation(a, b)  # mutates b in place toward a
     d = a.get_positions() - b.get_positions()

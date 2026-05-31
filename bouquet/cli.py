@@ -10,6 +10,8 @@ from bouquet.config import (
     DEFAULT_INIT_STEPS,
     DEFAULT_NUM_STEPS,
     DEFAULT_OPTIMIZER_METHOD,
+    DEFAULT_PRIOR_DECAY,
+    DEFAULT_PRIOR_EXPONENT,
     Configuration,
 )
 from bouquet.io import (
@@ -93,13 +95,13 @@ def main():
     parser.add_argument(
         "--prior-exponent",
         type=float,
-        default=2.0,
+        default=DEFAULT_PRIOR_EXPONENT,
         help="Initial prior exponent for PiBO (0 to disable)",
     )
     parser.add_argument(
         "--prior-decay",
         type=float,
-        default=0.9,
+        default=DEFAULT_PRIOR_DECAY,
         help="Prior exponent decay rate per iteration",
     )
     parser.add_argument(

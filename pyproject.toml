@@ -21,6 +21,10 @@ dependencies = [
 ani = ["torchani"]
 all = ["torchani"]
 test = ["pytest>=9.0", "pytest-cov>=7.0"]
+# Rotation/permutation-invariant RMSD for ensemble dedup. Optional because it
+# only ships wheels for some platforms (macOS 15+ arm64, manylinux x86_64; no
+# Windows). solver.py falls back to a Kabsch RMSD when it is not installed.
+irmsd = ["irmsd>=0.1.1"]
 
 [project.urls]
 Repository = "https://github.com/ghutchis/bouquet"

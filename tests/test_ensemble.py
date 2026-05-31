@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 import torch
 from ase import Atoms
+from ase.build import molecule
 
 from bouquet.config import KCAL_TO_EV
 from bouquet.io import save_ensemble
 from bouquet.solver import (
+    _HAVE_IRMSD,
     OptimizationState,
     _boltzmann_weights,
     _dedup,
@@ -21,8 +23,22 @@ from bouquet.solver import (
 
 
 def _h2(length: float) -> Atoms:
-    """A simple two-atom molecule with a tunable bond length."""
+    """A simple two-atom molecule with a tunable bond length.
+
+    Used only as a lightweight placeholder where the RMSD backend is never
+    invoked (selection and file-writing tests).
+    """
     return Atoms("H2", positions=[[0, 0, 0], [0, 0, length]])
+
+
+def _mol() -> Atoms:
+    """A real multi-atom molecule for RMSD tests.
+
+    The iRMSD backend canonicalizes/aligns whole molecules and is undefined for
+    trivial 2-atom inputs, so RMSD/dedup tests use ethanol (9 atoms), which
+    works under both the iRMSD and Kabsch-fallback code paths.
+    """
+    return molecule("CH3CH2OH")
 
 
 class TestBoltzmannWeights:
@@ -41,36 +57,58 @@ class TestBoltzmannWeights:
 
 
 class TestRmsdAndDedup:
-    def test_rmsd_identical_is_zero(self):
-        a = _h2(1.0)
-        assert _rmsd(a, a.copy()) < 1e-9
-
-    def test_rmsd_invariant_to_translation(self):
-        a = _h2(1.0)
+    def test_rmsd_invariant_to_rotation_and_translation(self):
+        a = _mol()
         b = a.copy()
+        b.rotate(57.0, "y")
         b.translate([5.0, -2.0, 1.0])
-        assert _rmsd(a, b) < 1e-9
+        # Same conformer up to rigid-body motion: RMSD ~ 0 under both backends.
+        assert _rmsd(a, b) < 1e-3
+
+    def test_rmsd_distinct_geometry_is_large(self):
+        a = _mol()
+        c = a.copy()
+        c.rattle(0.5, seed=42)  # large random displacement
+        assert _rmsd(a, c) > 0.125
 
     def test_dedup_merges_near_identical(self):
         e_tol = 0.1 * KCAL_TO_EV
-        a = _h2(1.0)
-        b = _h2(1.0)  # geometrically identical, energy-close
+        a = _mol()
+        b = a.copy()  # geometrically identical, energy-close
+        b.rotate(30.0, "z")
+        b.translate([1.0, 0.0, -2.0])
         unique = _dedup([(a, 0.0), (b, 0.0005)], rmsd_thr=0.125, e_tol_eV=e_tol)
         assert len(unique) == 1
 
     def test_dedup_keeps_distinct_geometry(self):
         e_tol = 0.1 * KCAL_TO_EV
-        a = _h2(1.0)
-        c = _h2(2.0)  # very different geometry, but energy-close
+        a = _mol()
+        c = a.copy()
+        c.rattle(0.5, seed=7)  # distinct geometry, but energy-close
         unique = _dedup([(a, 0.0), (c, 0.0005)], rmsd_thr=0.125, e_tol_eV=e_tol)
         assert len(unique) == 2
 
     def test_dedup_keeps_energy_separated(self):
         e_tol = 0.1 * KCAL_TO_EV
-        a = _h2(1.0)
-        b = _h2(1.0)  # identical geometry, but far in energy
+        a = _mol()
+        b = a.copy()  # identical geometry, but far in energy
         unique = _dedup([(a, 0.0), (b, 5.0 * KCAL_TO_EV)], rmsd_thr=0.125, e_tol_eV=e_tol)
         assert len(unique) == 2
+
+    @pytest.mark.skipif(
+        not _HAVE_IRMSD, reason="permutation invariance requires the iRMSD backend"
+    )
+    def test_rmsd_is_permutation_invariant(self):
+        # Swapping two symmetry-equivalent hydrogens leaves the molecule
+        # physically unchanged. iRMSD canonicalizes atom ordering and reports
+        # ~0; the Kabsch fallback (ordering-dependent) would report ~1.1 A.
+        m = molecule("CH4")
+        swapped = m.copy()
+        pos = swapped.get_positions()
+        pos[[1, 2]] = pos[[2, 1]]
+        swapped.set_positions(pos)
+
+        assert _rmsd(m, swapped) < 1e-3
 
 
 def _make_state(energies, coords, atoms, start_energy=-100.0):

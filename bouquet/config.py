@@ -12,6 +12,69 @@ from bouquet.calculator import MethodType, SUPPORTED_METHODS
 __all__ = ["MethodType", "SUPPORTED_METHODS", "Configuration"]
 
 
+# Optimization defaults
+DEFAULT_NUM_STEPS = 32
+DEFAULT_INIT_STEPS = 5
+DEFAULT_RELAXATION_STEPS = 10
+DEFAULT_FMAX = 5e-2
+TIGHT_FMAX = 1e-3
+
+# Auto-scaling thresholds for optimization steps based on dihedral count
+AUTO_STEPS_THRESHOLDS = {
+    3: 25,  # <= 3 dihedrals
+    5: 50,  # <= 5 dihedrals
+    7: 100,  # <= 7 dihedrals
+}
+AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
+
+# Energy clipping for Bayesian optimization
+ENERGY_CLIP_OFFSET = 2.0
+
+# Gaussian process settings
+GP_PERIOD_LENGTH_MEAN = 360
+GP_PERIOD_LENGTH_STD = 0.1
+
+# Acquisition function optimization
+ACQ_NUM_RESTARTS = 64
+ACQ_RAW_SAMPLES = 64
+
+# Initial guess sampling
+INITIAL_GUESS_STD = 90
+
+# Prior (PiBO) defaults
+DEFAULT_PRIOR_EXPONENT = 2.0
+DEFAULT_PRIOR_DECAY = 0.9
+
+KCAL_TO_EV = 1.0 / 23.0605
+
+# --- Ensemble selection ---
+# Reporting window W (also used at selection); sized for ZPE / level-of-theory
+# reordering of the final ensemble.
+ENSEMBLE_WINDOW_KCAL = 6.0
+# Minimum probability that a candidate's true energy lands inside the window.
+ENSEMBLE_P_THRESHOLD = 0.01
+# Numerical floor on the posterior sigma used for the inclusion test.
+ENSEMBLE_SIGMA_FLOOR_KCAL = 0.1
+# Geometric deduplication (CREST-like): RMSD in Angstrom, paired with an
+# energy gate so only structures that are BOTH close are merged.
+ENSEMBLE_RMSD_THRESHOLD = 0.125
+ENSEMBLE_ENERGY_TOL_KCAL = 0.1
+# Temperature (K) for Boltzmann populations.
+ENSEMBLE_TEMPERATURE = 298.15
+# Relative energies above this (eV) indicate a failed evaluation and are dropped
+# before fitting the selection GP and before tight optimization.
+FAILURE_ENERGY_EV = 100.0
+# Boltzmann constant in eV/K.
+KB_EV_PER_K = 8.617333262e-5
+
+# Default methods
+DEFAULT_ENERGY_METHOD = "gfn2"
+DEFAULT_OPTIMIZER_METHOD = "gfnff"
+
+# multithreading (e.g., Psi4)
+NUM_THREADS = 4
+
+
 @dataclass(slots=True)
 class Configuration:
     """Configuration for a Bouquet optimization run."""
@@ -25,20 +88,20 @@ class Configuration:
     name: Optional[str] = None
 
     # Calculation methods
-    energy_method: MethodType = "gfn2"
-    optimizer_method: MethodType = "gfnff"
+    energy_method: MethodType = DEFAULT_ENERGY_METHOD
+    optimizer_method: MethodType = DEFAULT_OPTIMIZER_METHOD
 
     # Optimization parameters
-    num_steps: int = 32
-    init_steps: int = 5
+    num_steps: int = DEFAULT_NUM_STEPS
+    init_steps: int = DEFAULT_INIT_STEPS
     auto_steps: bool = False
     relax: bool = True
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings
     priors_file: Optional[Path] = None
-    initial_prior_exponent: float = 2.0
-    prior_exponent_decay: float = 0.9
+    initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT
+    prior_exponent_decay: float = DEFAULT_PRIOR_DECAY
 
     # Ensemble selection
     ensemble: bool = False
@@ -47,7 +110,7 @@ class Configuration:
     out_dir: Optional[Path] = None
 
     # Psi4 settings (for DFT methods)
-    num_threads: int = 4
+    num_threads: int = NUM_THREADS
     charge: int = 0
     multiplicity: int = 1
 
@@ -86,62 +149,3 @@ class Configuration:
                 break
 
         return max(0, total - num_initial)
-
-
-# Optimization defaults
-DEFAULT_NUM_STEPS = 32
-DEFAULT_INIT_STEPS = 5
-DEFAULT_RELAXATION_STEPS = 10
-DEFAULT_FMAX = 5e-2
-TIGHT_FMAX = 1e-3
-
-# Auto-scaling thresholds for optimization steps based on dihedral count
-AUTO_STEPS_THRESHOLDS = {
-    3: 25,  # <= 3 dihedrals
-    5: 50,  # <= 5 dihedrals
-    7: 100,  # <= 7 dihedrals
-}
-AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
-
-# Energy clipping for Bayesian optimization
-ENERGY_CLIP_OFFSET = 2.0
-
-# Gaussian process settings
-GP_PERIOD_LENGTH_MEAN = 360
-GP_PERIOD_LENGTH_STD = 0.1
-
-# Acquisition function optimization
-ACQ_NUM_RESTARTS = 64
-ACQ_RAW_SAMPLES = 64
-
-# Initial guess sampling
-INITIAL_GUESS_STD = 90
-
-KCAL_TO_EV = 1.0 / 23.0605
-
-# --- Ensemble selection ---
-# Reporting window W (also used at selection); sized for ZPE / level-of-theory
-# reordering of the final ensemble.
-ENSEMBLE_WINDOW_KCAL = 6.0
-# Minimum probability that a candidate's true energy lands inside the window.
-ENSEMBLE_P_THRESHOLD = 0.01
-# Numerical floor on the posterior sigma used for the inclusion test.
-ENSEMBLE_SIGMA_FLOOR_KCAL = 0.1
-# Geometric deduplication (CREST-like): RMSD in Angstrom, paired with an
-# energy gate so only structures that are BOTH close are merged.
-ENSEMBLE_RMSD_THRESHOLD = 0.125
-ENSEMBLE_ENERGY_TOL_KCAL = 0.1
-# Temperature (K) for Boltzmann populations.
-ENSEMBLE_TEMPERATURE = 298.15
-# Relative energies above this (eV) indicate a failed evaluation and are dropped
-# before fitting the selection GP and before tight optimization.
-FAILURE_ENERGY_EV = 100.0
-# Boltzmann constant in eV/K.
-KB_EV_PER_K = 8.617333262e-5
-
-# Default methods
-DEFAULT_ENERGY_METHOD = "gfn2"
-DEFAULT_OPTIMIZER_METHOD = "gfnff"
-
-# multithreading (e.g., Psi4)
-NUM_THREADS = 4
