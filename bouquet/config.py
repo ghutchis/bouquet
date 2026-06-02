@@ -44,6 +44,12 @@ INITIAL_GUESS_STD = 90
 # Prior (PiBO) defaults
 DEFAULT_PRIOR_EXPONENT = 2.0
 DEFAULT_PRIOR_DECAY = 0.9
+# Cap on von Mises concentration when fitted priors are used for search; see
+# bouquet.priors.DEFAULT_MAX_CONCENTRATION.
+DEFAULT_PRIOR_MAX_CONCENTRATION = 50.0
+# Uniform background weight mixed into each univariate prior; see
+# bouquet.priors.DEFAULT_BACKGROUND_WEIGHT. 0.0 disables it.
+DEFAULT_PRIOR_BACKGROUND_WEIGHT = 0.0
 
 KCAL_TO_EV = 1.0 / 23.0605
 
@@ -102,6 +108,8 @@ class Configuration:
     priors_file: Optional[Path] = None
     initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT
     prior_exponent_decay: float = DEFAULT_PRIOR_DECAY
+    prior_max_concentration: float = DEFAULT_PRIOR_MAX_CONCENTRATION
+    prior_background_weight: float = DEFAULT_PRIOR_BACKGROUND_WEIGHT
 
     # Ensemble selection
     ensemble: bool = False

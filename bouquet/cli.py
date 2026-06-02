@@ -10,8 +10,10 @@ from bouquet.config import (
     DEFAULT_INIT_STEPS,
     DEFAULT_NUM_STEPS,
     DEFAULT_OPTIMIZER_METHOD,
+    DEFAULT_PRIOR_BACKGROUND_WEIGHT,
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
+    DEFAULT_PRIOR_MAX_CONCENTRATION,
     Configuration,
 )
 from bouquet.io import (
@@ -105,6 +107,22 @@ def main():
         help="Prior exponent decay rate per iteration",
     )
     parser.add_argument(
+        "--prior-max-concentration",
+        type=float,
+        default=DEFAULT_PRIOR_MAX_CONCENTRATION,
+        help="Cap on fitted von Mises concentration (kappa) used as a search prior. "
+        "Raw histogram fits can be near-delta (kappa ~1e4); capping keeps the prior "
+        "smooth enough for the acquisition optimizer to follow (<=0 disables the cap).",
+    )
+    parser.add_argument(
+        "--prior-background-weight",
+        type=float,
+        default=DEFAULT_PRIOR_BACKGROUND_WEIGHT,
+        help="Weight in [0,1) of a uniform background mixed into each univariate "
+        "prior: (1-w)*vonMises + w*uniform. Bounds how strongly any single mode can "
+        "dominate the acquisition and gives a smooth floor. 0 disables it. Try 0.05-0.2.",
+    )
+    parser.add_argument(
         "--ensemble",
         action="store_true",
         help="Select a Boltzmann ensemble of low-energy conformers, tightly "
@@ -130,6 +148,8 @@ def main():
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
         prior_exponent_decay=args.prior_decay,
+        prior_max_concentration=args.prior_max_concentration,
+        prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
     )
 
@@ -194,10 +214,18 @@ def main():
 
         # Get dihedral atom tuples
         dihedral_tuples = [d.chain for d in dihedrals]
+        # <=0 disables the cap (use the raw fitted concentrations).
+        max_conc = (
+            config.prior_max_concentration
+            if config.prior_max_concentration > 0
+            else None
+        )
         prior_module = create_prior_module(
             mol=mol,
             dihedrals=dihedral_tuples,
             univariate_file=config.priors_file,
+            max_concentration=max_conc,
+            background_weight=config.prior_background_weight,
         )
         logger.info(f"Created prior module from {config.priors_file}")
         logger.info(prior_module.describe())

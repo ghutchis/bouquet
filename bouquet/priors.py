@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 
 PriorTypeId = Union[str, int]
 
+# Default cap on von Mises concentration (kappa) when a fitted prior is used as a
+# PiBO search prior. kappa=50 corresponds to a ~8 deg (1-sigma) basin, broad enough
+# for the acquisition optimizer to climb while still expressing a clear preference.
+# Raw histogram fits can reach kappa ~ 1e4 (~0.5 deg), which is unusable for search.
+DEFAULT_MAX_CONCENTRATION: float = 50.0
+
+# Default weight of a uniform background component mixed into each univariate prior.
+# 0.0 disables it (pure fitted mixture). A small weight (e.g. 0.05-0.2) bounds the
+# prior's dynamic range so no single mode can dominate the acquisition, and replaces
+# the hard log-prob clamp with a smooth, principled floor.
+DEFAULT_BACKGROUND_WEIGHT: float = 0.0
+
 
 class BivariateTopology(Enum):
     """Defines how matched atoms map to two dihedrals in a bivariate pattern.
@@ -159,7 +171,12 @@ BUILTIN_UNIVARIATE_SMARTS: List[UnivariateSMARTS] = [
 class BivariateVonMisesMixture(nn.Module):
     """Mixture of bivariate von Mises distributions for correlated angles."""
 
-    def __init__(self, components: List[Dict[str, float]], weights: List[float]):
+    def __init__(
+        self,
+        components: List[Dict[str, float]],
+        weights: List[float],
+        max_concentration: Optional[float] = None,
+    ):
         super().__init__()
 
         weights_t = torch.tensor(weights, dtype=torch.float64)
@@ -171,14 +188,20 @@ class BivariateVonMisesMixture(nn.Module):
 
         mu1 = [math.radians(c["mu1_deg"]) for c in components]
         mu2 = [math.radians(c["mu2_deg"]) for c in components]
-        k1 = [c["kappa1"] for c in components]
-        k2 = [c["kappa2"] for c in components]
+        k1 = torch.tensor([c["kappa1"] for c in components], dtype=torch.float64)
+        k2 = torch.tensor([c["kappa2"] for c in components], dtype=torch.float64)
         corr = [c.get("correlation", 0.0) for c in components]
+
+        # Cap concentrations so a near-delta histogram fit becomes a usable, smooth
+        # *search* prior. See DihedralPriorModule.max_concentration for rationale.
+        if max_concentration is not None:
+            k1 = k1.clamp(max=max_concentration)
+            k2 = k2.clamp(max=max_concentration)
 
         self.register_buffer("mu1", torch.tensor(mu1, dtype=torch.float64))
         self.register_buffer("mu2", torch.tensor(mu2, dtype=torch.float64))
-        self.register_buffer("kappa1", torch.tensor(k1, dtype=torch.float64))
-        self.register_buffer("kappa2", torch.tensor(k2, dtype=torch.float64))
+        self.register_buffer("kappa1", k1)
+        self.register_buffer("kappa2", k2)
         self.register_buffer("correlation", torch.tensor(corr, dtype=torch.float64))
 
     def log_prob(self, phi: Tensor, psi: Tensor) -> Tensor:
@@ -211,11 +234,13 @@ class DihedralPriorModule(nn.Module):
 
     Supports both independent (1D) and correlated (2D) dihedral priors.
 
-    Usage with PiBO:
+    Usage with PiBO (forward returns a LOG probability, so pair it with a
+    log-scale acquisition and log=True):
         prior_module = DihedralPriorModule(...)
         pibo_acqf = PriorGuidedAcquisitionFunction(
-            acq_function=base_acqf,
+            acq_function=LogExpectedImprovement(...),
             prior_module=prior_module,
+            log=True,
             prior_exponent=2.0,
         )
     """
@@ -229,6 +254,8 @@ class DihedralPriorModule(nn.Module):
         bivariate_priors: Dict[PriorTypeId, Dict],
         fallback_type: PriorTypeId = "sp3_sp3",
         input_in_degrees: bool = True,
+        max_concentration: Optional[float] = DEFAULT_MAX_CONCENTRATION,
+        background_weight: float = DEFAULT_BACKGROUND_WEIGHT,
     ):
         """
         Args:
@@ -239,12 +266,30 @@ class DihedralPriorModule(nn.Module):
             bivariate_priors: Prior type definitions for 2D
             fallback_type: Default type for unassigned dimensions
             input_in_degrees: If True, input is in degrees [0, 360); else [0, 1]
+            max_concentration: Upper bound applied to every von Mises concentration
+                (kappa). Histogram fits can produce kappa ~ 1e4 (a ~0.5 deg-wide
+                spike) for near-rigid bonds; as a PiBO *search* prior that collapses
+                to a near-delta that is flat (and gradient-free) across virtually the
+                entire domain, so the acquisition optimizer cannot follow it. Capping
+                kappa turns each mode into a finite-width basin the optimizer can
+                actually climb. ``None`` disables the cap (use the raw fitted values).
+            background_weight: Weight ``w`` in [0, 1) of a uniform background mixed
+                into each univariate factor: ``(1-w) * vonMises_mixture + w * U``,
+                where ``U = 1/(2*pi)`` is the uniform density on the circle. This
+                bounds the log-prob range a single mode can contribute (so the prior
+                informs without dominating/trapping the search) and gives a smooth
+                lower floor in place of the hard log-prob clamp. 0.0 disables it.
         """
         super().__init__()
+
+        if not 0.0 <= background_weight < 1.0:
+            raise ValueError("background_weight must be in [0, 1)")
 
         self.dim = dim
         self.fallback_type = fallback_type
         self.input_in_degrees = input_in_degrees
+        self.max_concentration = max_concentration
+        self.background_weight = background_weight
         self.univariate_assignments = univariate_assignments
         self.bivariate_assignments = bivariate_assignments
 
@@ -284,6 +329,8 @@ class DihedralPriorModule(nn.Module):
             [math.radians(m) for m in type_def["means_deg"]], dtype=torch.float64
         )
         concs = torch.tensor(type_def["concentrations"], dtype=torch.float64)
+        if self.max_concentration is not None:
+            concs = concs.clamp(max=self.max_concentration)
         weights = torch.tensor(type_def["weights"], dtype=torch.float64)
         if weights.sum() == 0:
             raise ValueError(f"Weights must sum to a non-zero value for dim {d}")
@@ -306,6 +353,7 @@ class DihedralPriorModule(nn.Module):
             self.bivariate_dists[(d1, d2)] = BivariateVonMisesMixture(
                 components=type_def["components"],
                 weights=type_def["weights"],
+                max_concentration=self.max_concentration,
             )
 
     def _to_radians(self, x: Tensor) -> Tensor:
@@ -319,40 +367,64 @@ class DihedralPriorModule(nn.Module):
 
     def forward(self, X: Tensor) -> Tensor:
         """
-        Compute probability of X under the prior.
+        Compute the LOG probability of X under the prior.
 
-        PriorGuidedAcquisitionFunction expects probabilities in [0, 1], not log
-        probabilities. It multiplies: acqf_value * prior(X)^exponent
+        This is paired with ``PriorGuidedAcquisitionFunction(..., log=True)`` and a
+        log-scale base acquisition (``LogExpectedImprovement``). In that mode
+        botorch forms the PiBO objective additively:
+
+            weighted_af = logEI(X) + prior_exponent * log_prior(X)
+
+        which is the correct PiBO formula (Hvarfner 2022). Returning a *probability*
+        here instead (and using ``log=False``) would multiply a log-scale, almost
+        always negative ``logEI`` by ``prior**exponent``, which inverts the prior's
+        influence and steers the search away from the prior's own modes.
 
         Args:
             X: Shape (..., q, dim) - dihedral values
 
         Returns:
-            Probability (normalized to [0, 1]), shape (..., q)
+            Log probability (unnormalized), shape (..., q). With
+            ``background_weight == 0`` the far field is clamped at -20; with a
+            background the uniform component provides the (smooth) lower floor.
         """
         log_prob = torch.zeros(X.shape[:-1], dtype=X.dtype, device=X.device)
+
+        # Each univariate factor is a normalized circular density, so we can mix in
+        # a uniform background per-dimension: log[(1-w)*vM(theta) + w/(2*pi)].
+        w_bg = self.background_weight
+        if w_bg > 0.0:
+            log_uniform = -math.log(2.0 * math.pi)  # uniform density on the circle
+            log_one_minus_w = math.log(1.0 - w_bg)
+            log_w = math.log(w_bg)
 
         # Univariate contributions
         for d, dist in self.univariate_dists.items():
             if dist is None:
                 continue
             angle = self._to_radians(X[..., d])
-            log_prob = log_prob + dist.log_prob(angle)
+            vm_lp = dist.log_prob(angle)
+            if w_bg > 0.0:
+                bg_lp = torch.full_like(vm_lp, log_w + log_uniform)
+                vm_lp = torch.logaddexp(log_one_minus_w + vm_lp, bg_lp)
+            log_prob = log_prob + vm_lp
 
-        # Bivariate contributions
+        # Bivariate contributions. These factors are *unnormalized*, so the uniform
+        # background (which needs a normalized density to mix against) is not applied
+        # here; they keep the hard clamp below as their floor.
         for (d1, d2), dist in self.bivariate_dists.items():
             angle1 = self._to_radians(X[..., d1])
             angle2 = self._to_radians(X[..., d2])
             log_prob = log_prob + dist.log_prob(angle1, angle2)
 
-        # Convert log probability to probability in (0, 1]
-        # Clamp to avoid underflow when exponentiating very negative log probs
-        # -20 corresponds to prob ~2e-9, which is effectively zero but still
-        # provides gradients
-        log_prob_clamped = torch.clamp(log_prob, min=-20.0)
-        prob = torch.exp(log_prob_clamped)
-
-        return prob
+        if w_bg > 0.0:
+            # The per-dimension uniform background already bounds log_prob from
+            # below (>= dim * log(w/(2*pi))), so no hard clamp is needed -- clamping
+            # here would flatten the smooth background floor back to a dead region.
+            return log_prob
+        # No background: clamp the floor so a candidate far from every prior mode
+        # incurs a bounded penalty (still carrying a gradient) instead of -inf.
+        return torch.clamp(log_prob, min=-20.0)
 
     def describe(self) -> str:
         """Human-readable description of assignments."""
@@ -658,6 +730,8 @@ def create_prior_module(
     univariate_file: Optional[Union[str, Path]] = None,
     bivariate_file: Optional[Union[str, Path]] = None,
     fallback_type: PriorTypeId = "sp3_sp3",
+    max_concentration: Optional[float] = DEFAULT_MAX_CONCENTRATION,
+    background_weight: float = DEFAULT_BACKGROUND_WEIGHT,
 ) -> DihedralPriorModule:
     """
     Create a DihedralPriorModule for a molecule.
@@ -668,6 +742,10 @@ def create_prior_module(
         univariate_file: Optional JSON file with univariate priors
         bivariate_file: Optional JSON file with bivariate priors
         fallback_type: Default prior type for unmatched dihedrals
+        max_concentration: Cap on von Mises concentration (kappa); see
+            DihedralPriorModule. ``None`` disables the cap.
+        background_weight: Uniform background weight mixed into each univariate
+            prior; see DihedralPriorModule. 0.0 disables it.
 
     Returns:
         Configured DihedralPriorModule
@@ -708,4 +786,6 @@ def create_prior_module(
         bivariate_priors=bivariate_priors,
         fallback_type=fallback_type,
         input_in_degrees=False,  # PiBO operates in [0,1] normalized space
+        max_concentration=max_concentration,
+        background_weight=background_weight,
     )
