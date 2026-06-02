@@ -51,6 +51,7 @@ gcp-correction = "*"
 pytest = ">=9.0.2,<10"
 pytest-cov = ">=7.0.0,<8"
 python = "==3.12"
+pandas = ">=3.0.3,<4"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -185,9 +185,14 @@ def _select_next_points_botorch(
                 "optimizer operates in normalized [0, 1] space. Build the "
                 "module with create_prior_module (or input_in_degrees=False)."
             )
+        # base_acqf is LogExpectedImprovement (log-scale) and prior_module emits a
+        # log probability, so log=True makes botorch combine them additively
+        # (logEI + exponent * log_prior) -- the correct PiBO form. Without log=True
+        # botorch would multiply logEI by prior**exponent, inverting the prior.
         acqf = PriorGuidedAcquisitionFunction(
             acq_function=base_acqf,
             prior_module=prior_module,
+            log=True,
             prior_exponent=prior_exponent,
         )
     else:
