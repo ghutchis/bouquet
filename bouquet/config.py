@@ -40,6 +40,12 @@ ACQ_RAW_SAMPLES = 64
 
 # Initial guess sampling
 INITIAL_GUESS_STD = 90
+# How initial guesses are generated: "random" (Gaussian around the start) or
+# "peaks" (systematic grid / weighted sampling from the dihedral prior peaks).
+DEFAULT_INIT_METHOD = "random"
+# Maximum systematic peak-grid size for --init-method peaks before falling back
+# to weighted sampling (e.g. 3 modes x 3 dihedrals = 27 fits; x4 = 81 does not).
+DEFAULT_INIT_GRID_BUDGET = 64
 
 # Prior (PiBO) defaults
 DEFAULT_PRIOR_EXPONENT = 2.0
@@ -100,6 +106,8 @@ class Configuration:
     # Optimization parameters
     num_steps: int = DEFAULT_NUM_STEPS
     init_steps: int = DEFAULT_INIT_STEPS
+    init_method: str = DEFAULT_INIT_METHOD
+    init_grid_budget: int = DEFAULT_INIT_GRID_BUDGET
     auto_steps: bool = False
     relax: bool = True
     seed: int = field(default_factory=lambda: datetime.now().microsecond)

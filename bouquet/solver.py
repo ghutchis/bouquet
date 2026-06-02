@@ -1,5 +1,6 @@
 """Methods for solving the conformer option problem"""
 
+import itertools
 import logging
 import warnings
 from dataclasses import dataclass, field
@@ -279,6 +280,93 @@ def _setup_initial_state(
     return state
 
 
+def plan_initial_points(
+    prior_module: DihedralPriorModule,
+    n_dihedrals: int,
+    start_coords: np.ndarray,
+    init_steps: int,
+    grid_budget: int,
+    seed: int,
+) -> np.ndarray:
+    """Plan initial dihedral guesses from the peaks of a dihedral prior.
+
+    Builds either a systematic grid over the prior's peaks (when the full
+    Cartesian product of per-axis modes fits within ``grid_budget``) or a
+    weighted random sample from those peaks (when it does not, or when
+    ``init_steps`` points are wanted from a large space). Dihedrals with a
+    uniform prior carry their starting-geometry angle in the systematic grid
+    (the start geometry comes from ETKDG or supplied conformers, so it is
+    physically realistic) and are drawn uniformly at random when sampling.
+
+    Args:
+        prior_module: Prior whose peaks seed the guesses (see ``peak_modes``).
+        n_dihedrals: Number of dihedral dimensions.
+        start_coords: Starting dihedral angles (degrees), used to fill
+            uniform-prior dimensions in the systematic grid.
+        init_steps: Number of guesses to draw when sampling.
+        grid_budget: Maximum systematic grid size before falling back to
+            sampling.
+        seed: Random seed for the sampling fallback.
+
+    Returns:
+        Array of shape ``(n_points, n_dihedrals)`` in degrees [0, 360).
+    """
+    axes, uniform_dims = prior_module.peak_modes()
+    start_coords = np.asarray(start_coords, dtype=float)
+    rng = np.random.default_rng(seed)
+
+    grid_size = 1
+    for _dims, candidates in axes:
+        grid_size *= len(candidates)
+
+    # Systematic grid over every peak combination (uniform dims keep their
+    # start angle, so the only variation there comes from the optimizer).
+    if axes and grid_size <= grid_budget:
+        points = []
+        candidate_lists = [candidates for _dims, candidates in axes]
+        for combo in itertools.product(*candidate_lists):
+            pt = start_coords.copy()
+            for (dims, _c), (values, _w) in zip(axes, combo):
+                for dim, val in zip(dims, values):
+                    pt[dim] = val
+            points.append(pt % 360.0)
+        return np.array(points)
+
+    # Weighted sampling from the peaks. With no peaked axes at all this degrades
+    # to uniform-random guesses, so "peaks" still yields a spread of points.
+    axis_weights = [
+        np.array([w for _v, w in candidates], dtype=float)
+        for _dims, candidates in axes
+    ]
+    axis_weights = [w / w.sum() for w in axis_weights]
+
+    points = []
+    seen = set()
+    max_attempts = max(20 * init_steps, 100)
+    for _ in range(max_attempts):
+        if len(points) >= init_steps:
+            break
+        pt = start_coords.copy()
+        for d in uniform_dims:
+            pt[d] = rng.uniform(0.0, 360.0)
+        for (dims, candidates), weights in zip(axes, axis_weights):
+            values, _w = candidates[rng.choice(len(candidates), p=weights)]
+            for dim, val in zip(dims, values):
+                pt[dim] = val
+        pt = pt % 360.0
+        # Dedup on rounded coordinates: independent draws collide when peaks are
+        # few, but distinct uniform-dim values keep otherwise-equal points apart.
+        key = tuple(np.round(pt, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append(pt)
+
+    if not points:
+        return np.empty((0, n_dihedrals))
+    return np.array(points)
+
+
 def _evaluate_initial_guesses(
     state: OptimizationState,
     dihedrals: List[DihedralInfo],
@@ -288,10 +376,12 @@ def _evaluate_initial_guesses(
     init_steps: int,
     seed: int,
     initial_conformers: Optional[List[Atoms]],
+    initial_dihedrals: Optional[np.ndarray] = None,
 ) -> None:
     """Evaluate initial guesses and update state in-place.
 
-    Uses provided conformers if available, otherwise generates random guesses.
+    Precedence: provided conformers, then prior-peak guesses
+    (``initial_dihedrals``), then random Gaussian guesses around the start.
 
     Args:
         state: Optimization state to update
@@ -299,9 +389,11 @@ def _evaluate_initial_guesses(
         calc: Calculator for energy evaluation
         relaxCalc: Calculator used for geometry relaxation
         relax: Whether to relax non-dihedral degrees of freedom
-        init_steps: Number of random guesses if no conformers provided
+        init_steps: Number of random guesses if no conformers/peaks provided
         seed: Random seed for random sampling
         initial_conformers: Optional list of conformer structures
+        initial_dihedrals: Optional array of dihedral guesses (degrees),
+            shape (n_points, n_dihedrals), e.g. from ``plan_initial_points``
     """
     if initial_conformers is not None:
         state.init_steps = len(initial_conformers)
@@ -314,6 +406,25 @@ def _evaluate_initial_guesses(
             rel_energy = energy - state.start_energy
             logger.info(
                 f"Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}"
+            )
+
+            state.append_observation(guess, rel_energy, cur_atoms)
+
+            if state.add_entry is not None:
+                state.add_entry(guess, cur_atoms, energy)
+    elif initial_dihedrals is not None:
+        state.init_steps = len(initial_dihedrals)
+        logger.info(
+            f"Using {state.init_steps} prior-peak initial guesses"
+        )
+        for i, guess in enumerate(initial_dihedrals):
+            guess = np.asarray(guess, dtype=float) % 360.0
+            energy, cur_atoms = evaluate_energy(
+                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            )
+            rel_energy = energy - state.start_energy
+            logger.info(
+                f"Evaluated peak guess {i+1: >3}/{len(initial_dihedrals)}. Energy-E0: {rel_energy:12.6f}"
             )
 
             state.append_observation(guess, rel_energy, cur_atoms)
@@ -678,6 +789,7 @@ def run_optimization(
     relax: bool = True,
     seed: int = 0,
     initial_conformers: Optional[List[Atoms]] = None,
+    initial_dihedrals: Optional[np.ndarray] = None,
     # New PiBO parameters
     prior_module: Optional[DihedralPriorModule] = None,
     initial_prior_exponent: float = 2.0,
@@ -698,6 +810,9 @@ def run_optimization(
         seed: Random seed to use for initial sampling
         initial_conformers: Optional list of conformer structures to use as initial guesses
                            instead of random sampling
+        initial_dihedrals: Optional array of dihedral guesses (degrees) to use as
+                           initial points (e.g. from plan_initial_points). Used
+                           when no conformers are provided; falls back to random.
         return_ensemble: If True, also select and tightly optimize a Boltzmann
             ensemble of low-energy conformers and return it alongside the best
             structure.
@@ -717,9 +832,10 @@ def run_optimization(
     state.prior_exponent = initial_prior_exponent
     state.prior_decay = prior_exponent_decay
 
-    # Evaluate initial guesses (conformers or random)
+    # Evaluate initial guesses (conformers, prior peaks, or random)
     _evaluate_initial_guesses(
-        state, dihedrals, calc, relaxCalc, relax, init_steps, seed, initial_conformers
+        state, dihedrals, calc, relaxCalc, relax, init_steps, seed,
+        initial_conformers, initial_dihedrals,
     )
 
     # Run Bayesian optimization loop
