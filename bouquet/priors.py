@@ -354,6 +354,65 @@ class DihedralPriorModule(nn.Module):
 
         return prob
 
+    def peak_modes(
+        self,
+    ) -> Tuple[
+        List[Tuple[Tuple[int, ...], List[Tuple[Tuple[float, ...], float]]]],
+        List[int],
+    ]:
+        """Per-axis peak locations, for seeding initial points from the prior.
+
+        A univariate dihedral is one axis; a correlated bivariate pair is a
+        single *joint* axis, so taking the product over axes does not break the
+        correlation between the paired dihedrals.
+
+        Returns:
+            ``(axes, uniform_dims)`` where:
+
+            - ``axes`` is a list of ``(dims, candidates)``. ``dims`` is a tuple
+              of dihedral indices (length 1 for a univariate axis, 2 for a
+              bivariate pair). ``candidates`` is a list of
+              ``(values_deg, weight)``: one mode of that axis, with
+              ``values_deg`` aligned to ``dims`` (degrees in [0, 360)) and
+              ``weight`` the normalized mixture weight.
+            - ``uniform_dims`` lists dihedral indices with no angular preference
+              (a uniform prior); callers should leave these to the optimizer.
+        """
+        axes: List[Tuple[Tuple[int, ...], List[Tuple[Tuple[float, ...], float]]]] = []
+        uniform_dims: List[int] = []
+
+        # Univariate axes (one dim each); a None distribution is uniform (no peaks).
+        for d, dist in self.univariate_dists.items():
+            if dist is None:
+                uniform_dims.append(d)
+                continue
+            locs = dist.component_distribution.loc.detach().cpu().numpy()
+            probs = dist.mixture_distribution.probs.detach().cpu().numpy()
+            candidates = [
+                ((float(math.degrees(loc) % 360.0),), float(w))
+                for loc, w in zip(locs, probs)
+            ]
+            axes.append(((d,), candidates))
+
+        # Bivariate axes: a correlated pair is one joint axis of (mu1, mu2) peaks.
+        for (d1, d2), dist in self.bivariate_dists.items():
+            mu1 = dist.mu1.detach().cpu().numpy()
+            mu2 = dist.mu2.detach().cpu().numpy()
+            probs = dist.weights.detach().cpu().numpy()
+            candidates = [
+                (
+                    (
+                        float(math.degrees(m1) % 360.0),
+                        float(math.degrees(m2) % 360.0),
+                    ),
+                    float(w),
+                )
+                for m1, m2, w in zip(mu1, mu2, probs)
+            ]
+            axes.append(((d1, d2), candidates))
+
+        return axes, uniform_dims
+
     def describe(self) -> str:
         """Human-readable description of assignments."""
         lines = [f"DihedralPriorModule (dim={self.dim})"]
