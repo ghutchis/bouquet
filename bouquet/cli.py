@@ -242,7 +242,7 @@ def main():
         )
 
     # Compute the number of optimization steps (handles auto mode)
-    if initial_conformers:
+    if initial_conformers is not None:
         initial_count = len(initial_conformers)
     elif initial_dihedrals is not None:
         initial_count = len(initial_dihedrals)
