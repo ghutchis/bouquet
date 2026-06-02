@@ -285,6 +285,9 @@ class DihedralPriorModule(nn.Module):
         if not 0.0 <= background_weight < 1.0:
             raise ValueError("background_weight must be in [0, 1)")
 
+        if max_concentration is not None and max_concentration <= 0:
+            raise ValueError("max_concentration must be > 0 or None")
+
         self.dim = dim
         self.fallback_type = fallback_type
         self.input_in_degrees = input_in_degrees
