@@ -38,7 +38,7 @@ class TestCalculatorFactory:
         with patch.dict("sys.modules", {"xtb.ase.calculator": mock_module, "xtb": MagicMock()}):
             calc = CalculatorFactory.create("gfn0")
             assert calc is not None
-            mock_xtb_class.assert_called_once_with(method="gfn0")
+            mock_xtb_class.assert_called_once_with(method="GFN0xTB")
 
     def test_create_gfnff_calculator(self):
         """Test creating a GFNFF calculator."""
@@ -75,6 +75,7 @@ class TestCalculatorFactory:
 
             mock_create.assert_called_once_with(
                 method="gfn2",
+                mol=None,
                 num_threads=config.num_threads,
                 charge=config.charge,
                 multiplicity=config.multiplicity,
@@ -96,6 +97,7 @@ class TestCalculatorFactory:
 
             mock_create.assert_called_once_with(
                 method="gfnff",
+                mol=None,
                 num_threads=config.num_threads,
                 charge=config.charge,
                 multiplicity=config.multiplicity,
@@ -116,6 +118,7 @@ class TestCalculatorFactory:
 
             mock_create.assert_called_once_with(
                 method="b3lyp",
+                mol=None,
                 num_threads=8,
                 charge=1,
                 multiplicity=2,

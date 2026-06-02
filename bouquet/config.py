@@ -137,6 +137,14 @@ class Configuration:
         if isinstance(self.priors_file, str):
             self.priors_file = Path(self.priors_file)
 
+        # Derive a run name from the input if one wasn't provided: prefer the
+        # SMILES string, otherwise fall back to the input file's stem.
+        if self.name is None:
+            if self.smiles is not None:
+                self.name = self.smiles
+            elif self.input_file is not None:
+                self.name = self.input_file.stem
+
     def compute_auto_steps(self, num_dihedrals: int, num_initial: int) -> int:
         """Compute the number of optimization steps based on dihedral count.
 

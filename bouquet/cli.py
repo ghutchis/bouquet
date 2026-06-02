@@ -130,13 +130,11 @@ def main():
     )
     args = parser.parse_args()
 
-    name = args.name or args.smiles or (Path(args.file).stem if args.file else None)
-
     # Create configuration from parsed arguments
     config = Configuration(
         smiles=args.smiles,
         input_file=Path(args.file) if args.file else None,
-        name=name,
+        name=args.name,
         conformer_file=Path(args.conformer_file) if args.conformer_file else None,
         energy_method=args.energy,
         optimizer_method=args.optimizer,
@@ -155,7 +153,7 @@ def main():
 
     # Make an output directory
     out_dir = create_output_directory(
-        name, config.seed, config.energy_method, args.__dict__
+        config.name, config.seed, config.energy_method, args.__dict__
     )
     config.out_dir = out_dir
 
