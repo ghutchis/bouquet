@@ -287,6 +287,7 @@ def plan_initial_points(
     init_steps: int,
     grid_budget: int,
     seed: int,
+    max_points: Optional[int] = None,
 ) -> np.ndarray:
     """Plan initial dihedral guesses from the peaks of a dihedral prior.
 
@@ -298,6 +299,11 @@ def plan_initial_points(
     (the start geometry comes from ETKDG or supplied conformers, so it is
     physically realistic) and are drawn uniformly at random when sampling.
 
+    The systematic grid is ordered **best-first** by descending joint prior
+    weight (the product of the per-axis mode weights), so the most probable mode
+    combinations are evaluated first. This improves anytime behavior and means
+    that truncating to ``max_points`` keeps the most probable conformers.
+
     Args:
         prior_module: Prior whose peaks seed the guesses (see ``peak_modes``).
         n_dihedrals: Number of dihedral dimensions.
@@ -307,6 +313,10 @@ def plan_initial_points(
         grid_budget: Maximum systematic grid size before falling back to
             sampling.
         seed: Random seed for the sampling fallback.
+        max_points: Optional cap on the number of guesses returned. For the
+            systematic grid this truncates to the ``max_points`` highest-weight
+            mode combinations (leaving budget for later refinement); for sampling
+            it caps the number of draws.
 
     Returns:
         Array of shape ``(n_points, n_dihedrals)`` in degrees [0, 360).
@@ -322,9 +332,19 @@ def plan_initial_points(
     # Systematic grid over every peak combination (uniform dims keep their
     # start angle, so the only variation there comes from the optimizer).
     if axes and grid_size <= grid_budget:
-        points = []
         candidate_lists = [candidates for _dims, candidates in axes]
-        for combo in itertools.product(*candidate_lists):
+        # Evaluate the most probable mode combinations first: the joint weight is
+        # the product of each axis's mode weight. Best-first ordering makes the
+        # early-budget points the likely conformers and makes truncation principled.
+        combos = sorted(
+            itertools.product(*candidate_lists),
+            key=lambda combo: float(np.prod([w for _v, w in combo])),
+            reverse=True,
+        )
+        if max_points is not None:
+            combos = combos[:max_points]
+        points = []
+        for combo in combos:
             pt = start_coords.copy()
             for (dims, _c), (values, _w) in zip(axes, combo):
                 for dim, val in zip(dims, values):
@@ -340,11 +360,12 @@ def plan_initial_points(
     ]
     axis_weights = [w / w.sum() for w in axis_weights]
 
+    target = init_steps if max_points is None else min(init_steps, max_points)
     points = []
     seen = set()
-    max_attempts = max(20 * init_steps, 100)
+    max_attempts = max(20 * target, 100)
     for _ in range(max_attempts):
-        if len(points) >= init_steps:
+        if len(points) >= target:
             break
         pt = start_coords.copy()
         for d in uniform_dims:
@@ -824,6 +845,15 @@ def run_optimization(
         by energy ascending (``best_atoms`` is the lowest-energy ensemble member,
         or the single-best relaxation if the ensemble is empty).
     """
+    # Seed every RNG the run touches from `seed`, so a run is reproducible and the
+    # seed actually controls the search. The acquisition optimizer (optimize_acqf)
+    # draws its restart points from torch's global RNG at every BO step; without
+    # this that dominant stochasticity is uncontrolled (and config.seed would only
+    # affect the numpy-drawn initial guesses). Seeding torch also enables
+    # common-random-number paired comparisons across arms at a fixed seed.
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     # Setup initial state (relaxation, starting point, logging)
     state = _setup_initial_state(atoms, dihedrals, calc, relaxCalc, relax, out_dir)
 

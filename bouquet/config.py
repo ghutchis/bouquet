@@ -26,6 +26,11 @@ AUTO_STEPS_THRESHOLDS = {
     7: 100,  # <= 7 dihedrals
 }
 AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
+# Under --auto, reserve at least this many BO refinement steps when seeding many
+# initial points (e.g. a systematic peak grid): the seeded points are capped to
+# total - this, so a large grid can't consume the whole budget and leave zero
+# refinement. Targets small molecules where grid size >= the auto total.
+DEFAULT_MIN_AUTO_BO_STEPS = 10
 
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
@@ -153,6 +158,22 @@ class Configuration:
             elif self.input_file is not None:
                 self.name = self.input_file.stem
 
+    def auto_total(self, num_dihedrals: int) -> int:
+        """Total --auto evaluation budget (initial guesses + BO steps).
+
+        Args:
+            num_dihedrals: Number of dihedral angles detected
+
+        Returns:
+            The tiered total evaluation budget for this dihedral count.
+        """
+        total = AUTO_STEPS_DEFAULT
+        for threshold, steps in sorted(AUTO_STEPS_THRESHOLDS.items()):
+            if num_dihedrals <= threshold:
+                total = steps
+                break
+        return total
+
     def compute_auto_steps(self, num_dihedrals: int, num_initial: int) -> int:
         """Compute the number of optimization steps based on dihedral count.
 
@@ -166,10 +187,4 @@ class Configuration:
         if not self.auto_steps:
             return self.num_steps
 
-        total = AUTO_STEPS_DEFAULT
-        for threshold, steps in sorted(AUTO_STEPS_THRESHOLDS.items()):
-            if num_dihedrals <= threshold:
-                total = steps
-                break
-
-        return max(0, total - num_initial)
+        return max(0, self.auto_total(num_dihedrals) - num_initial)
