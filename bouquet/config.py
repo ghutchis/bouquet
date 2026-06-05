@@ -12,6 +12,10 @@ from bouquet.calculator import MethodType, SUPPORTED_METHODS
 __all__ = ["MethodType", "SUPPORTED_METHODS", "Configuration"]
 
 
+# Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation
+# or relaxation fails; callers treat any energy at or above this as a failure.
+RELAX_FAILURE_ENERGY_EV = 1000.0
+
 # Optimization defaults
 DEFAULT_NUM_STEPS = 32
 DEFAULT_INIT_STEPS = 5
