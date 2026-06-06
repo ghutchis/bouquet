@@ -110,6 +110,13 @@ def main():
         help="Relax the non-dihedral degrees of freedom before computing energy",
     )
     parser.add_argument(
+        "--use-gradients",
+        action="store_true",
+        help="Use the gradient-enhanced GP surrogate: project the calculator's "
+        "forces onto each torsion (dE/dtheta) and feed them to the acquisition "
+        "GP, so each energy evaluation also contributes a gradient observation.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -164,6 +171,7 @@ def main():
         init_grid_budget=args.init_grid_budget,
         auto_steps=args.auto,
         relax=args.relax,
+        use_gradients=args.use_gradients,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -299,6 +307,7 @@ def main():
         initial_prior_exponent=config.initial_prior_exponent,
         prior_exponent_decay=config.prior_exponent_decay,
         return_ensemble=config.ensemble,
+        use_gradients=config.use_gradients,
     )
 
     if config.ensemble:

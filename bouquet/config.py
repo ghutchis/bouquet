@@ -34,8 +34,13 @@ AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
-# Gaussian process settings
-GP_PERIOD_LENGTH_MEAN = 360
+# Gaussian process settings.
+# The acquisition/ensemble GPs operate on dihedral inputs normalized by /360
+# (see solver.py), so a full turn is 1.0 and the periodic kernel period is
+# exactly 1.0. (A period of 360 on [0, 1] inputs makes the kernel argument
+# pi*dx/360 tiny for all pairs -> near-degenerate, near-constant covariance,
+# e.g. k(0deg, 180deg) ~= 1.)
+GP_PERIOD_LENGTH_MEAN = 1.0
 GP_PERIOD_LENGTH_STD = 0.1
 
 # Acquisition function optimization
@@ -114,6 +119,9 @@ class Configuration:
     init_grid_budget: int = DEFAULT_INIT_GRID_BUDGET
     auto_steps: bool = False
     relax: bool = True
+    # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
+    # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
+    use_gradients: bool = False
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings

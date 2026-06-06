@@ -2,6 +2,7 @@
 
 import itertools
 import logging
+import math
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,7 +19,6 @@ from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.optim import optimize_acqf
-from botorch.utils import standardize
 from gpytorch import kernels as gpykernels
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import NormalPrior
@@ -37,7 +37,11 @@ except ImportError:  # pragma: no cover - exercised only without irmsd installed
 
 warnings.filterwarnings("ignore")
 
-from bouquet.assess import evaluate_energy, relax_structure
+from bouquet.assess import (
+    evaluate_energy,
+    evaluate_energy_with_gradient,
+    relax_structure,
+)
 from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
@@ -55,6 +59,7 @@ from bouquet.config import (
     KB_EV_PER_K,
     KCAL_TO_EV,
 )
+from bouquet.gradient_gp import GradientEnhancedPeriodicGP
 from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
 from bouquet.priors import DihedralPriorModule
 from bouquet.setup import DihedralInfo
@@ -77,6 +82,9 @@ class OptimizationState:
     start_energy: float
     observed_coords: torch.Tensor  # Shape: (n_observations, n_dihedrals)
     observed_energies: torch.Tensor  # Shape: (n_observations,)
+    # dE/dtheta (eV/rad) per observation, index-aligned with the tensors above;
+    # NaN where the gradient is unavailable (failed eval, or use_gradients off).
+    observed_gradients: torch.Tensor = None  # Shape: (n_observations, n_dihedrals)
     # Per-observation Atoms, aligned index-for-index with the tensors above.
     observed_atoms: List[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
@@ -84,6 +92,9 @@ class OptimizationState:
     best_atoms: Optional[Atoms] = None
     best_step: int = 0
     add_entry: Optional[Callable] = None
+    # When True, evaluations also record dE/dtheta and the acquisition GP uses
+    # the gradient-enhanced surrogate (see GradientEnhancedPeriodicGP).
+    use_gradients: bool = False
 
     # PiBO fields
     prior_module: Optional[DihedralPriorModule] = None
@@ -91,7 +102,11 @@ class OptimizationState:
     prior_decay: float = 0.9
 
     def append_observation(
-        self, coords: np.ndarray, energy: float, atoms: Atoms
+        self,
+        coords: np.ndarray,
+        energy: float,
+        atoms: Atoms,
+        gradient: Optional[np.ndarray] = None,
     ) -> None:
         """Append a new observation, keeping observed_atoms index-aligned.
 
@@ -99,13 +114,26 @@ class OptimizationState:
             coords: Dihedral coordinates as numpy array
             energy: Relative energy value
             atoms: Structure at this observation (copied for retention)
+            gradient: Optional dE/dtheta (eV/rad) for each dihedral; stored as
+                NaN when not provided so the gradient tensor stays index-aligned.
         """
         new_coords = torch.tensor(
             coords, dtype=torch.float64, device=self.device
         ).unsqueeze(0)
         new_energy = torch.tensor([energy], dtype=torch.float64, device=self.device)
+        if gradient is None:
+            gradient = np.full(len(coords), np.nan, dtype=float)
+        new_grad = torch.tensor(
+            np.asarray(gradient, dtype=float), dtype=torch.float64, device=self.device
+        ).unsqueeze(0)
         self.observed_coords = torch.cat([self.observed_coords, new_coords], dim=0)
         self.observed_energies = torch.cat([self.observed_energies, new_energy], dim=0)
+        if self.observed_gradients is None:
+            self.observed_gradients = new_grad
+        else:
+            self.observed_gradients = torch.cat(
+                [self.observed_gradients, new_grad], dim=0
+            )
         self.observed_atoms.append(atoms.copy())
 
 
@@ -124,11 +152,50 @@ def _periodic_covar_module(num_dims: int) -> gpykernels.ScaleKernel:
     )
 
 
+def _fit_gradient_gp(
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    raw_y: torch.Tensor,
+    energy_cap: torch.Tensor,
+    observed_gradients: torch.Tensor,
+    y_std: torch.Tensor,
+) -> GradientEnhancedPeriodicGP:
+    """Build and fit the gradient-enhanced periodic GP on standardized data.
+
+    The acquisition GP fits standardized values ``y' = (-clamp(E) - mean)/std``
+    over inputs ``x' = degrees / 360``. The stored gradients are ``dE/dtheta`` in
+    eV/rad, so the chain rule for the matching gradient observation is
+
+        dy'/dx' = -(2*pi / std) * dE/dtheta           [clamp inactive]
+
+    (``x_rad = 2*pi * x'``; the maximization sign flip contributes the minus).
+    ``y_std`` is the standardization std the caller applied to the values, so the
+    gradients are scaled by exactly the same factor. Points where the energy
+    clamp is active or whose gradient is NaN (failed evaluation) are dropped from
+    the gradient observations via the mask, but still contribute their value.
+    """
+    grad = observed_gradients.to(train_x)  # (n, d), eV/rad
+    grad_scaled = -(2.0 * math.pi / y_std) * grad  # (n, d)
+
+    clamp_inactive = raw_y <= energy_cap  # (n,)
+    grad_valid = ~torch.isnan(grad).any(dim=1)  # (n,)
+    mask = clamp_inactive & grad_valid
+    grad_scaled = torch.nan_to_num(grad_scaled, nan=0.0)
+
+    gp = GradientEnhancedPeriodicGP(
+        train_x, train_y, grad_scaled, grad_mask=mask, period=1.0
+    )
+    gp.fit(steps=200, lr=0.05)
+    return gp
+
+
 def _select_next_points_botorch(
     train_X: torch.Tensor,
     train_y: torch.Tensor,
     prior_module: Optional[DihedralPriorModule] = None,
     prior_exponent: float = 0.0,
+    observed_gradients: Optional[torch.Tensor] = None,
+    use_gradients: bool = False,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -138,6 +205,10 @@ def _select_next_points_botorch(
         train_y (torch.Tensor): Observed energies corresponding to train_X, shape (n_observations,).
         prior_module: Optional DihedralPriorModule for PiBO
         prior_exponent: Prior strength (0 = no prior influence)
+        observed_gradients: Optional dE/dtheta (eV/rad), shape (n_observations,
+            n_dims), index-aligned with ``train_X``; NaN rows are dropped.
+        use_gradients: If True (and gradients are provided), fit the
+            gradient-enhanced surrogate instead of the value-only GP.
 
     Returns:
         np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
@@ -147,25 +218,35 @@ def _select_next_points_botorch(
     train_x = train_X.clone() / 360.0
 
     # Clip the energies if needed
-    train_y = torch.clamp(train_y, max=2 + torch.log10(torch.clamp(train_y, min=1)))
+    raw_y = train_y  # relative energies (eV), positive = worse
+    energy_cap = 2 + torch.log10(torch.clamp(raw_y, min=1))
 
-    # Reshape and standardize for GP (minimize -> maximize by negating)
-    train_y = train_y[:, None]
-    train_y = standardize(-1 * train_y)  # make this a maximization problem
+    # Negate (minimize -> maximize) and standardize (matching botorch.standardize).
+    # Keep the std so the gradient observations can be scaled by exactly the same
+    # factor as the values -- see _fit_gradient_gp.
+    neg = (-1 * torch.minimum(raw_y, energy_cap))[:, None]
+    y_std = neg.std(dim=0, keepdim=True)
+    y_std = torch.where(y_std >= 1e-9, y_std, torch.ones_like(y_std))
+    train_y = (neg - neg.mean(dim=0, keepdim=True)) / y_std
 
-    # Make the GP
-    # TODO: make the GP only once and reuse via updates
-    gp = SingleTaskGP(
-        train_x,
-        train_y,
-        covar_module=_periodic_covar_module(train_x.shape[1]),
-    )
-    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
-    fit_gpytorch_mll_torch(
-        mll,
-        step_limit=200,
-        optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
-    )
+    if use_gradients and observed_gradients is not None:
+        gp = _fit_gradient_gp(
+            train_x, train_y, raw_y, energy_cap, observed_gradients, y_std
+        )
+    else:
+        # Make the GP
+        # TODO: make the GP only once and reuse via updates
+        gp = SingleTaskGP(
+            train_x,
+            train_y,
+            covar_module=_periodic_covar_module(train_x.shape[1]),
+        )
+        mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
+        fit_gpytorch_mll_torch(
+            mll,
+            step_limit=200,
+            optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
+        )
 
     # Solve the optimization problem
     n_sampled, n_dim = train_x.shape
@@ -270,6 +351,11 @@ def _setup_initial_state(
             [start_coords], dtype=torch.float64, device=device
         ),
         observed_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
+        # Start point recorded with an unavailable (NaN) gradient so the
+        # gradient tensor stays index-aligned with the energy/coord tensors.
+        observed_gradients=torch.full(
+            (1, len(start_coords)), float("nan"), dtype=torch.float64, device=device
+        ),
         device=device,
         best_atoms=start_atoms.copy(),
         best_step=0,
@@ -367,6 +453,29 @@ def plan_initial_points(
     return np.array(points)
 
 
+def _evaluate_point(
+    state: OptimizationState,
+    guess: np.ndarray,
+    dihedrals: List[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    relax: bool,
+) -> Tuple[float, Atoms, Optional[np.ndarray]]:
+    """Evaluate a dihedral guess, optionally also returning dE/dtheta.
+
+    When ``state.use_gradients`` is set this projects the calculator's forces
+    onto the torsion coordinates (eV/rad); otherwise the gradient is ``None``.
+    """
+    if state.use_gradients:
+        return evaluate_energy_with_gradient(
+            guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+        )
+    energy, cur_atoms = evaluate_energy(
+        guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+    )
+    return energy, cur_atoms, None
+
+
 def _evaluate_initial_guesses(
     state: OptimizationState,
     dihedrals: List[DihedralInfo],
@@ -400,15 +509,15 @@ def _evaluate_initial_guesses(
         logger.info(f"Using {state.init_steps} provided conformers as initial guesses")
         for i, conformer in enumerate(initial_conformers):
             guess = np.array([d.get_angle(conformer) for d in dihedrals])
-            energy, cur_atoms = evaluate_energy(
-                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            energy, cur_atoms, gradient = _evaluate_point(
+                state, guess, dihedrals, calc, relaxCalc, relax
             )
             rel_energy = energy - state.start_energy
             logger.info(
                 f"Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}"
             )
 
-            state.append_observation(guess, rel_energy, cur_atoms)
+            state.append_observation(guess, rel_energy, cur_atoms, gradient)
 
             if state.add_entry is not None:
                 state.add_entry(guess, cur_atoms, energy)
@@ -419,15 +528,15 @@ def _evaluate_initial_guesses(
         )
         for i, guess in enumerate(initial_dihedrals):
             guess = np.asarray(guess, dtype=float) % 360.0
-            energy, cur_atoms = evaluate_energy(
-                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            energy, cur_atoms, gradient = _evaluate_point(
+                state, guess, dihedrals, calc, relaxCalc, relax
             )
             rel_energy = energy - state.start_energy
             logger.info(
                 f"Evaluated peak guess {i+1: >3}/{len(initial_dihedrals)}. Energy-E0: {rel_energy:12.6f}"
             )
 
-            state.append_observation(guess, rel_energy, cur_atoms)
+            state.append_observation(guess, rel_energy, cur_atoms, gradient)
 
             if state.add_entry is not None:
                 state.add_entry(guess, cur_atoms, energy)
@@ -443,15 +552,15 @@ def _evaluate_initial_guesses(
             # make sure angles are between 0 and 360
             # to standardize later
             guess = guess % 360.0
-            energy, cur_atoms = evaluate_energy(
-                guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+            energy, cur_atoms, gradient = _evaluate_point(
+                state, guess, dihedrals, calc, relaxCalc, relax
             )
             rel_energy = energy - state.start_energy
             logger.info(
                 f"Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}"
             )
 
-            state.append_observation(guess, rel_energy, cur_atoms)
+            state.append_observation(guess, rel_energy, cur_atoms, gradient)
 
             if state.add_entry is not None:
                 state.add_entry(guess, cur_atoms, energy)
@@ -482,11 +591,13 @@ def _run_optimization_loop(
             state.observed_coords, state.observed_energies,
             prior_module=state.prior_module,
             prior_exponent=state.prior_exponent,
+            observed_gradients=state.observed_gradients,
+            use_gradients=state.use_gradients,
         )
         # logger.info(f'Selected next point: {next_coords}')
 
-        energy, cur_atoms = evaluate_energy(
-            next_coords, state.start_atoms, dihedrals, calc, relaxCalc, relax
+        energy, cur_atoms, gradient = _evaluate_point(
+            state, next_coords, dihedrals, calc, relaxCalc, relax
         )
         rel_energy = energy - state.start_energy
         logger.info(
@@ -502,7 +613,7 @@ def _run_optimization_loop(
         if state.add_entry is not None:
             state.add_entry(next_coords, cur_atoms, energy)
 
-        state.append_observation(next_coords, rel_energy, cur_atoms)
+        state.append_observation(next_coords, rel_energy, cur_atoms, gradient)
 
         # Decay prior exponent
         if state.prior_module is not None:
@@ -795,6 +906,7 @@ def run_optimization(
     initial_prior_exponent: float = 2.0,
     prior_exponent_decay: float = 0.9,
     return_ensemble: bool = False,
+    use_gradients: bool = False,
 ) -> Union[Atoms, Tuple[Atoms, List[Tuple[Atoms, float, float]]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
@@ -816,6 +928,8 @@ def run_optimization(
         return_ensemble: If True, also select and tightly optimize a Boltzmann
             ensemble of low-energy conformers and return it alongside the best
             structure.
+        use_gradients: If True, record dE/dtheta at each evaluation and use the
+            gradient-enhanced periodic GP surrogate for acquisition.
 
     Returns:
         If ``return_ensemble`` is False, the optimized lowest-energy geometry as
@@ -831,6 +945,7 @@ def run_optimization(
     state.prior_module = prior_module
     state.prior_exponent = initial_prior_exponent
     state.prior_decay = prior_exponent_decay
+    state.use_gradients = use_gradients
 
     # Evaluate initial guesses (conformers, prior peaks, or random)
     _evaluate_initial_guesses(
