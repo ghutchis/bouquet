@@ -9,7 +9,13 @@ from ase.calculators.calculator import Calculator
 from ase.constraints import FixInternals
 from ase.optimize import FIRE2, LBFGS
 
-from bouquet.config import DEFAULT_FMAX, DEFAULT_RELAXATION_STEPS, TIGHT_FMAX
+from bouquet.config import (
+    DEFAULT_FMAX,
+    DEFAULT_RELAXATION_STEPS,
+    RELAX_FAILURE_ENERGY_EV,
+    TIGHT_FMAX,
+)
+from bouquet.gradients import compute_torsion_gradient
 from bouquet.setup import DihedralInfo
 
 
@@ -54,9 +60,9 @@ def evaluate_energy(
     try:
         energy = calc.get_potential_energy(atoms)
     except:
-        energy = 1000.0
+        energy = RELAX_FAILURE_ENERGY_EV
 
-    if not relax or energy >= 1000.0:
+    if not relax or energy >= RELAX_FAILURE_ENERGY_EV:
         # too high energy, just return
         return energy, atoms
 
@@ -110,6 +116,61 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
     try:
         energy = energyCalc.get_potential_energy(atoms)
     except:
-        energy = 1000.0
+        energy = RELAX_FAILURE_ENERGY_EV
 
     return energy, atoms
+
+
+def evaluate_energy_with_gradient(
+    angles: Union[List[float], np.ndarray],
+    atoms: Atoms,
+    dihedrals: List[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    relax: bool = True,
+    steps: Optional[int] = DEFAULT_RELAXATION_STEPS,
+    per_degree: bool = False,
+) -> Tuple[float, Atoms, np.ndarray]:
+    """Evaluate the energy and its gradient with respect to the torsion angles.
+
+    Thin wrapper around :func:`evaluate_energy` that additionally returns
+    ``dE/dtheta`` for each dihedral, obtained by projecting the calculator's
+    Cartesian forces onto the torsion coordinates (see :mod:`bouquet.gradients`).
+
+    When ``relax`` is True the gradient is that of the relaxed energy surface
+    ``E*(theta)`` evaluated at the constrained minimum (valid by the envelope
+    theorem); when ``relax`` is False it is the rigid-scan gradient at the given
+    geometry. The gradient is always projected from the energy calculator
+    ``calc``.
+
+    Consistency requirement: the envelope-theorem identity only holds when the
+    geometry is a constrained minimum of ``calc``. With ``relax=True`` the
+    geometry is minimized on ``relaxCalc``, so ``dE*/dtheta`` from ``calc`` forces
+    is only correct when ``calc`` and ``relaxCalc`` are the same surface. If they
+    differ (e.g. gfn2 energy on a gfnff-optimized geometry), the projection drops
+    the relaxation-response term and the gradient is biased -- callers that feed
+    these to a model (``use_gradients``) must use matching calculators. The CLI
+    enforces this; ``relax=False`` is always consistent (rigid scan of ``calc``).
+
+    Parameters mirror :func:`evaluate_energy`, plus:
+        per_degree (bool): If True, the gradient is in eV/degree; otherwise
+            eV/radian (default).
+
+    Returns:
+        Tuple[float, Atoms, np.ndarray]: ``(energy, atoms, gradient)``. On a
+        failed energy evaluation the energy is ``RELAX_FAILURE_ENERGY_EV`` and
+        the gradient is filled with ``nan`` (it is meaningless there and should
+        be dropped by the caller).
+    """
+    energy, relaxed = evaluate_energy(
+        angles, atoms, dihedrals, calc, relaxCalc, relax=relax, steps=steps
+    )
+
+    if energy >= RELAX_FAILURE_ENERGY_EV:
+        gradient = np.full(len(dihedrals), np.nan, dtype=float)
+        return energy, relaxed, gradient
+
+    gradient = compute_torsion_gradient(
+        relaxed, dihedrals, calc, per_degree=per_degree
+    )
+    return energy, relaxed, gradient

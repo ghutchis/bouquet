@@ -110,6 +110,13 @@ def main():
         help="Relax the non-dihedral degrees of freedom before computing energy",
     )
     parser.add_argument(
+        "--use-gradients",
+        action="store_true",
+        help="Use the gradient-enhanced GP surrogate: project the calculator's "
+        "forces onto each torsion (dE/dtheta) and feed them to the acquisition "
+        "GP, so each energy evaluation also contributes a gradient observation.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -164,6 +171,7 @@ def main():
         init_grid_budget=args.init_grid_budget,
         auto_steps=args.auto,
         relax=args.relax,
+        use_gradients=args.use_gradients,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -172,6 +180,27 @@ def main():
         prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
     )
+
+    # Gradient labels are only consistent with the energy objective when the
+    # geometry is a constrained minimum of the *energy* calculator. With
+    # relaxation the geometry is minimized on the optimizer surface, so the
+    # projected torsion gradient equals dE*/dtheta only if the two calculators
+    # are the same surface. Refuse the mismatched combination rather than feeding
+    # the GP biased gradient labels. (Without --relax the rigid-scan gradient is
+    # always consistent, so the check is limited to the relaxed case.)
+    if (
+        config.use_gradients
+        and config.relax
+        and config.energy_method != config.optimizer_method
+    ):
+        raise ValueError(
+            "--use-gradients with --relax requires --energy and --optimizer to be "
+            f"the same method (got energy={config.energy_method!r}, "
+            f"optimizer={config.optimizer_method!r}). The torsion gradient is only "
+            "dE*/dtheta at a constrained minimum of the energy calculator, but the "
+            "geometry is relaxed on the optimizer surface. Use "
+            f"--optimizer {config.energy_method}, or drop --use-gradients / --relax."
+        )
 
     # Make an output directory
     out_dir = create_output_directory(
@@ -299,6 +328,7 @@ def main():
         initial_prior_exponent=config.initial_prior_exponent,
         prior_exponent_decay=config.prior_exponent_decay,
         return_ensemble=config.ensemble,
+        use_gradients=config.use_gradients,
     )
 
     if config.ensemble:

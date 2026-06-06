@@ -1,3 +1,3 @@
 """Utilities for conformer optimization"""
 
-from . import assess, calculator, config, io, priors, setup, solver
+from . import assess, calculator, config, gradients, io, priors, setup, solver
