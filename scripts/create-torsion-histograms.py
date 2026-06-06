@@ -60,62 +60,63 @@ for sdf_file in glob.iglob("*/*.sdf"):
     print("Processing", sdf_file)
     signal.alarm(60) # more than enough
 
-    mol = Chem.MolFromMolFile(sdf_file, removeHs=False)
-    if mol is None:
-        continue
-
-    # read the corresponding XYZ file for the actual conformer coordinates
-    xyz_file = sdf_file.replace('.sdf', '.xyz')
-    if not os.path.exists(xyz_file):
-        print(f"  XYZ file not found: {xyz_file}")
-        continue
-    xyz_mol = Chem.MolFromXYZFile(xyz_file)
-    if xyz_mol is None:
-        print(f"  Could not read XYZ file: {xyz_file}")
-        continue
-
-    # get the geometry from the XYZ file
-    conf = xyz_mol.GetConformer(0)
-
-    # loop through the possible SMARTS patterns from more general to more specific
-    # .. we make a map of the atom indices from the SMARTS pattern
-    # .. so if a more specific pattern matches later, we use that instead
-    matched_list = {}
-    for query in range(len(query_list)):
-        torsionQuery = query_list[query]
-        if torsionQuery is None:
-            continue
-        matches = mol.GetSubstructMatches(torsionQuery)
-
-        try:
-            # these SMARTS have atom maps, so convert them
-            # http://www.rdkit.org/docs/GettingStartedInPython.html#atom-map-indices-in-smarts
-            index_map = {}
-            for atom in torsionQuery.GetAtoms() :
-                map_num = atom.GetAtomMapNum()
-                if map_num:
-                    index_map[map_num-1] = atom.GetIdx()
-            map_list = [index_map[x] for x in sorted(index_map)]
-
-            for match in matches:
-                # get the atom maps from the SMARTS match
-                mapped = [match[x] for x in map_list]
-                key = f"{mapped[0]}-{mapped[1]}-{mapped[2]}-{mapped[3]}"
-
-                angle = rdMolTransforms.GetDihedralDeg(conf, mapped[0],mapped[1],mapped[2],mapped[3])
-                if (angle < 0.0):
-                    angle += 360.0
-
-                # okay, we want to hash - e.g., 5° bins
-                angle = round(angle / bin_size) % bins
-
-                matched_list[key] = (query, angle)
-        except Exception as e:
-            print(f"  Error processing query {query}: {e}")
+    try:
+        mol = Chem.MolFromMolFile(sdf_file, removeHs=False)
+        if mol is None:
             continue
 
-    # reset the timeout
-    signal.alarm(0)
+        # read the corresponding XYZ file for the actual conformer coordinates
+        xyz_file = sdf_file.replace('.sdf', '.xyz')
+        if not os.path.exists(xyz_file):
+            print(f"  XYZ file not found: {xyz_file}")
+            continue
+        xyz_mol = Chem.MolFromXYZFile(xyz_file)
+        if xyz_mol is None:
+            print(f"  Could not read XYZ file: {xyz_file}")
+            continue
+
+        # get the geometry from the XYZ file
+        conf = xyz_mol.GetConformer(0)
+
+        # loop through the possible SMARTS patterns from more general to more specific
+        # .. we make a map of the atom indices from the SMARTS pattern
+        # .. so if a more specific pattern matches later, we use that instead
+        matched_list = {}
+        for query in range(len(query_list)):
+            torsionQuery = query_list[query]
+            if torsionQuery is None:
+                continue
+            matches = mol.GetSubstructMatches(torsionQuery)
+
+            try:
+                # these SMARTS have atom maps, so convert them
+                # http://www.rdkit.org/docs/GettingStartedInPython.html#atom-map-indices-in-smarts
+                index_map = {}
+                for atom in torsionQuery.GetAtoms() :
+                    map_num = atom.GetAtomMapNum()
+                    if map_num:
+                        index_map[map_num-1] = atom.GetIdx()
+                map_list = [index_map[x] for x in sorted(index_map)]
+
+                for match in matches:
+                    # get the atom maps from the SMARTS match
+                    mapped = [match[x] for x in map_list]
+                    key = f"{mapped[0]}-{mapped[1]}-{mapped[2]}-{mapped[3]}"
+
+                    angle = rdMolTransforms.GetDihedralDeg(conf, mapped[0],mapped[1],mapped[2],mapped[3])
+                    if (angle < 0.0):
+                        angle += 360.0
+
+                    # okay, we want to hash - e.g., 5° bins
+                    angle = round(angle / bin_size) % bins
+
+                    matched_list[key] = (query, angle)
+            except Exception as e:
+                print(f"  Error processing query {query}: {e}")
+                continue
+    finally:
+        # reset the timeout, even on early continue / exception
+        signal.alarm(0)
 
     # now we go through the matched_list
     # .. and increment the histogram for each match

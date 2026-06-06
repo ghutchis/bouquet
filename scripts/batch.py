@@ -163,9 +163,11 @@ def process_molecule(
                         results["e_e0_constrained"],
                         results["e_e0_unconstrained"],
                     ]
+                    e_e0 = results["e_e0_unconstrained"]
+                    e_e0_str = f"{e_e0:.4f}" if e_e0 is not None else "N/A"
                     print(
                         f"done (best step: {results['best_step']}, "
-                        f"E-E0: {results['e_e0_unconstrained']:.4f})"
+                        f"E-E0: {e_e0_str})"
                     )
                 else:
                     seed_results[seed] = ["", "", "", "", ""]
@@ -200,9 +202,11 @@ def process_molecule(
                             results["e_e0_constrained"],
                             results["e_e0_unconstrained"],
                         ]
+                        e_e0 = results["e_e0_unconstrained"]
+                        e_e0_str = f"{e_e0:.4f}" if e_e0 is not None else "N/A"
                         print(
                             f"    Seed {seed}: done (best step: {results['best_step']}, "
-                            f"E-E0: {results['e_e0_unconstrained']:.4f})"
+                            f"E-E0: {e_e0_str})"
                         )
                     else:
                         seed_results[seed] = ["", "", "", "", ""]
@@ -308,9 +312,11 @@ def main():
         print(f"Error: Empty input file {args.input}")
         sys.exit(1)
 
-    # Check if first row looks like a header
+    # Check if first row looks like a header. Require BOTH configured columns so
+    # downstream mol[smiles_column]/mol[name_column] lookups can't KeyError; if
+    # only one (or neither) is present, fall back to positional header below.
     first_row = rows[0]
-    has_header = args.smiles_column in first_row or args.name_column in first_row
+    has_header = args.smiles_column in first_row and args.name_column in first_row
 
     # Convert rows to list of dicts
     if has_header:

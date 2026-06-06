@@ -24,6 +24,11 @@ def get_unconstrained_columns(df: pd.DataFrame) -> list[str]:
 def compute_min_unconstrained(df: pd.DataFrame) -> pd.Series:
     """Compute the minimum e_e0_unconstrained value across all seeds for each row."""
     unconstrained_cols = get_unconstrained_columns(df)
+    if not unconstrained_cols:
+        raise ValueError(
+            "No '_e_e0_unconstrained' columns found in the dataframe; "
+            "check that the input file has the expected format."
+        )
     # Use min with skipna=True to handle missing values
     return df[unconstrained_cols].min(axis=1, skipna=True)
 
@@ -60,6 +65,14 @@ def process_files(input_files: list[Path], output_file: Path) -> pd.DataFrame:
         # Read the CSV
         df = pd.read_csv(filepath)
 
+        # Validate required columns before any access
+        required = {'name', 'num_dihedrals'}
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Missing required column(s) {sorted(missing)} in {filepath}"
+            )
+
         # Extract suffix for column naming
         suffix = extract_suffix_from_filename(filepath)
 
@@ -72,13 +85,17 @@ def process_files(input_files: list[Path], output_file: Path) -> pd.DataFrame:
             result_df = df[['name', 'num_dihedrals']].copy()
             result_df[min_col_name] = min_values
         else:
-            # Verify that names match across files
+            # Verify that names match across files (same names, same order:
+            # the quick path below assigns by position, so order must match).
             if not df['name'].equals(result_df['name']):
                 print(f"  Warning: Names in {filepath} don't match the first file!")
                 print("  Attempting to merge by name...")
                 temp_df = df[['name']].copy()
                 temp_df[min_col_name] = min_values
                 result_df = result_df.merge(temp_df, on='name', how='outer')
+                n_missing = result_df[min_col_name].isna().sum()
+                if n_missing:
+                    print(f"  Warning: {n_missing} rows have no {min_col_name} after merge (name mismatch)")
             else:
                 result_df[min_col_name] = min_values
 

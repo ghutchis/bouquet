@@ -7,8 +7,8 @@
 - Minimum fit quality threshold to force more components
 
 Usage:
-    python scripts/assemble_univariate_priors_improved.py [--output priors.json] [--max-components 5]
-    python scripts/assemble_univariate_priors_improved.py --plot-dir plots/  # Generate diagnostic plots
+    python scripts/assemble_univariate_priors.py [--output priors.json] [--max-components 5]
+    python scripts/assemble_univariate_priors.py --plot-dir plots/  # Generate diagnostic plots
 """
 
 import argparse
@@ -260,10 +260,7 @@ def load_histogram(data_dirs: List[Path], pattern_idx: int) -> Optional[np.ndarr
     for i in range(360):
         mirror_idx = (360 - i) % 360
         mirrored_counts[i] = total_counts[i] + total_counts[mirror_idx]
-
-    # Exception: 0° and 180° map to themselves, so they were only counted once
-    mirrored_counts[0] *= 2  # 0° maps to itself
-    mirrored_counts[180] *= 2  # 180° maps to itself
+        # 0° and 180° map to themselves, so the line above already doubles them.
 
     return mirrored_counts
 
@@ -632,7 +629,14 @@ def fit_symmetric_von_mises_mixture(
             if result.fun < best_nll:
                 best_nll = result.fun
                 best_result = result
-        except Exception:
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as e:
+            # Expected numerical/optimization failure for this restart: log and
+            # try the next one. Unexpected exceptions propagate so real bugs surface.
+            print(
+                f"  Skipping fit restart: {type(e).__name__}: {e} "
+                f"(init_params={init_params}, bounds={bounds})",
+                file=sys.stderr,
+            )
             continue
 
     if best_result is None:
@@ -839,7 +843,14 @@ def fit_von_mises_mixture(
             if result.fun < best_nll:
                 best_nll = result.fun
                 best_result = result
-        except Exception as e:
+        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as e:
+            # Expected numerical/optimization failure for this restart: log and
+            # try the next one. Unexpected exceptions propagate so real bugs surface.
+            print(
+                f"  Skipping fit restart: {type(e).__name__}: {e} "
+                f"(init_params={init_params}, bounds={bounds})",
+                file=sys.stderr,
+            )
             continue
 
     if best_result is None:

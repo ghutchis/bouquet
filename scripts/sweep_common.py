@@ -83,14 +83,17 @@ _EVAL_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
-def subprocess_run(cmd: List[str]) -> str:
-    """Run a command, returning combined stdout+stderr (logging may go to either)."""
+def subprocess_run(cmd: List[str]) -> Tuple[str, int]:
+    """Run a command, returning (combined stdout+stderr, returncode).
+
+    Logging may go to either stream, so both are combined for parsing.
+    """
     import subprocess
 
     result = subprocess.run(
         cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
-    return result.stdout + "\n" + result.stderr
+    return result.stdout + "\n" + result.stderr, result.returncode
 
 
 def parse_trajectory(log_text: str) -> List[Tuple[str, float]]:
@@ -159,9 +162,11 @@ def run_one(
     if optimizer_method:
         cmd += ["--optimizer", optimizer_method]
 
-    proc = subprocess_run(cmd)
+    proc, returncode = subprocess_run(cmd)
     parsed = parse_log_output(proc)
-    ok = parsed["best_step"] is not None
+    # Mirror batch.py: a trial only counts as successful when the process exited
+    # cleanly AND a best step was parsed from the log.
+    ok = returncode == 0 and parsed["best_step"] is not None
     row = {
         "config": config,
         "name": name,
@@ -175,7 +180,13 @@ def run_one(
         "e_e0_constrained": parsed["e_e0_constrained"] if ok else "",
         "e_e0_unconstrained": parsed["e_e0_unconstrained"] if ok else "",
     }
-    traj_rows = build_traj_rows(config, name, seed, parsed["num_dihedrals"], proc)
+    # Only emit trajectory rows for cleanly-exited runs; a crashed process may
+    # have produced a partial/misleading log.
+    traj_rows = (
+        build_traj_rows(config, name, seed, parsed["num_dihedrals"], proc)
+        if returncode == 0
+        else []
+    )
     return row, traj_rows
 
 
@@ -192,7 +203,9 @@ def load_molecules(
         sys.exit(f"Error: empty input file {input_path}")
 
     first = rows[0]
-    has_header = smiles_col in first or name_col in first
+    # Require BOTH columns before treating row 0 as a header; otherwise the
+    # header.index() calls below would ValueError on the missing one.
+    has_header = smiles_col in first and name_col in first
     if has_header:
         header, data = first, rows[1:]
         si, ni = header.index(smiles_col), header.index(name_col)
