@@ -12,6 +12,7 @@ from bouquet.config import (
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
     DEFAULT_INIT_STEPS,
+    DEFAULT_MIN_AUTO_BO_STEPS,
     DEFAULT_NUM_STEPS,
     DEFAULT_OPTIMIZER_METHOD,
     DEFAULT_PRIOR_BACKGROUND_WEIGHT,
@@ -283,6 +284,14 @@ def main():
                 mol=mol, dihedrals=[d.chain for d in dihedrals]
             )
         start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
+        # Under --auto, cap the number of seeded points so a large systematic grid
+        # can't consume the whole budget and leave zero BO refinement (worst on
+        # small molecules, where grid size >= the auto total). The grid is
+        # best-first, so the cap keeps the most probable mode combinations.
+        max_init = None
+        if config.auto_steps:
+            total = config.auto_total(len(dihedrals))
+            max_init = max(1, total - DEFAULT_MIN_AUTO_BO_STEPS)
         initial_dihedrals = plan_initial_points(
             planning_module,
             len(dihedrals),
@@ -290,10 +299,14 @@ def main():
             config.init_steps,
             config.init_grid_budget,
             config.seed,
+            max_points=max_init,
         )
         logger.info(
             f"Planned {len(initial_dihedrals)} prior-peak initial guesses "
-            f"(grid budget {config.init_grid_budget})"
+            f"(grid budget {config.init_grid_budget}"
+            + (f", capped at {max_init} to keep >= {DEFAULT_MIN_AUTO_BO_STEPS} "
+               f"BO steps" if max_init is not None else "")
+            + ")"
         )
 
     # Compute the number of optimization steps (handles auto mode)
