@@ -140,8 +140,17 @@ def evaluate_energy_with_gradient(
     When ``relax`` is True the gradient is that of the relaxed energy surface
     ``E*(theta)`` evaluated at the constrained minimum (valid by the envelope
     theorem); when ``relax`` is False it is the rigid-scan gradient at the given
-    geometry. The gradient is taken from the energy calculator ``calc`` so that
-    it matches the energy surface the optimizer fits.
+    geometry. The gradient is always projected from the energy calculator
+    ``calc``.
+
+    Consistency requirement: the envelope-theorem identity only holds when the
+    geometry is a constrained minimum of ``calc``. With ``relax=True`` the
+    geometry is minimized on ``relaxCalc``, so ``dE*/dtheta`` from ``calc`` forces
+    is only correct when ``calc`` and ``relaxCalc`` are the same surface. If they
+    differ (e.g. gfn2 energy on a gfnff-optimized geometry), the projection drops
+    the relaxation-response term and the gradient is biased -- callers that feed
+    these to a model (``use_gradients``) must use matching calculators. The CLI
+    enforces this; ``relax=False`` is always consistent (rigid scan of ``calc``).
 
     Parameters mirror :func:`evaluate_energy`, plus:
         per_degree (bool): If True, the gradient is in eV/degree; otherwise

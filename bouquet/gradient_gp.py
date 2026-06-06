@@ -106,7 +106,14 @@ class GradientEnhancedPeriodicGP(Model):
         # a structural constant, not a fitted hyperparameter -- freeze it.
         self.kernel.raw_period_length.requires_grad_(False)
 
-        # Free hyperparameters (softplus for the positive ones).
+        # Free hyperparameters (softplus for the positive ones). The noises seed
+        # raw_value_noise/raw_grad_noise via _softplus_inv, which is only defined
+        # for positive inputs, so require them strictly positive.
+        if value_noise <= 0 or grad_noise <= 0:
+            raise ValueError(
+                f"value_noise and grad_noise must be > 0 (got value_noise="
+                f"{value_noise}, grad_noise={grad_noise})"
+            )
         self.raw_outputscale = torch.nn.Parameter(torch.tensor(_softplus_inv(1.0)))
         self.raw_value_noise = torch.nn.Parameter(
             torch.tensor(_softplus_inv(value_noise))

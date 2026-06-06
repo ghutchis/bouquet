@@ -302,6 +302,7 @@ def _setup_initial_state(
     relaxCalc: Calculator,
     relax: bool,
     out_dir: Optional[Path],
+    use_gradients: bool = False,
 ) -> OptimizationState:
     """Perform initial relaxation, evaluate starting point, and set up logging.
 
@@ -312,6 +313,8 @@ def _setup_initial_state(
         relaxCalc: Calculator used for geometry relaxation
         relax: Whether to relax non-dihedral degrees of freedom
         out_dir: Output path for logging information
+        use_gradients: If True, also record dE/dtheta at the starting point so it
+            contributes a gradient observation like every other point.
 
     Returns:
         OptimizationState with initial values
@@ -326,12 +329,19 @@ def _setup_initial_state(
     else:
         init_atoms = atoms
 
-    # Evaluate initial point
+    # Evaluate initial point (with dE/dtheta when gradients are enabled, so the
+    # start contributes a gradient observation like every other point).
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
     logger.info(f"Initial dihedral angles: {start_coords}")
-    start_energy, start_atoms = evaluate_energy(
-        start_coords, atoms, dihedrals, calc, relaxCalc, relax
-    )
+    if use_gradients:
+        start_energy, start_atoms, start_gradient = evaluate_energy_with_gradient(
+            start_coords, atoms, dihedrals, calc, relaxCalc, relax
+        )
+    else:
+        start_energy, start_atoms = evaluate_energy(
+            start_coords, atoms, dihedrals, calc, relaxCalc, relax
+        )
+        start_gradient = np.full(len(start_coords), np.nan, dtype=float)
     logger.info(f"Computed initial energy: {start_energy}")
 
     # Set up logging if output directory provided
@@ -351,11 +361,12 @@ def _setup_initial_state(
             [start_coords], dtype=torch.float64, device=device
         ),
         observed_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
-        # Start point recorded with an unavailable (NaN) gradient so the
-        # gradient tensor stays index-aligned with the energy/coord tensors.
-        observed_gradients=torch.full(
-            (1, len(start_coords)), float("nan"), dtype=torch.float64, device=device
+        # Start-point gradient (real dE/dtheta when use_gradients, else NaN),
+        # index-aligned with the energy/coord tensors.
+        observed_gradients=torch.tensor(
+            [start_gradient], dtype=torch.float64, device=device
         ),
+        use_gradients=use_gradients,
         device=device,
         best_atoms=start_atoms.copy(),
         best_step=0,
@@ -929,7 +940,11 @@ def run_optimization(
             ensemble of low-energy conformers and return it alongside the best
             structure.
         use_gradients: If True, record dE/dtheta at each evaluation and use the
-            gradient-enhanced periodic GP surrogate for acquisition.
+            gradient-enhanced periodic GP surrogate for acquisition. With
+            ``relax=True`` the projected gradient is only consistent with the
+            energy objective when ``calc`` and ``relaxCalc`` are the same surface
+            (the envelope theorem needs the geometry to be a constrained minimum
+            of the energy calculator); pass matching calculators in that case.
 
     Returns:
         If ``return_ensemble`` is False, the optimized lowest-energy geometry as
@@ -939,13 +954,14 @@ def run_optimization(
         or the single-best relaxation if the ensemble is empty).
     """
     # Setup initial state (relaxation, starting point, logging)
-    state = _setup_initial_state(atoms, dihedrals, calc, relaxCalc, relax, out_dir)
+    state = _setup_initial_state(
+        atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=use_gradients
+    )
 
     # Add prior settings to state
     state.prior_module = prior_module
     state.prior_exponent = initial_prior_exponent
     state.prior_decay = prior_exponent_decay
-    state.use_gradients = use_gradients
 
     # Evaluate initial guesses (conformers, prior peaks, or random)
     _evaluate_initial_guesses(

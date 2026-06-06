@@ -138,6 +138,18 @@ def test_diag_matches_full_diagonal():
     assert torch.allclose(diag, torch.diagonal(full), atol=1e-9)
 
 
+def test_diag_matches_full_diagonal_shared_hypers():
+    """Shared (ard=1) hyperparameters with d>1 -- the production configuration."""
+    d = 3
+    kern = PeriodicKernelGrad().double()  # ard_num_dims defaults to 1 (shared)
+    kern.lengthscale = torch.tensor([[0.7]], dtype=torch.float64)
+    kern.period_length = torch.tensor([[2 * PI]], dtype=torch.float64)
+    X = torch.rand(4, d, dtype=torch.float64) * (2 * PI)
+    full = kern.forward(X, X)
+    diag = kern.forward(X, X, diag=True)
+    assert torch.allclose(diag, torch.diagonal(full), atol=1e-9)
+
+
 def test_augmented_matrix_is_psd():
     d = 2
     ell = torch.tensor([0.7, 0.7], dtype=torch.float64)

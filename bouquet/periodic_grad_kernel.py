@@ -90,8 +90,10 @@ class PeriodicKernelGrad(PeriodicKernel):
                 raise RuntimeError("diag=True only works when x1 == x2")
             # u = 0 along the diagonal: value 1, gradient variance D_m = 4 pi^2/(l^2 p^2).
             value = torch.ones(*batch_shape, n1, device=x1.device, dtype=x1.dtype)
-            D = (4.0 * PI**2) / (ell * period.pow(2))  # (..., 1, 1, d)
-            grad = D.reshape(*D.shape[:-3], 1, d).expand(*batch_shape, n1, d)
+            D = (4.0 * PI**2) / (ell * period.pow(2))  # (..., 1, 1, ard); ard is 1 or d
+            # Broadcast per-dim variances from ard (shared: 1, or ARD: d) to d.
+            D = D.reshape(*batch_shape, -1).expand(*batch_shape, d)  # (*batch, d)
+            grad = D.unsqueeze(-2).expand(*batch_shape, n1, d)  # (*batch, n1, d)
             # grouped [value(n1), grad dim-major (d*n1)] then interleave
             k_diag = torch.cat(
                 [value, grad.transpose(-1, -2).reshape(*batch_shape, n1 * d)], dim=-1

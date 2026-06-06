@@ -57,8 +57,9 @@ def test_gradient_path_handles_nan_rows(butane_calc):
 def test_run_optimization_records_aligned_gradients(butane_calc):
     """Full pipeline with use_gradients keeps gradients index-aligned & runs."""
     atoms, _, dihedrals, calc = butane_calc
-    state = solver._setup_initial_state(atoms, dihedrals, calc, calc, False, None)
-    state.use_gradients = True
+    state = solver._setup_initial_state(
+        atoms, dihedrals, calc, calc, False, None, use_gradients=True
+    )
     solver._evaluate_initial_guesses(
         state, dihedrals, calc, calc, False, 4, 0, None, None
     )
@@ -66,8 +67,8 @@ def test_run_optimization_records_aligned_gradients(butane_calc):
 
     n = state.observed_energies.shape[0]
     assert state.observed_gradients.shape == (n, len(dihedrals))
-    # The start point is recorded with a NaN gradient; the evaluated points
-    # (rigid scan here) should have finite gradients.
+    # The start point now contributes a gradient too (not NaN).
+    assert not torch.isnan(state.observed_gradients[0]).any()
     finite = (~torch.isnan(state.observed_gradients).any(dim=1)).sum().item()
     assert finite >= n - 1
 

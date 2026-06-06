@@ -181,6 +181,27 @@ def main():
         ensemble=args.ensemble,
     )
 
+    # Gradient labels are only consistent with the energy objective when the
+    # geometry is a constrained minimum of the *energy* calculator. With
+    # relaxation the geometry is minimized on the optimizer surface, so the
+    # projected torsion gradient equals dE*/dtheta only if the two calculators
+    # are the same surface. Refuse the mismatched combination rather than feeding
+    # the GP biased gradient labels. (Without --relax the rigid-scan gradient is
+    # always consistent, so the check is limited to the relaxed case.)
+    if (
+        config.use_gradients
+        and config.relax
+        and config.energy_method != config.optimizer_method
+    ):
+        raise ValueError(
+            "--use-gradients with --relax requires --energy and --optimizer to be "
+            f"the same method (got energy={config.energy_method!r}, "
+            f"optimizer={config.optimizer_method!r}). The torsion gradient is only "
+            "dE*/dtheta at a constrained minimum of the energy calculator, but the "
+            "geometry is relaxed on the optimizer surface. Use "
+            f"--optimizer {config.energy_method}, or drop --use-gradients / --relax."
+        )
+
     # Make an output directory
     out_dir = create_output_directory(
         config.name, config.seed, config.energy_method, args.__dict__
