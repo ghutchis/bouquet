@@ -47,8 +47,8 @@ EPS = 0.043  # ~1 kcal/mol: "reached the minimum" tolerance (eV)
 def _silence():
     with open(os.devnull, "w") as dn:
         old = os.dup(1)
-        os.dup2(dn.fileno(), 1)
         try:
+            os.dup2(dn.fileno(), 1)
             yield
         finally:
             os.dup2(old, 1)

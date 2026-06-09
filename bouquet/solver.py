@@ -250,7 +250,7 @@ def _fit_gradient_gp(
         gp.fit(steps=_GRAD_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
     else:
         # Condition-only: load the frozen hypers and re-condition (steps=0, no Adam).
-        gp.load_state_dict(frozen_hypers, strict=False)
+        gp.load_state_dict(frozen_hypers, strict=True)
         gp.fit(steps=0, lr=0.05)
     return gp
 

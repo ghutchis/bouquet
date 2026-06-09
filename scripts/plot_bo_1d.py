@@ -151,6 +151,13 @@ def fit_arm(
     acqf = LogExpectedImprovement(gp, best_f=train_y.max(), maximize=True)
     with torch.no_grad():
         log_ei = acqf(gx.unsqueeze(1))  # (M,1,1) -> (M,)
+    # Exclude grid points already evaluated (selected angles are grid points and
+    # get appended verbatim) so EI can't re-propose a sampled angle and stall.
+    step = 360.0 / len(grid_deg)
+    gap = np.abs(grid_deg[:, None] - obs_deg[None, :])
+    gap = np.minimum(gap, 360.0 - gap)  # periodic distance
+    sampled = torch.from_numpy((gap < step / 2).any(axis=1))
+    log_ei = log_ei.masked_fill(sampled, float("-inf"))
     ei = log_ei.exp()
     next_deg = float(grid_deg[int(ei.argmax())])
 
@@ -342,6 +349,12 @@ def main():
     )
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    if args.n_total < len(args.init):
+        ap.error(
+            f"--n-total ({args.n_total}) must be >= the number of initial points "
+            f"({len(args.init)}: {args.init})"
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

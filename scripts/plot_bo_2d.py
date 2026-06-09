@@ -164,6 +164,15 @@ def fit_arm(
     acqf = LogExpectedImprovement(gp, best_f=train_y.max(), maximize=True)
     with torch.no_grad():
         log_ei = acqf(qx)  # (M,1,2) -> (M,)
+    # Exclude grid points already evaluated (selected points are grid rows and get
+    # appended verbatim) so EI can't re-propose a sampled point and stall.
+    n_grid = round(math.sqrt(len(query_deg)))
+    step = 360.0 / n_grid
+    d = np.abs(query_deg[:, None, :] - obs_deg[None, :, :])  # (M, n, 2)
+    d = np.minimum(d, 360.0 - d)  # periodic per axis
+    sampled = (d < step / 2).all(axis=2).any(axis=1)  # (M,)
+    if not sampled.all():  # keep at least one candidate if every grid point is taken
+        log_ei = log_ei.masked_fill(torch.from_numpy(sampled), float("-inf"))
     ei = log_ei.exp()
     next_deg = query_deg[int(ei.argmax())].copy()
 
@@ -340,6 +349,17 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    if len(args.init) % 2 != 0:
+        ap.error(
+            f"--init must be a flat list of (theta1, theta2) pairs (even length); "
+            f"got {len(args.init)} values: {args.init}"
+        )
+    num_pairs = len(args.init) // 2
+    if args.n_total < num_pairs:
+        ap.error(
+            f"--n-total ({args.n_total}) must be >= the number of initial pairs "
+            f"({num_pairs}) from --init"
+        )
     init = np.array(args.init, dtype=float).reshape(-1, 2)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
