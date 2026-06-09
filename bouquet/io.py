@@ -1,5 +1,15 @@
 """Input/Output and logging utilities for Bouquet"""
 
+from __future__ import annotations
+
+# ase is only needed when structures are actually written; defer it (and the xyz
+# writer) so importing this module for logging setup alone stays cheap. 3.15+.
+__lazy_modules__ = [
+    "ase",
+    "ase.io.xyz",
+    "json",
+]
+
 import hashlib
 import json
 import logging
@@ -96,7 +106,7 @@ def atoms_to_xyz_string(atoms: Atoms) -> str:
     return xyz.getvalue()
 
 
-def initialize_structure_log(out_dir: Path) -> Tuple[Path, Path]:
+def initialize_structure_log(out_dir: Path) -> tuple[Path, Path]:
     """Initialize the structure logging files.
 
     Creates the CSV log file with headers and returns paths for logging.
@@ -150,7 +160,7 @@ def create_structure_logger(
 
 
 def save_ensemble(
-    out_dir: Path, ensemble: List[Tuple[Atoms, float, float]]
+    out_dir: Path, ensemble: list[tuple[Atoms, float, float]]
 ) -> None:
     """Write the final Boltzmann ensemble to disk.
 

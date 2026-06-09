@@ -1,5 +1,19 @@
 """Tools for computing the energy of a molecule"""
 
+from __future__ import annotations
+
+# Annotations are strings (PEP 563), so numpy/ase types in signatures no longer
+# pin those modules at import; defer them and the optimizer submodules until an
+# energy is actually evaluated (Python 3.15+).
+__lazy_modules__ = [
+    "numpy",
+    "ase",
+    "ase.calculators.calculator",
+    "ase.constraints",
+    "ase.optimize",
+    "bouquet.gradients",
+]
+
 import os
 from typing import List, Optional, Tuple, Union
 
@@ -20,14 +34,14 @@ from bouquet.setup import DihedralInfo
 
 
 def evaluate_energy(
-    angles: Union[List[float], np.ndarray],
+    angles: list[float] | np.ndarray,
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool = True,
-    steps: Optional[int] = DEFAULT_RELAXATION_STEPS,
-) -> Tuple[float, Atoms]:
+    steps: int | None = DEFAULT_RELAXATION_STEPS,
+) -> tuple[float, Atoms]:
     """
     Compute the potential energy for a set of dihedral angles and optionally relax non-dihedral degrees of freedom.
 
@@ -75,7 +89,7 @@ def evaluate_energy(
     return relax_structure(atoms, calc, relaxCalc, steps)
 
 
-def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: Optional[int]) -> Tuple[float, Atoms]:
+def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, steps: int | None) -> tuple[float, Atoms]:
     """
     Relax the atomic geometry using the provided optimizer and evaluate its potential energy.
 
@@ -122,15 +136,15 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
 
 
 def evaluate_energy_with_gradient(
-    angles: Union[List[float], np.ndarray],
+    angles: list[float] | np.ndarray,
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool = True,
-    steps: Optional[int] = DEFAULT_RELAXATION_STEPS,
+    steps: int | None = DEFAULT_RELAXATION_STEPS,
     per_degree: bool = False,
-) -> Tuple[float, Atoms, np.ndarray]:
+) -> tuple[float, Atoms, np.ndarray]:
     """Evaluate the energy and its gradient with respect to the torsion angles.
 
     Thin wrapper around :func:`evaluate_energy` that additionally returns

@@ -1,5 +1,27 @@
 """Methods for solving the conformer option problem"""
 
+from __future__ import annotations
+
+# With annotations evaluated as strings (PEP 563), the heavy numeric/BO stack is
+# only touched inside function bodies, so defer it until an optimization actually
+# runs. This is the dominant `import bouquet` cost (Python 3.15+).
+__lazy_modules__ = [
+    "numpy",
+    "torch",
+    "ase",
+    "ase.build",
+    "ase.calculators.calculator",
+    "botorch.acquisition.analytic",
+    "botorch.acquisition.prior_guided",
+    "botorch.optim.fit",
+    "botorch.optim",
+    "botorch.models",
+    "botorch.models.transforms.outcome",
+    "gpytorch",
+    "gpytorch.mlls",
+    "gpytorch.priors",
+]
+
 import itertools
 import logging
 import math
@@ -94,12 +116,12 @@ class OptimizationState:
     # NaN where the gradient is unavailable (failed eval, or use_gradients off).
     observed_gradients: torch.Tensor = None  # Shape: (n_observations, n_dihedrals)
     # Per-observation Atoms, aligned index-for-index with the tensors above.
-    observed_atoms: List[Atoms] = field(default_factory=list)
+    observed_atoms: list[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
-    best_atoms: Optional[Atoms] = None
+    best_atoms: Atoms | None = None
     best_step: int = 0
-    add_entry: Optional[Callable] = None
+    add_entry: Callable | None = None
     # When True, evaluations also record dE/dtheta and the acquisition GP uses
     # the gradient-enhanced surrogate (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
@@ -120,10 +142,10 @@ class OptimizationState:
     # on condition-only steps).
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
-    grad_gp_hypers: Optional[dict] = None
+    grad_gp_hypers: dict | None = None
 
     # PiBO fields
-    prior_module: Optional[DihedralPriorModule] = None
+    prior_module: DihedralPriorModule | None = None
     prior_exponent: float = 2.0
     prior_decay: float = 0.9
 
@@ -132,7 +154,7 @@ class OptimizationState:
         coords: np.ndarray,
         energy: float,
         atoms: Atoms,
-        gradient: Optional[np.ndarray] = None,
+        gradient: np.ndarray | None = None,
     ) -> None:
         """Append a new observation, keeping observed_atoms index-aligned.
 
@@ -185,7 +207,7 @@ def _fit_gradient_gp(
     energy_cap: torch.Tensor,
     observed_gradients: torch.Tensor,
     y_std: torch.Tensor,
-    frozen_hypers: Optional[dict] = None,
+    frozen_hypers: dict | None = None,
 ) -> GradientEnhancedPeriodicGP:
     """Build and fit the gradient-enhanced periodic GP on standardized data.
 
@@ -236,12 +258,12 @@ def _fit_gradient_gp(
 def _select_next_points_botorch(
     train_X: torch.Tensor,
     train_y: torch.Tensor,
-    prior_module: Optional[DihedralPriorModule] = None,
+    prior_module: DihedralPriorModule | None = None,
     prior_exponent: float = 0.0,
-    observed_gradients: Optional[torch.Tensor] = None,
+    observed_gradients: torch.Tensor | None = None,
     use_gradients: bool = False,
-    gp_frozen_hypers: Optional[dict] = None,
-    gp_hyper_out: Optional[dict] = None,
+    gp_frozen_hypers: dict | None = None,
+    gp_hyper_out: dict | None = None,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -356,11 +378,11 @@ def _select_next_points_botorch(
 
 def _setup_initial_state(
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
     use_gradients: bool = False,
 ) -> OptimizationState:
     """Perform initial relaxation, evaluate starting point, and set up logging.
@@ -443,7 +465,7 @@ def plan_initial_points(
     init_steps: int,
     grid_budget: int,
     seed: int,
-    max_points: Optional[int] = None,
+    max_points: int | None = None,
 ) -> np.ndarray:
     """Plan initial dihedral guesses from the peaks of a dihedral prior.
 
@@ -547,11 +569,11 @@ def plan_initial_points(
 def _evaluate_point(
     state: OptimizationState,
     guess: np.ndarray,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-) -> Tuple[float, Atoms, Optional[np.ndarray]]:
+) -> tuple[float, Atoms, np.ndarray | None]:
     """Evaluate a dihedral guess, optionally also returning dE/dtheta.
 
     When ``state.use_gradients`` is set this projects the calculator's forces
@@ -569,14 +591,14 @@ def _evaluate_point(
 
 def _evaluate_initial_guesses(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
     init_steps: int,
     seed: int,
-    initial_conformers: Optional[List[Atoms]],
-    initial_dihedrals: Optional[np.ndarray] = None,
+    initial_conformers: list[Atoms] | None,
+    initial_dihedrals: np.ndarray | None = None,
 ) -> None:
     """Evaluate initial guesses and update state in-place.
 
@@ -660,11 +682,11 @@ def _evaluate_initial_guesses(
 def _run_optimization_loop(
     state: OptimizationState,
     n_steps: int,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
 ) -> None:
     """Run the Bayesian optimization loop, updating state in-place.
 
@@ -760,7 +782,7 @@ def _run_optimization_loop(
 
 def _perform_final_relaxation(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
 ) -> Atoms:
@@ -866,7 +888,7 @@ def _select_ensemble_candidates(
     p_threshold: float,
     sigma_floor_eV: float,
     failure_energy_eV: float,
-) -> List[Tuple[np.ndarray, Atoms]]:
+) -> list[tuple[np.ndarray, Atoms]]:
     """Select observed conformers to tightly optimize, ordered by predicted energy.
 
     A conformer ``i`` is included iff its GP posterior gives
@@ -941,14 +963,14 @@ def _rmsd(a: Atoms, b: Atoms) -> float:
 
 
 def _dedup(
-    pairs: List[Tuple[Atoms, float]], rmsd_thr: float, e_tol_eV: float
-) -> List[Tuple[Atoms, float]]:
+    pairs: list[tuple[Atoms, float]], rmsd_thr: float, e_tol_eV: float
+) -> list[tuple[Atoms, float]]:
     """Deduplicate (atoms, energy_eV) pairs, assumed sorted by energy ascending.
 
     A structure is a duplicate iff it is BOTH energy-close AND geometry-close to
     an already-kept structure.
     """
-    unique: List[Tuple[Atoms, float]] = []
+    unique: list[tuple[Atoms, float]] = []
     for atoms, energy in pairs:
         if any(
             abs(energy - ue) < e_tol_eV and _rmsd(ua, atoms) < rmsd_thr
@@ -970,10 +992,10 @@ def _boltzmann_weights(energies_eV: np.ndarray, temperature: float) -> np.ndarra
 
 def _perform_ensemble_relaxation(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
-) -> List[Tuple[Atoms, float, float]]:
+) -> list[tuple[Atoms, float, float]]:
     """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
 
     Returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy ascending,
@@ -992,7 +1014,7 @@ def _perform_ensemble_relaxation(
     )
 
     # Tight, UNCONSTRAINED optimization of each candidate (no step limit).
-    optimized: List[Tuple[Atoms, float]] = []
+    optimized: list[tuple[Atoms, float]] = []
     for k, (coords, atoms) in enumerate(candidates):
         a = atoms.copy()
         a.set_constraint()  # remove any dihedral constraints
@@ -1029,18 +1051,18 @@ def _perform_ensemble_relaxation(
 
 def run_optimization(
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     n_steps: int,
     calc: Calculator,
     relaxCalc: Calculator,
     init_steps: int,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
     relax: bool = True,
     seed: int = 0,
-    initial_conformers: Optional[List[Atoms]] = None,
-    initial_dihedrals: Optional[np.ndarray] = None,
+    initial_conformers: list[Atoms] | None = None,
+    initial_dihedrals: np.ndarray | None = None,
     # New PiBO parameters
-    prior_module: Optional[DihedralPriorModule] = None,
+    prior_module: DihedralPriorModule | None = None,
     initial_prior_exponent: float = 2.0,
     prior_exponent_decay: float = 0.9,
     return_ensemble: bool = False,
@@ -1048,7 +1070,7 @@ def run_optimization(
     gradient_steps: int = 0,
     grad_refit_dense_until: int = 20,
     grad_refit_every: int = 0,
-) -> Union[Atoms, Tuple[Atoms, List[Tuple[Atoms, float, float]]]]:
+) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
     Args:
