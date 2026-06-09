@@ -49,6 +49,11 @@ class TestConfiguration:
         assert config.num_threads == 4
         assert config.charge == 0
         assert config.multiplicity == 1
+        # Gradient GP defaults to the "gradfreeze" schedule (cold-fit 20 steps,
+        # then freeze); full refitting every step is the opt-out (dense=0).
+        assert config.gradient_steps == 0
+        assert config.grad_refit_dense_until == 20
+        assert config.grad_refit_every == 0
 
     def test_configuration_string_path_conversion(self, tmp_path):
         """Test that string paths are converted to Path objects."""

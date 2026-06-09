@@ -127,6 +127,20 @@ class Configuration:
     # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
     # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
+    # Cap on the number of leading BO steps that use the gradient-enhanced GP; the
+    # remaining steps use the value-only GP. The gradient GP's per-step cost grows
+    # steeply with observation count, so this bounds it on large molecules while
+    # keeping the early benefit. <=0 keeps gradients for the whole run.
+    gradient_steps: int = 0
+    # Gradient-GP hyperparameter refit schedule (see solver._run_optimization_loop):
+    # cold full fits for the first `grad_refit_dense_until` BO steps, then freeze the
+    # hyperparameters and only re-condition; `grad_refit_every` > 0 cold-refreshes
+    # them every that many post-dense steps. Default (20, 0) = the "gradfreeze"
+    # schedule: cold-fit 20 steps then freeze (validated quality-neutral vs full
+    # refitting across 5-11 dihedrals). Set grad_refit_dense_until=0 to refit every
+    # step (the slow reference).
+    grad_refit_dense_until: int = 20
+    grad_refit_every: int = 0
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings

@@ -118,6 +118,37 @@ def main():
         "GP, so each energy evaluation also contributes a gradient observation.",
     )
     parser.add_argument(
+        "--gradient-steps",
+        type=int,
+        default=0,
+        help="With --use-gradients, use the gradient-enhanced GP only for the "
+        "first N BO steps, then switch to the value-only GP. The gradient GP's "
+        "per-step cost grows steeply with the observation count, so this caps it "
+        "on large/flexible molecules while keeping the early-search benefit. "
+        "0 (default) keeps gradients for the whole run.",
+    )
+    parser.add_argument(
+        "--grad-refit-dense-until",
+        type=int,
+        default=20,
+        help="Gradient-GP refit schedule ('gradfreeze'): do a full hyperparameter "
+        "fit for the first N BO steps, then FREEZE the hyperparameters and only "
+        "re-condition (one Cholesky/step instead of ~200). Refitting is the dominant "
+        "gradient-GP cost and grows with observation count, so freezing keeps the "
+        "full-gradient run affordable on large molecules. Default 20 (validated "
+        "quality-neutral vs full refitting, 5-11 dihedrals); set 0 to refit every "
+        "step (the slow reference).",
+    )
+    parser.add_argument(
+        "--grad-refit-every",
+        type=int,
+        default=0,
+        help="After the dense phase, optionally cold-refresh the frozen "
+        "hyperparameters every Nth BO step (0 freezes for the rest of the run; the "
+        "refresh is a cold fit -- warm-starting drifts the hyperparameters and "
+        "degrades the search). 0 (default); with no dense phase, fits every step.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -173,6 +204,9 @@ def main():
         auto_steps=args.auto,
         relax=args.relax,
         use_gradients=args.use_gradients,
+        gradient_steps=args.gradient_steps,
+        grad_refit_dense_until=args.grad_refit_dense_until,
+        grad_refit_every=args.grad_refit_every,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -342,6 +376,9 @@ def main():
         prior_exponent_decay=config.prior_exponent_decay,
         return_ensemble=config.ensemble,
         use_gradients=config.use_gradients,
+        gradient_steps=config.gradient_steps,
+        grad_refit_dense_until=config.grad_refit_dense_until,
+        grad_refit_every=config.grad_refit_every,
     )
 
     if config.ensemble:
