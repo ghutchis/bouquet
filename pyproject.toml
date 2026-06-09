@@ -74,6 +74,12 @@ pytest-cov = ">=7.0.0,<8"
 python = "==3.12"
 pandas = ">=3.0.3,<4"
 
+# Install bouquet itself editably (the pixi equivalent of `pip install -e .`) so
+# `import bouquet` and scripts/ resolve without setting PYTHONPATH. The key must
+# match the local [project].name, not the PyPI distribution name.
+[tool.pixi.pypi-dependencies]
+bouquet = { path = ".", editable = true }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
