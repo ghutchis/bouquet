@@ -17,10 +17,18 @@ Configurations are passed as ``{label: full_extra_cli_args}`` (each arm fully
 specifies its own flags, including ``--priors`` where relevant), so ``run_one``
 is configuration-agnostic.
 
-Paired comparisons are by (molecule, seed): bouquet now seeds every RNG
-(numpy + torch) from ``--seed``, so the arms share their randomness at a fixed
-seed and differencing per (name, seed) cancels the shared Bayesian-optimization
+Paired comparisons are by (molecule, seed): bouquet seeds every RNG (numpy +
+torch) from ``--seed``, so the arms share their randomness at a fixed seed and
+differencing per (name, seed) cancels much of the shared Bayesian-optimization
 noise (common random numbers), isolating the configuration effect.
+
+Caveat: common random numbers only hold *exactly* when runs are deterministic.
+Multi-threaded BLAS (the default) has non-deterministic reduction order, and the
+chaotic BO search amplifies that ~1e-6 noise into different basins -- two
+identical runs can finish ~0.02 eV apart. That ~0.02 eV is the paired-comparison
+noise floor unless you pass ``--single-thread`` (bit-reproducible, slower). For a
+clean isolation of a single configuration knob, run single-threaded; for a broad
+sweep, rely on the per-molecule-mean statistics in ``analyze`` to average it out.
 """
 
 import argparse
@@ -83,17 +91,66 @@ _EVAL_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
-def subprocess_run(cmd: List[str]) -> Tuple[str, int]:
+def subprocess_run(
+    cmd: List[str], timeout: Optional[float] = None, env: Optional[dict] = None
+) -> Tuple[str, int]:
     """Run a command, returning (combined stdout+stderr, returncode).
 
-    Logging may go to either stream, so both are combined for parsing.
+    Logging may go to either stream, so both are combined for parsing. If
+    ``timeout`` (seconds) is given and exceeded, the child is killed and a
+    non-zero return code (124, matching coreutils ``timeout``) is returned along
+    with whatever output was captured before the kill -- some molecules (large,
+    very flexible) can run effectively forever, so the sweep must not block on
+    one trial. ``env`` overrides the child environment (e.g. pinning BLAS threads
+    for run-to-run determinism); None inherits the parent's.
     """
     import subprocess
 
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL
+    def _text(x) -> str:  # TimeoutExpired output is sometimes bytes even w/ text=True
+        if x is None:
+            return ""
+        return x.decode("utf-8", "replace") if isinstance(x, bytes) else x
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=timeout, env=env,
+        )
+        return result.stdout + "\n" + result.stderr, result.returncode
+    except subprocess.TimeoutExpired as e:
+        out = _text(e.stdout) + "\n" + _text(e.stderr)
+        return out + f"\n[sweep] trial killed after {timeout:g}s timeout\n", 124
+
+
+def single_thread_env() -> dict:
+    """Parent environment with BLAS/OpenMP thread counts pinned to 1.
+
+    The gradient-GP fit and the acquisition optimizer use multi-threaded BLAS,
+    whose reduction order is not deterministic run-to-run; the chaotic BO search
+    amplifies the resulting ~1e-6 noise into different basins (two identical runs
+    can finish ~0.02 eV apart). Pinning to one thread makes a run bit-reproducible
+    from its seed, which is what the paired (common-random-number) comparison needs
+    to actually cancel noise between arms. The trade-off is slower per-trial fits.
+    """
+    import os
+
+    return dict(
+        os.environ,
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+        OPENBLAS_NUM_THREADS="1",
+        NUMEXPR_NUM_THREADS="1",
     )
-    return result.stdout + "\n" + result.stderr, result.returncode
+
+
+def require_single_surface(energy: Optional[str], optimizer: Optional[str]) -> None:
+    """Exit unless ``energy == optimizer``. ``--use-gradients`` with ``--relax``
+    needs a single surface so the projected torsion gradient equals dE*/dtheta at the
+    constrained minimum of the energy calculator (see bouquet.cli)."""
+    if energy != optimizer:
+        sys.exit(f"--use-gradients with --relax requires --energy == --optimizer "
+                 f"(got {energy} / {optimizer}); the torsion gradient is only "
+                 "dE*/dtheta at a constrained minimum of the energy calculator.")
 
 
 def parse_trajectory(log_text: str) -> List[Tuple[str, float]]:
@@ -141,12 +198,18 @@ def run_one(
     seed: int,
     energy_method: Optional[str],
     optimizer_method: Optional[str],
+    timeout: Optional[float] = None,
+    fail_log_dir: Optional[Path] = None,
+    env: Optional[dict] = None,
 ) -> Tuple[Dict, List[Dict]]:
     """Run a single (config, molecule, seed) trial.
 
     Returns ``(summary_row, traj_rows)``: the tidy summary dict and the
     per-evaluation trajectory rows (running best-so-far) for this trial.
     ``extra_args`` fully specifies the arm (including ``--priors`` if needed).
+    A trial exceeding ``timeout`` seconds is killed and recorded as a failure.
+    On any failure, the captured stdout+stderr is written under ``fail_log_dir``
+    (if given) so crashes can be told apart from timeouts after the fact.
     """
     cmd = [
         sys.executable, "-m", "bouquet.cli",
@@ -162,7 +225,7 @@ def run_one(
     if optimizer_method:
         cmd += ["--optimizer", optimizer_method]
 
-    proc, returncode = subprocess_run(cmd)
+    proc, returncode = subprocess_run(cmd, timeout=timeout, env=env)
     parsed = parse_log_output(proc)
     # Mirror batch.py: a trial only counts as successful when the process exited
     # cleanly AND a best step was parsed from the log.
@@ -180,6 +243,17 @@ def run_one(
         "e_e0_constrained": parsed["e_e0_constrained"] if ok else "",
         "e_e0_unconstrained": parsed["e_e0_unconstrained"] if ok else "",
     }
+    # Persist the log of a failed trial for diagnosis (timeout vs. crash vs. a
+    # ValueError like the gradient single-surface check). Unique filename per
+    # trial key, so concurrent workers never collide -- no lock needed.
+    if not ok and fail_log_dir is not None:
+        fail_log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = fail_log_dir / f"{config}_{_safe_filename(name)}_seed{seed}.log"
+        with open(log_path, "w") as f:
+            f.write(f"# cmd: {' '.join(cmd)}\n# returncode: {returncode}"
+                    f"{'  (124 = timeout)' if returncode == 124 else ''}\n\n")
+            f.write(proc)
+
     # Only emit trajectory rows for cleanly-exited runs; a crashed process may
     # have produced a partial/misleading log.
     traj_rows = (
@@ -188,6 +262,63 @@ def run_one(
         else []
     )
     return row, traj_rows
+
+
+def predict_bo_budget(smiles: str) -> Optional[int]:
+    """Predict how many BO steps ``bouquet --auto`` will run for ``smiles``.
+
+    Uses bouquet's own dihedral detection and tiered ``--auto`` budget so the
+    estimate tracks the CLI exactly. Returns ``None`` if it can't be computed
+    (bad SMILES, import failure) -- callers then decline to skip and just run it.
+    Imported lazily so non-gradient sweeps never pay the rdkit/torch import.
+    """
+    try:
+        from bouquet.config import Configuration
+        from bouquet.setup import detect_dihedrals, get_initial_structure
+
+        _, mol = get_initial_structure(smiles)
+        d = len(detect_dihedrals(mol))
+        cfg = Configuration(smiles=smiles, auto_steps=True)
+        return cfg.compute_auto_steps(d, cfg.init_steps)
+    except Exception:
+        return None
+
+
+def _flag_int(extra_args: List[str], flag: str) -> Optional[int]:
+    """The int value following ``flag`` in a CLI-arg list, or None if the flag is
+    absent or its value can't be parsed."""
+    if flag in extra_args:
+        try:
+            return int(extra_args[extra_args.index(flag) + 1])
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def arm_gradient_steps(extra_args: List[str], budget: int) -> int:
+    """Number of BO steps this arm would run the *gradient-enhanced* GP for, given
+    a molecule's BO ``budget``.
+
+    0 if the arm is value-only. A ``--gradient-steps N`` cap (e.g. the hybrid arm)
+    limits it to ``min(N, budget)``; an uncapped ``--use-gradients`` arm runs the
+    gradient GP for the whole ``budget``. This is what the predictive skip tests
+    against, so capped arms are never skipped for being long.
+    """
+    if "--use-gradients" not in extra_args:
+        return 0
+    cap = _flag_int(extra_args, "--gradient-steps")
+    return min(cap, budget) if cap and cap > 0 else budget
+
+
+def arm_freezes_hypers(extra_args: List[str]) -> bool:
+    """True if the gradient arm uses the freeze schedule, so its whole-run gradient
+    GP is tractable and the predictive skip should leave it in.
+
+    Freezing is bouquet's default (``Configuration.grad_refit_dense_until`` defaults
+    to 20), so a bare ``--use-gradients`` arm freezes and is exempt; only an explicit
+    ``--grad-refit-dense-until 0`` -- the slow full-refit reference -- does NOT freeze
+    and remains subject to the skip. (Mirrors that bouquet default; keep in sync.)"""
+    return _flag_int(extra_args, "--grad-refit-dense-until") != 0
 
 
 def load_molecules(
@@ -227,6 +358,46 @@ def load_done_keys(output_path: Path) -> set:
     return done
 
 
+def drop_failed(output_path: Path, traj_path: Path) -> set:
+    """Remove every failed (``success != 1``) trial from the summary CSV and purge
+    its rows from the trajectory CSV. Returns the set of removed (config, name,
+    seed) keys so a ``--resume`` afterwards re-runs exactly those trials.
+
+    A clean-exit-but-unparsed trial can leave trajectory rows while still being
+    recorded ``success=0``; purging them prevents duplicate trajectory rows when
+    the retry succeeds.
+    """
+    if not output_path.exists():
+        return set()
+    with open(output_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    failed = {
+        (r["config"], r["name"], str(r["seed"]))
+        for r in rows if str(r.get("success")) != "1"
+    }
+    if not failed:
+        return failed
+
+    kept = [r for r in rows
+            if (r["config"], r["name"], str(r["seed"])) not in failed]
+    with open(output_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        w.writeheader()
+        w.writerows(kept)
+
+    if traj_path.exists():
+        with open(traj_path, newline="") as f:
+            trows = list(csv.DictReader(f))
+        tkept = [r for r in trows
+                 if (r["config"], r["name"], str(r["seed"])) not in failed]
+        if len(tkept) != len(trows):
+            with open(traj_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES)
+                w.writeheader()
+                w.writerows(tkept)
+    return failed
+
+
 def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) -> None:
     """Run every (config, molecule, seed) trial; append to summary + trajectory CSVs.
 
@@ -238,6 +409,16 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
         if c not in configurations:
             sys.exit(f"Unknown config '{c}'. Known: {', '.join(configurations)}")
 
+    # --use-gradients passthrough: turn on the gradient-enhanced GP for every arm
+    # (requires a single surface; see require_single_surface / bouquet.cli).
+    if getattr(args, "use_gradients", False):
+        require_single_surface(args.energy, args.optimizer)
+        configurations = {
+            label: a if "--use-gradients" in a else a + ["--use-gradients"]
+            for label, a in configurations.items()
+        }
+        print("Gradients ON for all arms (--use-gradients; freeze schedule by default).")
+
     mols = load_molecules(args.input, args.smiles_column, args.name_column)
     print(f"Loaded {len(mols)} molecules; seeds={seeds}; configs={configs}")
 
@@ -246,8 +427,17 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
         f"{args.output.stem}_traj{args.output.suffix or '.csv'}"
     )
 
+    # --retry-failed: strip prior failures from both CSVs so they re-run; everything
+    # successful is still skipped (it implies resume). Without it, --resume skips ALL
+    # recorded trials, failures included.
+    if getattr(args, "retry_failed", False):
+        removed = drop_failed(args.output, traj_path)
+        print(f"--retry-failed: removed {len(removed)} failed trial(s); they will be "
+              f"re-run, successful trials skipped.")
+
     # Build the full task list, then drop any already-done (resume).
-    done = load_done_keys(args.output) if args.resume else set()
+    done = load_done_keys(args.output) if (args.resume or
+                                           getattr(args, "retry_failed", False)) else set()
     if not args.output.exists():
         with open(args.output, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
@@ -255,13 +445,50 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
         with open(traj_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES).writeheader()
 
+    # Predictive skip: drop any gradient arm whose gradient-GP phase would exceed
+    # this many BO steps for a molecule (its per-step cost grows steeply, so big
+    # molecules run for hours and time out). Estimated from dihedral count up front
+    # so we never pay the wall-clock to discover it. 0 disables.
+    skip_thresh = getattr(args, "skip_grad_above_steps", 0) or 0
+    budget_cache: Dict[str, Optional[int]] = {}
+    skipped = []
+
+    def predicted_skip(config: str, smiles: str, name: str) -> bool:
+        if skip_thresh <= 0:
+            return False
+        extra = configurations[config]
+        if "--use-gradients" not in extra:
+            return False
+        if arm_freezes_hypers(extra):  # the freeze schedule keeps it tractable
+            return False
+        if smiles not in budget_cache:
+            budget_cache[smiles] = predict_bo_budget(smiles)
+        budget = budget_cache[smiles]
+        if budget is None:  # couldn't predict -> don't skip, just run it
+            return False
+        gsteps = arm_gradient_steps(extra, budget)
+        if gsteps > skip_thresh:
+            skipped.append((config, name, gsteps, budget))
+            return True
+        return False
+
     tasks = []
     for config in configs:
         for smiles, name in mols:
+            if predicted_skip(config, smiles, name):
+                continue
             for seed in seeds:
                 if (config, name, str(seed)) in done:
                     continue
                 tasks.append((config, smiles, name, seed))
+
+    if skipped:
+        print(f"\nPredictively skipped {len(skipped)} (config, molecule) cell(s) "
+              f"with > {skip_thresh} gradient-GP steps (all seeds each):")
+        for config, name, gsteps, budget in skipped:
+            print(f"  SKIP {config:<16} {name:<20} "
+                  f"({gsteps} grad steps of {budget}-step budget)")
+        print()
 
     total = len(tasks)
     print(f"{total} trials to run ({len(done)} already done)"
@@ -272,11 +499,32 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
     write_lock = threading.Lock()
     counter = {"n": 0}
 
+    # A non-positive --timeout disables the per-trial kill.
+    timeout = args.timeout if getattr(args, "timeout", 0) and args.timeout > 0 else None
+
+    # Failed-trial logs land in <output stem>_failed/ by default; --no-fail-logs off.
+    fail_log_dir = None
+    if not getattr(args, "no_fail_logs", False):
+        fail_log_dir = args.fail_log_dir or args.output.with_name(
+            f"{args.output.stem}_failed"
+        )
+
+    # Pin BLAS threads to 1 for bit-reproducible runs (real common-random-number
+    # pairing) at the cost of speed. On by default; --no-single-thread opts out.
+    env = single_thread_env() if getattr(args, "single_thread", True) else None
+    if env is not None:
+        print("Single-threaded (OMP/MKL/OPENBLAS=1): runs are seed-reproducible for "
+              "clean paired comparison. Pass --no-single-thread for raw speed.")
+    else:
+        print("WARNING: --no-single-thread: multi-threaded BLAS is non-deterministic; "
+              "the paired comparison carries a ~0.02 eV run-to-run noise floor.")
+
     def submit(task):
         config, smiles, name, seed = task
         return run_one(
             config, configurations[config], smiles, name, seed,
-            args.energy, args.optimizer,
+            args.energy, args.optimizer, timeout=timeout, fail_log_dir=fail_log_dir,
+            env=env,
         )
 
     t0 = time.time()
@@ -303,8 +551,9 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
                 n = counter["n"]
             e = row.get("e_e0_unconstrained", "")
             bs = row.get("best_step", "")
+            tag = "" if row.get("success") else "  FAILED (crash/timeout)"
             print(f"[{n}/{total}] {row['config']:<16} {row['name']:<16} "
-                  f"seed={row['seed']:<7} best_step={bs} E-E0={e}")
+                  f"seed={row['seed']:<7} best_step={bs} E-E0={e}{tag}")
 
     prog = Path(sys.argv[0]).name
     print(f"\nDone in {time.time() - t0:.0f}s. Wrote {args.output} and {traj_path}")
@@ -409,7 +658,10 @@ def analyze(args: argparse.Namespace, baseline: str) -> None:
     # Every RNG is seeded from --seed (torch included), so arms sharing a seed share
     # their randomness. Differencing per (name, seed) cancels the shared BO noise
     # (common random numbers) and isolates the config effect -- far lower variance
-    # than pairing on best-of-seeds.
+    # than pairing on best-of-seeds. NOTE: CRN is only exact when runs are
+    # deterministic; under default multi-threaded BLAS there is a ~0.02 eV
+    # run-to-run noise floor (see the module docstring), so treat per-(name, seed)
+    # deltas below that as noise unless the sweep was run with --single-thread.
     if baseline not in dfp["config"].unique():
         print(f"\n(No '{baseline}' rows; skipping paired comparison.)")
         return
@@ -709,7 +961,12 @@ def _plot_trajectories(df, best_known, configs, baseline, plot_dir) -> None:
 # ---------------------------------------------------------------------------
 
 
-def add_run_args(parser, config_names, priors_default=PRIORS_FILE_DEFAULT) -> None:
+def add_run_args(parser, config_names, priors_default=PRIORS_FILE_DEFAULT,
+                 gradients_default=None) -> None:
+    """Shared 'run' arguments. ``gradients_default``: if not None, add a
+    --use-gradients/--no-use-gradients flag with that default; when set, every arm
+    gets --use-gradients appended (single-surface check enforced). Sweeps that vary
+    gradients per-arm (sweep_gradient) leave it None and manage their own arms."""
     parser.add_argument("--input", required=True, type=Path, help="CSV with smiles,name")
     parser.add_argument("--output", required=True, type=Path, help="Tidy output CSV")
     parser.add_argument("--traj-output", type=Path, default=None,
@@ -718,12 +975,58 @@ def add_run_args(parser, config_names, priors_default=PRIORS_FILE_DEFAULT) -> No
     parser.add_argument("--configs", default=None,
                         help=f"Comma-separated subset of: {', '.join(config_names)}")
     parser.add_argument("--priors-file", default=priors_default)
-    parser.add_argument("--energy", default=None, choices=ENERGY_CHOICES)
-    parser.add_argument("--optimizer", default=None, choices=ENERGY_CHOICES)
+    # Default both methods to gfnff: it is fast and, being a single surface, satisfies
+    # the gradient single-surface requirement (energy == optimizer under --relax), so
+    # gradients can be enabled across every arm.
+    parser.add_argument("--energy", default="gfnff", choices=ENERGY_CHOICES)
+    parser.add_argument("--optimizer", default="gfnff", choices=ENERGY_CHOICES)
     parser.add_argument("--smiles-column", default="smiles")
     parser.add_argument("--name-column", default="name")
     parser.add_argument("--workers", "-w", type=int, default=1)
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--timeout", type=float, default=1800.0,
+                        help="Per-trial wall-clock limit in seconds; a trial that "
+                        "exceeds it is killed and recorded as a failure (some large, "
+                        "flexible molecules never converge). 0 disables (default 1800).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Skip (config, molecule, seed) trials already in the "
+                        "output CSV, successes and failures alike")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Re-run only the trials previously recorded as failures: "
+                        "drop their rows from the summary + trajectory CSVs, then "
+                        "resume (successful trials are still skipped). Use after a "
+                        "sweep where some trials timed out or crashed.")
+    parser.add_argument("--fail-log-dir", type=Path, default=None,
+                        help="Directory for captured logs of FAILED trials "
+                        "(default: <output stem>_failed/). One file per trial; "
+                        "returncode 124 means it hit --timeout.")
+    parser.add_argument("--no-fail-logs", action="store_true",
+                        help="Do not save logs for failed trials")
+    parser.add_argument("--single-thread", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Pin BLAS/OpenMP to 1 thread per trial so each run is "
+                        "bit-reproducible from its seed (DEFAULT: on). Multi-threaded "
+                        "BLAS is non-deterministic and the chaotic BO search amplifies "
+                        "it (~0.02 eV run-to-run), which breaks the paired (CRN) "
+                        "comparison and inflates the noise floor. Pass "
+                        "--no-single-thread for raw speed when reproducibility isn't "
+                        "needed; recover throughput with more --workers.")
+    parser.add_argument("--skip-grad-above-steps", type=int, default=0,
+                        help="Predictively skip any --use-gradients arm whose "
+                        "gradient-GP phase would run more than this many BO steps "
+                        "for a molecule (estimated from its dihedral count and the "
+                        "--auto budget), instead of grinding to a timeout. The "
+                        "gradient GP's per-step cost grows steeply, so large "
+                        "molecules can run for hours. A --gradient-steps N cap "
+                        "counts only N, so capped arms (e.g. gradhybrid) stay in. "
+                        "0 (default) disables.")
+    if gradients_default is not None:
+        parser.add_argument("--use-gradients", action=argparse.BooleanOptionalAction,
+                            default=gradients_default,
+                            help="Append --use-gradients to every arm (gradient-enhanced "
+                            f"GP; freeze schedule by bouquet default). Default: "
+                            f"{'on' if gradients_default else 'off'}. Requires "
+                            "--energy == --optimizer (single surface); --no-use-gradients "
+                            "runs the value-only GP everywhere.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the plan and trial count, then exit")
 

@@ -1,5 +1,27 @@
 """Methods for solving the conformer option problem"""
 
+from __future__ import annotations
+
+# With annotations evaluated as strings (PEP 563), the heavy numeric/BO stack is
+# only touched inside function bodies, so defer it until an optimization actually
+# runs. This is the dominant `import bouquet` cost (Python 3.15+).
+__lazy_modules__ = [
+    "numpy",
+    "torch",
+    "ase",
+    "ase.build",
+    "ase.calculators.calculator",
+    "botorch.acquisition.analytic",
+    "botorch.acquisition.prior_guided",
+    "botorch.optim.fit",
+    "botorch.optim",
+    "botorch.models",
+    "botorch.models.transforms.outcome",
+    "gpytorch",
+    "gpytorch.mlls",
+    "gpytorch.priors",
+]
+
 import itertools
 import logging
 import math
@@ -66,6 +88,14 @@ from bouquet.setup import DihedralInfo
 
 logger = logging.getLogger(__name__)
 
+# Marginal-likelihood Adam iterations for a cold gradient-GP hyperparameter fit
+# (see _fit_gradient_gp). Condition-only updates run 0 steps. A benchmark found
+# conformer quality is insensitive to fit convergence (50/100/200 steps gave
+# statistically indistinguishable minima despite very different final NLLs), so 100
+# trims the dense-phase cold fits at no quality cost; 50 showed a faint degradation
+# and is under-converged for larger molecules.
+_GRAD_GP_FIT_STEPS = 100
+
 
 def _get_device() -> torch.device:
     """Get the appropriate torch device (CUDA if available, else CPU)."""
@@ -86,18 +116,36 @@ class OptimizationState:
     # NaN where the gradient is unavailable (failed eval, or use_gradients off).
     observed_gradients: torch.Tensor = None  # Shape: (n_observations, n_dihedrals)
     # Per-observation Atoms, aligned index-for-index with the tensors above.
-    observed_atoms: List[Atoms] = field(default_factory=list)
+    observed_atoms: list[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
-    best_atoms: Optional[Atoms] = None
+    best_atoms: Atoms | None = None
     best_step: int = 0
-    add_entry: Optional[Callable] = None
+    add_entry: Callable | None = None
     # When True, evaluations also record dE/dtheta and the acquisition GP uses
     # the gradient-enhanced surrogate (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
+    # Number of leading BO steps that use the gradient-enhanced GP; once the loop
+    # passes this many steps it switches to the value-only GP (gradients are still
+    # recorded, just not fed to the surrogate). The gradient GP's per-step cost
+    # grows as O((n*(1+d))^3), so on large/floppy molecules it becomes intractable
+    # late in the run; spending the gradient signal early -- where it helps most --
+    # and then dropping to the cheap n*n GP keeps the search tractable. <=0 means
+    # never switch (gradient GP for the whole run).
+    gradient_steps: int = 0
+    # Gradient-GP hyperparameter refit schedule (see _run_optimization_loop). Cold
+    # full fits for the first `grad_refit_dense_until` BO steps, then the
+    # hyperparameters are frozen and later steps only re-condition; `grad_refit_every`
+    # > 0 optionally cold-refreshes them every that many post-dense steps. Default
+    # (20, 0) = the "gradfreeze" schedule; set grad_refit_dense_until=0 for a full fit
+    # every step. `grad_gp_hypers` holds the last cold-fitted hyperparameters (frozen
+    # on condition-only steps).
+    grad_refit_dense_until: int = 20
+    grad_refit_every: int = 0
+    grad_gp_hypers: dict | None = None
 
     # PiBO fields
-    prior_module: Optional[DihedralPriorModule] = None
+    prior_module: DihedralPriorModule | None = None
     prior_exponent: float = 2.0
     prior_decay: float = 0.9
 
@@ -106,7 +154,7 @@ class OptimizationState:
         coords: np.ndarray,
         energy: float,
         atoms: Atoms,
-        gradient: Optional[np.ndarray] = None,
+        gradient: np.ndarray | None = None,
     ) -> None:
         """Append a new observation, keeping observed_atoms index-aligned.
 
@@ -159,8 +207,21 @@ def _fit_gradient_gp(
     energy_cap: torch.Tensor,
     observed_gradients: torch.Tensor,
     y_std: torch.Tensor,
+    frozen_hypers: dict | None = None,
 ) -> GradientEnhancedPeriodicGP:
     """Build and fit the gradient-enhanced periodic GP on standardized data.
+
+    Two modes (see ``_run_optimization_loop``):
+    - ``frozen_hypers=None``: a cold fit -- optimize fresh hyperparameters with
+      ``_GRAD_GP_FIT_STEPS`` marginal-likelihood Adam iterations. The caller reads
+      ``gp.state_dict()`` afterwards to carry the hyperparameters forward.
+    - ``frozen_hypers`` set: a condition-only update -- load those hyperparameters
+      and fold in the new data for one Cholesky, running NO Adam steps.
+
+    We deliberately never optimize *from* loaded hyperparameters: warm-starting the
+    fit drifts them and degrades the search, so loaded hypers are only ever used for
+    conditioning. Collapsing the two knobs into one parameter makes that the only
+    expressible behavior.
 
     The acquisition GP fits standardized values ``y' = (-clamp(E) - mean)/std``
     over inputs ``x' = degrees / 360``. The stored gradients are ``dE/dtheta`` in
@@ -185,17 +246,24 @@ def _fit_gradient_gp(
     gp = GradientEnhancedPeriodicGP(
         train_x, train_y, grad_scaled, grad_mask=mask, period=1.0
     )
-    gp.fit(steps=200, lr=0.05)
+    if frozen_hypers is None:
+        gp.fit(steps=_GRAD_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
+    else:
+        # Condition-only: load the frozen hypers and re-condition (steps=0, no Adam).
+        gp.load_state_dict(frozen_hypers, strict=True)
+        gp.fit(steps=0, lr=0.05)
     return gp
 
 
 def _select_next_points_botorch(
     train_X: torch.Tensor,
     train_y: torch.Tensor,
-    prior_module: Optional[DihedralPriorModule] = None,
+    prior_module: DihedralPriorModule | None = None,
     prior_exponent: float = 0.0,
-    observed_gradients: Optional[torch.Tensor] = None,
+    observed_gradients: torch.Tensor | None = None,
     use_gradients: bool = False,
+    gp_frozen_hypers: dict | None = None,
+    gp_hyper_out: dict | None = None,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -209,6 +277,12 @@ def _select_next_points_botorch(
             n_dims), index-aligned with ``train_X``; NaN rows are dropped.
         use_gradients: If True (and gradients are provided), fit the
             gradient-enhanced surrogate instead of the value-only GP.
+        gp_frozen_hypers: Optional state-dict of gradient-GP hyperparameters. None
+            does a cold fit (optimize fresh hyperparameters); a value loads those
+            hyperparameters and conditions only (no Adam). Ignored unless gradients
+            are used. (The value-only GP path always uses the standard fit.)
+        gp_hyper_out: If provided and gradients are used, this dict is populated
+            with ``{"hypers": <fitted state-dict>}`` for the caller to carry forward.
 
     Returns:
         np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
@@ -231,8 +305,15 @@ def _select_next_points_botorch(
 
     if use_gradients and observed_gradients is not None:
         gp = _fit_gradient_gp(
-            train_x, train_y, raw_y, energy_cap, observed_gradients, y_std
+            train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
+            frozen_hypers=gp_frozen_hypers,
         )
+        # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
+        # steps), so frozen condition-only steps don't clone them needlessly.
+        if gp_hyper_out is not None:
+            gp_hyper_out["hypers"] = {
+                k: v.detach().clone() for k, v in gp.state_dict().items()
+            }
     else:
         # Make the GP
         # TODO: make the GP only once and reuse via updates
@@ -297,11 +378,11 @@ def _select_next_points_botorch(
 
 def _setup_initial_state(
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
     use_gradients: bool = False,
 ) -> OptimizationState:
     """Perform initial relaxation, evaluate starting point, and set up logging.
@@ -384,7 +465,7 @@ def plan_initial_points(
     init_steps: int,
     grid_budget: int,
     seed: int,
-    max_points: Optional[int] = None,
+    max_points: int | None = None,
 ) -> np.ndarray:
     """Plan initial dihedral guesses from the peaks of a dihedral prior.
 
@@ -488,11 +569,11 @@ def plan_initial_points(
 def _evaluate_point(
     state: OptimizationState,
     guess: np.ndarray,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-) -> Tuple[float, Atoms, Optional[np.ndarray]]:
+) -> tuple[float, Atoms, np.ndarray | None]:
     """Evaluate a dihedral guess, optionally also returning dE/dtheta.
 
     When ``state.use_gradients`` is set this projects the calculator's forces
@@ -510,14 +591,14 @@ def _evaluate_point(
 
 def _evaluate_initial_guesses(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
     init_steps: int,
     seed: int,
-    initial_conformers: Optional[List[Atoms]],
-    initial_dihedrals: Optional[np.ndarray] = None,
+    initial_conformers: list[Atoms] | None,
+    initial_dihedrals: np.ndarray | None = None,
 ) -> None:
     """Evaluate initial guesses and update state in-place.
 
@@ -601,11 +682,11 @@ def _evaluate_initial_guesses(
 def _run_optimization_loop(
     state: OptimizationState,
     n_steps: int,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
     relax: bool,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
 ) -> None:
     """Run the Bayesian optimization loop, updating state in-place.
 
@@ -618,14 +699,61 @@ def _run_optimization_loop(
         relax: Whether to relax non-dihedral degrees of freedom
         out_dir: Output path for saving best structure
     """
+    # Optional grad->value handoff: use the gradient-enhanced GP only for the first
+    # `gradient_steps` BO steps, then the cheap value-only GP (see OptimizationState).
+    switch_at = state.gradient_steps if state.gradient_steps > 0 else None
+
+    # Gradient-GP hyperparameter refit schedule. A full fit runs ~200 Choleskys and
+    # its cost grows steeply with the observation count, so fitting every step
+    # dominates the run late on. Instead: full (cold) fits for the first
+    # `dense_until` BO steps -- hyperparameters move most early and the matrices are
+    # still small -- then FREEZE them and only re-condition, which folds each new
+    # point in under the frozen hyperparameters for one Cholesky instead of ~200
+    # (a cold fit vs. a condition-only update, selected per step below via
+    # `gp_frozen_hypers`). `refit_every > 0` optionally refreshes the frozen
+    # hyperparameters with a *cold* refit every that many post-dense steps (cold,
+    # not warm-started: warm-starting the fit drifts the hyperparameters and
+    # degrades the search). The shipped default freezes after `dense_until` steps;
+    # the opt-out `dense_until=0` (with `refit_every<=1`) refits every step -- the
+    # slow full-gradient reference. See _fit_gradient_gp.
+    dense_until = max(0, state.grad_refit_dense_until)
+    refit_every = state.grad_refit_every
+    schedule_active = dense_until > 0 or refit_every > 1
+
     for step in range(n_steps):
+        step_uses_gradients = state.use_gradients and (
+            switch_at is None or step < switch_at
+        )
+        if switch_at is not None and state.use_gradients and step == switch_at:
+            logger.info(
+                f"Switching to value-only GP after {switch_at} gradient-enhanced "
+                f"step(s) (gradient GP cost grows with observation count)."
+            )
+
+        # Per-step gradient-GP cost: a cold full fit (no schedule, dense phase,
+        # periodic refresh, or the mandatory first fit) vs. a condition-only update
+        # that reuses the frozen hyperparameters and runs no Adam. Only a cold fit
+        # produces new hyperparameters, so only then do we snapshot them (via a
+        # non-None gp_hyper_out) to freeze on later steps.
+        cold_fit = True
+        if step_uses_gradients and schedule_active and state.grad_gp_hypers is not None:
+            on_refit = refit_every > 0 and (step - dense_until) % refit_every == 0
+            cold_fit = step < dense_until or on_refit
+        # Snapshot fitted hypers only on a cold fit under an active schedule -- i.e.
+        # only when a later step will actually freeze on them.
+        hyper_out = {} if step_uses_gradients and cold_fit and schedule_active else None
+
         next_coords = _select_next_points_botorch(
             state.observed_coords, state.observed_energies,
             prior_module=state.prior_module,
             prior_exponent=state.prior_exponent,
             observed_gradients=state.observed_gradients,
-            use_gradients=state.use_gradients,
+            use_gradients=step_uses_gradients,
+            gp_frozen_hypers=None if cold_fit else state.grad_gp_hypers,
+            gp_hyper_out=hyper_out,
         )
+        if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
+            state.grad_gp_hypers = hyper_out["hypers"]
         # logger.info(f'Selected next point: {next_coords}')
 
         energy, cur_atoms, gradient = _evaluate_point(
@@ -654,7 +782,7 @@ def _run_optimization_loop(
 
 def _perform_final_relaxation(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
 ) -> Atoms:
@@ -760,7 +888,7 @@ def _select_ensemble_candidates(
     p_threshold: float,
     sigma_floor_eV: float,
     failure_energy_eV: float,
-) -> List[Tuple[np.ndarray, Atoms]]:
+) -> list[tuple[np.ndarray, Atoms]]:
     """Select observed conformers to tightly optimize, ordered by predicted energy.
 
     A conformer ``i`` is included iff its GP posterior gives
@@ -835,14 +963,14 @@ def _rmsd(a: Atoms, b: Atoms) -> float:
 
 
 def _dedup(
-    pairs: List[Tuple[Atoms, float]], rmsd_thr: float, e_tol_eV: float
-) -> List[Tuple[Atoms, float]]:
+    pairs: list[tuple[Atoms, float]], rmsd_thr: float, e_tol_eV: float
+) -> list[tuple[Atoms, float]]:
     """Deduplicate (atoms, energy_eV) pairs, assumed sorted by energy ascending.
 
     A structure is a duplicate iff it is BOTH energy-close AND geometry-close to
     an already-kept structure.
     """
-    unique: List[Tuple[Atoms, float]] = []
+    unique: list[tuple[Atoms, float]] = []
     for atoms, energy in pairs:
         if any(
             abs(energy - ue) < e_tol_eV and _rmsd(ua, atoms) < rmsd_thr
@@ -864,10 +992,10 @@ def _boltzmann_weights(energies_eV: np.ndarray, temperature: float) -> np.ndarra
 
 def _perform_ensemble_relaxation(
     state: OptimizationState,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
-) -> List[Tuple[Atoms, float, float]]:
+) -> list[tuple[Atoms, float, float]]:
     """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
 
     Returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy ascending,
@@ -886,7 +1014,7 @@ def _perform_ensemble_relaxation(
     )
 
     # Tight, UNCONSTRAINED optimization of each candidate (no step limit).
-    optimized: List[Tuple[Atoms, float]] = []
+    optimized: list[tuple[Atoms, float]] = []
     for k, (coords, atoms) in enumerate(candidates):
         a = atoms.copy()
         a.set_constraint()  # remove any dihedral constraints
@@ -923,23 +1051,26 @@ def _perform_ensemble_relaxation(
 
 def run_optimization(
     atoms: Atoms,
-    dihedrals: List[DihedralInfo],
+    dihedrals: list[DihedralInfo],
     n_steps: int,
     calc: Calculator,
     relaxCalc: Calculator,
     init_steps: int,
-    out_dir: Optional[Path],
+    out_dir: Path | None,
     relax: bool = True,
     seed: int = 0,
-    initial_conformers: Optional[List[Atoms]] = None,
-    initial_dihedrals: Optional[np.ndarray] = None,
+    initial_conformers: list[Atoms] | None = None,
+    initial_dihedrals: np.ndarray | None = None,
     # New PiBO parameters
-    prior_module: Optional[DihedralPriorModule] = None,
+    prior_module: DihedralPriorModule | None = None,
     initial_prior_exponent: float = 2.0,
     prior_exponent_decay: float = 0.9,
     return_ensemble: bool = False,
     use_gradients: bool = False,
-) -> Union[Atoms, Tuple[Atoms, List[Tuple[Atoms, float, float]]]]:
+    gradient_steps: int = 0,
+    grad_refit_dense_until: int = 20,
+    grad_refit_every: int = 0,
+) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
     Args:
@@ -966,6 +1097,26 @@ def run_optimization(
             energy objective when ``calc`` and ``relaxCalc`` are the same surface
             (the envelope theorem needs the geometry to be a constrained minimum
             of the energy calculator); pass matching calculators in that case.
+        gradient_steps: If > 0 (and ``use_gradients``), use the gradient-enhanced
+            GP only for the first ``gradient_steps`` BO steps, then switch to the
+            value-only GP for the remainder. The gradient GP's per-step cost grows
+            steeply with the observation count, so this caps it on large molecules
+            while keeping the early-search benefit. <=0 keeps gradients for the
+            whole run; a budget smaller than ``gradient_steps`` never switches.
+        grad_refit_dense_until: Number of leading BO steps that do a full
+            gradient-GP hyperparameter fit. Refitting is the dominant cost (~200
+            Choleskys, growing with observation count), so beyond this the
+            hyperparameters are frozen and later steps only re-condition (one
+            Cholesky). Hyperparameters move most early, when the matrices are still
+            small, so the cold fits there are both useful and cheap. Default 20
+            (validated quality-neutral vs full refitting for 5-11 dihedrals); 0
+            refits every step (the slow full-gradient reference).
+        grad_refit_every: After the dense phase, optionally do a *cold* refit of the
+            frozen hyperparameters every this many BO steps (<=0 or 1 with no dense
+            phase keeps the original full-fit-every-step behavior; >0 with a dense
+            phase refreshes periodically, 0 freezes for the rest of the run). Cold,
+            not warm-started: warm-starting the fit drifts the hyperparameters and
+            degrades the search.
 
     Returns:
         If ``return_ensemble`` is False, the optimized lowest-energy geometry as
@@ -987,6 +1138,9 @@ def run_optimization(
     state = _setup_initial_state(
         atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=use_gradients
     )
+    state.gradient_steps = gradient_steps
+    state.grad_refit_dense_until = grad_refit_dense_until
+    state.grad_refit_every = grad_refit_every
 
     # Add prior settings to state
     state.prior_module = prior_module

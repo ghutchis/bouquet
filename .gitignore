@@ -1,6 +1,10 @@
 __pycache__
 gfnff_*
 solutions/*
+# build artifacts
+dist/
+build/
+*.egg-info/
 # pixi environments
 .pixi/*
 !.pixi/config.toml

@@ -60,7 +60,7 @@ def main() -> None:
     sub = p.add_subparsers(dest="command", required=True)
 
     r = sub.add_parser("run", help="Run the sweep")
-    sc.add_run_args(r, CONFIG_NAMES)
+    sc.add_run_args(r, CONFIG_NAMES, gradients_default=True)
     r.set_defaults(func=lambda a: sc.run_sweep(a, build_configurations(a.priors_file)))
 
     a = sub.add_parser("analyze", help="Summarize a sweep CSV")

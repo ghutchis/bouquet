@@ -1,12 +1,23 @@
 """Tools for assessing the bond structure of a molecule and finding the dihedrals to move"""
 
+from __future__ import annotations
+
+# With annotations as strings, networkx/ase/rdkit are only used inside function
+# bodies, so defer them until a structure is actually parsed (Python 3.15+).
+__lazy_modules__ = [
+    "networkx",
+    "ase",
+    "ase.io",
+    "rdkit",
+    "rdkit.Chem",
+]
+
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Set, Tuple, Union
 
 import networkx as nx
-import numpy as np
 from ase import Atoms
 from ase.io import read
 from rdkit import Chem
@@ -42,7 +53,7 @@ def mol_to_ase_atoms(mol: Chem.Mol, conf_id: int = -1) -> Atoms:
     return atoms
 
 
-def get_initial_structure(smiles: str) -> Tuple[Atoms, Chem.Mol]:
+def get_initial_structure(smiles: str) -> tuple[Atoms, Chem.Mol]:
     """Generate an initial guess for a molecular structure from SMILES.
 
     Args:
@@ -84,7 +95,7 @@ def get_initial_structure(smiles: str) -> Tuple[Atoms, Chem.Mol]:
     return atoms, mol
 
 
-def get_initial_structure_from_file(filename: str) -> Tuple[Atoms, Chem.Mol]:
+def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:
     """Generate an initial molecular structure from a file.
 
     Supported formats: .xyz, .mol, .sdf, .mol2, .pdb
@@ -168,7 +179,7 @@ def get_initial_structure_from_file(filename: str) -> Tuple[Atoms, Chem.Mol]:
     return atoms, mol
 
 
-def get_conformers_from_file(filename: str) -> List[Atoms]:
+def get_conformers_from_file(filename: str) -> list[Atoms]:
     """Read multiple conformers from a file.
 
     Args:
@@ -226,15 +237,15 @@ def get_conformers_from_file(filename: str) -> List[Atoms]:
 class DihedralInfo:
     """Describes a dihedral angle within a molecule."""
 
-    chain: Tuple[int, int, int, int] = None
+    chain: tuple[int, int, int, int] = None
     """Atoms that form the dihedral. ASE rotates the last atom when setting a dihedral angle"""
-    group: Set[int] = None
+    group: set[int] = None
     """List of atoms that should rotate along with this dihedral"""
     type: str = None
     """Optional classification of the dihedral (e.g., 'backbone', 'sidechain')"""
-    prior_type: Union[str, int, None] = None
+    prior_type: str | int | None = None
     """Prior type ID for PiBO (assigned by SMARTS matching)"""
-    correlated_with: Optional[int] = None
+    correlated_with: int | None = None
     """Index of correlated dihedral (for bivariate priors)"""
 
     def get_angle(self, atoms: Atoms) -> float:
@@ -284,8 +295,8 @@ def get_bonding_graph(mol: Chem.Mol) -> nx.Graph:
 
 
 def get_dihedral_info(
-    graph: nx.Graph, bond: Tuple[int, int], backbone_atoms: Set[int]
-) -> Optional[DihedralInfo]:
+    graph: nx.Graph, bond: tuple[int, int], backbone_atoms: set[int]
+) -> DihedralInfo | None:
     """For a rotatable bond, get the atoms defining the dihedral and the rotating group.
 
     Args:
@@ -340,7 +351,7 @@ def get_dihedral_info(
         return DihedralInfo(chain=tuple(points), group=b, type="backbone")
 
 
-def detect_dihedrals(mol: Chem.Mol) -> List[DihedralInfo]:
+def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
     """Detect the bonds to be treated as rotors.
 
     Uses the RDKit definition of rotatable bonds:

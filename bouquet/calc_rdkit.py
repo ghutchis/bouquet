@@ -1,5 +1,15 @@
 """RDKit force field calculators compatible with ASE interface."""
 
+from __future__ import annotations
+
+# rdkit/numpy are only touched inside method bodies once annotations are strings
+# (the ASE Calculator base class still loads eagerly). Python 3.15+.
+__lazy_modules__ = [
+    "numpy",
+    "rdkit",
+    "rdkit.Chem",
+]
+
 from abc import ABC, abstractmethod
 from typing import List
 
@@ -66,7 +76,7 @@ class RDKitCalculator(Calculator, ABC):
     def calculate(
         self,
         atoms=None,
-        properties: List[str] = None,
+        properties: list[str] = None,
         system_changes=all_changes,
     ):
         """Calculate energy (and optionally forces) using the force field.
