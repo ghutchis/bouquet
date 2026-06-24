@@ -8,6 +8,9 @@ from rdkit import Chem
 
 from bouquet.calculator import CalculatorFactory
 from bouquet.config import (
+    ACQ_NUM_RESTARTS,
+    ACQ_RAW_SAMPLES,
+    DEFAULT_CERTIFICATE_BETAS,
     DEFAULT_ENERGY_METHOD,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
@@ -20,6 +23,8 @@ from bouquet.config import (
     DEFAULT_PRIOR_EXPONENT,
     DEFAULT_PRIOR_MAX_CONCENTRATION,
     Configuration,
+    format_certificate_betas,
+    parse_certificate_betas,
 )
 from bouquet.io import (
     create_output_directory,
@@ -187,6 +192,52 @@ def main():
         help="Select a Boltzmann ensemble of low-energy conformers, tightly "
         "optimize them all, and write ensemble_final.xyz + ensemble.csv",
     )
+    parser.add_argument(
+        "--certificate-log",
+        type=str,
+        default=None,
+        help="Path to write a per-BO-step stopping-rule certificate CSV "
+        "(mu_min/lb/alpha_max + e_eval/e_best/n_calls/wall_s). Used by the "
+        "stopping-rule calibration benchmark; off by default.",
+    )
+    parser.add_argument(
+        "--certificate-betas",
+        type=str,
+        default=format_certificate_betas(DEFAULT_CERTIFICATE_BETAS),
+        help="Comma-separated confidence multipliers for the certificate lower "
+        "bound (mu - beta*sigma); one lb_b<beta> column is logged per value so the "
+        "offline replay can calibrate beta. Only used with --certificate-log.",
+    )
+    parser.add_argument(
+        "--geometry-log",
+        type=str,
+        default=None,
+        help="Path to write a multi-frame XYZ of the geometry at each best-so-far "
+        "improvement (plus the final relaxed best), for the benchmark's "
+        "RMSD-identity / distinct-conformer analysis. Off by default.",
+    )
+    parser.add_argument(
+        "--acq-num-restarts",
+        type=int,
+        default=ACQ_NUM_RESTARTS,
+        help=f"optimize_acqf L-BFGS restarts (default {ACQ_NUM_RESTARTS}). The main "
+        "BO speed lever -- lowering trades acquisition quality for speed.",
+    )
+    parser.add_argument(
+        "--acq-raw-samples",
+        type=int,
+        default=ACQ_RAW_SAMPLES,
+        help=f"optimize_acqf raw initialization samples (default {ACQ_RAW_SAMPLES}).",
+    )
+    parser.add_argument(
+        "--retain-bonds",
+        action="store_true",
+        help="Reject any evaluated geometry whose covalent bond graph differs from "
+        "the initial structure (the optimizer can rearrange/dissociate strained or "
+        "unusual species into a spurious lower minimum). Such points get a failure "
+        "energy so they're never selected; a final relaxation that breaks bonds "
+        "reverts to the constrained best.",
+    )
     args = parser.parse_args()
 
     # Create configuration from parsed arguments
@@ -214,6 +265,12 @@ def main():
         prior_max_concentration=args.prior_max_concentration,
         prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
+        certificate_log=Path(args.certificate_log) if args.certificate_log else None,
+        certificate_betas=parse_certificate_betas(args.certificate_betas),
+        geometry_log=Path(args.geometry_log) if args.geometry_log else None,
+        retain_bonds=args.retain_bonds,
+        acq_num_restarts=args.acq_num_restarts,
+        acq_raw_samples=args.acq_raw_samples,
     )
 
     # Gradient labels are only consistent with the energy objective when the
@@ -251,8 +308,11 @@ def main():
 
     # Make the initial guess
     if config.input_file is None:
-        # this will do some initial cleanup from the SMILES string
-        init_atoms, mol = get_initial_structure(config.smiles)
+        # this will do some initial cleanup from the SMILES string. Seed the ETKDG
+        # embedding from the run seed so different seeds start from different 3D
+        # geometries -- the only way multi-seed runs sample distinct ring puckers
+        # (the BO loop perturbs rotatable dihedrals only, never ring bonds).
+        init_atoms, mol = get_initial_structure(config.smiles, seed=config.seed)
     else:
         # this will just read the geometry from the file
         # and parse using Pybel
@@ -379,6 +439,12 @@ def main():
         gradient_steps=config.gradient_steps,
         grad_refit_dense_until=config.grad_refit_dense_until,
         grad_refit_every=config.grad_refit_every,
+        acq_num_restarts=config.acq_num_restarts,
+        acq_raw_samples=config.acq_raw_samples,
+        cert_log_path=config.certificate_log,
+        cert_betas=config.certificate_betas,
+        geom_log_path=config.geometry_log,
+        retain_bonds=config.retain_bonds,
     )
 
     if config.ensemble:

@@ -25,10 +25,13 @@ __lazy_modules__ = [
 import itertools
 import logging
 import math
+import time
 import warnings
+from contextlib import contextmanager
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable
 
 import numpy as np
 import torch
@@ -41,6 +44,7 @@ from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.models import SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.optim import optimize_acqf
+from botorch.utils.sampling import draw_sobol_samples
 from gpytorch import kernels as gpykernels
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.priors import NormalPrior
@@ -57,8 +61,6 @@ except ImportError:  # pragma: no cover - exercised only without irmsd installed
     _irmsd = None
     _HAVE_IRMSD = False
 
-warnings.filterwarnings("ignore")
-
 from bouquet.assess import (
     evaluate_energy,
     evaluate_energy_with_gradient,
@@ -67,6 +69,7 @@ from bouquet.assess import (
 from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
+    DEFAULT_CERTIFICATE_BETAS,
     DEFAULT_RELAXATION_STEPS,
     ENSEMBLE_ENERGY_TOL_KCAL,
     ENSEMBLE_P_THRESHOLD,
@@ -80,21 +83,39 @@ from bouquet.config import (
     INITIAL_GUESS_STD,
     KB_EV_PER_K,
     KCAL_TO_EV,
+    RELAX_FAILURE_ENERGY_EV,
 )
 from bouquet.gradient_gp import GradientEnhancedPeriodicGP
-from bouquet.io import create_structure_logger, initialize_structure_log, save_structure
+from bouquet.io import (
+    append_xyz_frame,
+    create_certificate_logger,
+    create_structure_logger,
+    initialize_structure_log,
+    save_structure,
+)
 from bouquet.priors import DihedralPriorModule
-from bouquet.setup import DihedralInfo
+from bouquet.setup import DihedralInfo, bonds_broken, geometry_bond_set
 
 logger = logging.getLogger(__name__)
 
-# Marginal-likelihood Adam iterations for a cold gradient-GP hyperparameter fit
-# (see _fit_gradient_gp). Condition-only updates run 0 steps. A benchmark found
-# conformer quality is insensitive to fit convergence (50/100/200 steps gave
-# statistically indistinguishable minima despite very different final NLLs), so 100
-# trims the dense-phase cold fits at no quality cost; 50 showed a faint degradation
-# and is under-converged for larger molecules.
-_GRAD_GP_FIT_STEPS = 100
+
+@contextmanager
+def _suppress_fit_warnings():
+    """Silence the expected, noisy botorch/gpytorch fit and acquisition warnings,
+    scoped to the wrapped block instead of the whole process (importing this module
+    used to install a global ``warnings.filterwarnings('ignore')``)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        yield
+
+# Marginal-likelihood Adam iterations for a cold GP hyperparameter fit, shared by
+# the value-only acquisition GP, the ensemble-selection GP, and the cold
+# gradient-GP fit (see _fit_gradient_gp); gradient-GP condition-only updates run 0
+# steps. A benchmark found conformer quality is insensitive to fit convergence
+# (50/100/200 steps gave statistically indistinguishable minima despite very
+# different final NLLs), so 100 trims the cold fits at no quality cost; 50 showed a
+# faint degradation and is under-converged for larger molecules.
+_GP_FIT_STEPS = 100
 
 
 def _get_device() -> torch.device:
@@ -114,14 +135,30 @@ class OptimizationState:
     observed_energies: torch.Tensor  # Shape: (n_observations,)
     # dE/dtheta (eV/rad) per observation, index-aligned with the tensors above;
     # NaN where the gradient is unavailable (failed eval, or use_gradients off).
-    observed_gradients: torch.Tensor = None  # Shape: (n_observations, n_dihedrals)
+    observed_gradients: torch.Tensor | None = None  # Shape: (n_observations, n_dihedrals)
     # Per-observation Atoms, aligned index-for-index with the tensors above.
     observed_atoms: list[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
-    best_atoms: Atoms | None = None
     best_step: int = 0
+    # --retain-bonds: the covalent bond set of the initial structure that every
+    # evaluated geometry must preserve (None disables the check). Broken-bond
+    # evaluations get a failure energy so they're never selected. n_bond_breaks
+    # counts how many were rejected (logged once at the end).
+    required_bonds: set | None = None
+    n_bond_breaks: int = 0
     add_entry: Callable | None = None
+    # Optional per-BO-step stopping-rule certificate logger (see
+    # _run_optimization_loop / io.create_certificate_logger). When set, each step
+    # logs mu_min/lb/alpha_max alongside e_eval/e_best/n_calls/wall_s. cert_betas is
+    # the grid of confidence multipliers for the lower-bound term (one lb per beta).
+    cert_log: Callable | None = None
+    cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS
+    # Optional geometry-trail path (stopping-rule benchmark): when set, the geometry
+    # at each best-so-far improvement is appended here (plus the final relaxed best),
+    # for the offline RMSD-identity / distinct-conformer analysis. See
+    # _log_improvement_geometry and io.append_xyz_frame.
+    geom_log_path: Path | None = None
     # When True, evaluations also record dE/dtheta and the acquisition GP uses
     # the gradient-enhanced surrogate (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
@@ -143,6 +180,9 @@ class OptimizationState:
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
     grad_gp_hypers: dict | None = None
+    # Acquisition-optimizer effort (optimize_acqf); see Configuration.
+    acq_num_restarts: int = ACQ_NUM_RESTARTS
+    acq_raw_samples: int = ACQ_RAW_SAMPLES
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
@@ -165,6 +205,10 @@ class OptimizationState:
             gradient: Optional dE/dtheta (eV/rad) for each dihedral; stored as
                 NaN when not provided so the gradient tensor stays index-aligned.
         """
+        # TODO: each append does three torch.cat reallocations, so accumulating N
+        # observations is O(N^2) in copy cost. Fine while N stays in the hundreds;
+        # if N grows to thousands, buffer into Python lists and torch.stack once at
+        # fit time instead.
         new_coords = torch.tensor(
             coords, dtype=torch.float64, device=self.device
         ).unsqueeze(0)
@@ -213,7 +257,7 @@ def _fit_gradient_gp(
 
     Two modes (see ``_run_optimization_loop``):
     - ``frozen_hypers=None``: a cold fit -- optimize fresh hyperparameters with
-      ``_GRAD_GP_FIT_STEPS`` marginal-likelihood Adam iterations. The caller reads
+      ``_GP_FIT_STEPS`` marginal-likelihood Adam iterations. The caller reads
       ``gp.state_dict()`` afterwards to carry the hyperparameters forward.
     - ``frozen_hypers`` set: a condition-only update -- load those hyperparameters
       and fold in the new data for one Cholesky, running NO Adam steps.
@@ -247,12 +291,112 @@ def _fit_gradient_gp(
         train_x, train_y, grad_scaled, grad_mask=mask, period=1.0
     )
     if frozen_hypers is None:
-        gp.fit(steps=_GRAD_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
+        gp.fit(steps=_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
     else:
         # Condition-only: load the frozen hypers and re-condition (steps=0, no Adam).
         gp.load_state_dict(frozen_hypers, strict=True)
         gp.fit(steps=0, lr=0.05)
     return gp
+
+
+# Size of the Sobol space-filling pool used to estimate the stopping-rule
+# certificate each step. The certificate is a smooth function of the posterior, so
+# a modest pool localizes its min/max well; observed points and the chosen
+# candidate are added on top (see _compute_certificate).
+_CERT_POOL_SIZE = 1024
+# Fixed scramble seed for the certificate's Sobol pool. Held constant so the pool
+# is identical every step and every run: that isolates the certificate's
+# step-to-step motion to the GP (and the growing observed set), instead of letting
+# fresh Sobol scrambles add sampling noise to lb/alpha_max -- and makes the offline
+# stopping-rule replay reproducible.
+_CERT_POOL_SEED = 12345
+
+
+@lru_cache(maxsize=None)
+def _cert_sobol_pool(
+    num_dims: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """The certificate's fixed Sobol space-filling pool over [0, 1]^num_dims.
+
+    Size and scramble seed are constants, so the pool is identical every step and
+    every run (see _CERT_POOL_SEED); caching draws it once per (dims, dtype,
+    device) instead of regenerating 1024 points on every BO step. Returned
+    read-only -- callers ``cat`` it with the step's observations, never mutate it.
+    """
+    bounds = torch.stack(
+        [
+            torch.zeros(num_dims, device=device, dtype=dtype),
+            torch.ones(num_dims, device=device, dtype=dtype),
+        ]
+    )
+    return draw_sobol_samples(
+        bounds=bounds, n=_CERT_POOL_SIZE, q=1, seed=_CERT_POOL_SEED
+    ).squeeze(1)
+
+
+def _compute_certificate(
+    gp,
+    base_acqf,
+    train_x: torch.Tensor,
+    candidate: torch.Tensor,
+    y_std: torch.Tensor,
+    neg_mean: torch.Tensor,
+    betas: tuple[float, ...],
+) -> dict:
+    """Compute the per-step GP stopping-rule certificate, in run energy units.
+
+    The acquisition GP is fit on the *negated, standardized* energy (minimize ->
+    maximize), so a standardized posterior value ``v`` maps back to relative
+    energy (eV, the ``e_e0`` convention) as ``E = -(v * y_std + neg_mean)``.
+    Returns, all in relative eV:
+
+      * ``mu_min``    -- the predicted global-minimum energy ``min_x mu_t(x)``;
+      * ``lb``        -- list of high-probability lower bounds on it, one per beta
+                         in ``betas``: ``min_x [mu_t(x) - beta * sigma_t(x)]`` (a
+                         UCB on the maximized objective mapped back to energy). The
+                         argmax shifts with beta, so the bound is logged across a
+                         grid to let the offline replay pick/calibrate beta without
+                         re-running;
+      * ``alpha_max`` -- the maximum *plain* expected improvement (energy units,
+                         not log) over the pool, the quantity the log-EI stopping
+                         rule thresholds (beta-independent).
+
+    The pool reuses the observed coordinates and the chosen candidate (so the
+    incumbent basin is always represented, which guarantees ``lb <= e_best``)
+    plus a fixed Sobol space-filling set over the normalized [0, 1]^d cube.
+    """
+    device = train_x.device
+    num_dims = train_x.shape[1]
+    y_std_s = float(y_std.reshape(-1)[0])
+    neg_mean_s = float(neg_mean.reshape(-1)[0])
+
+    # Query in the dtype the acquisition optimizer used (the candidate's): the
+    # value-only GP caches its prediction strategy from that optimize_acqf pass
+    # (typically float32), so a mismatched dtype here errors. The gradient GP casts
+    # inputs to its training dtype internally, so this is safe for both paths.
+    cand = torch.as_tensor(candidate, device=device).reshape(1, num_dims)
+    dtype = cand.dtype
+    sobol = _cert_sobol_pool(num_dims, dtype, device)
+    pool = torch.cat([sobol, train_x.to(dtype), cand], dim=0).unsqueeze(1)  # (M, 1, d)
+
+    with torch.no_grad():
+        posterior = gp.posterior(pool)
+        mu_std = posterior.mean.reshape(-1)  # maximize-space mean
+        sd_std = posterior.variance.clamp_min(0).sqrt().reshape(-1)
+        # base_acqf is the unwrapped LogExpectedImprovement (no PiBO term), so
+        # exp() recovers plain EI; scale standardized -> energy units by y_std.
+        ei_energy = torch.exp(base_acqf(pool)) * y_std_s
+
+    # min predicted energy = -(max standardized mean) mapped back.
+    mu_min = -(float(mu_std.max()) * y_std_s + neg_mean_s)
+    # min_x [E_mean - beta*E_sd] = -(neg_mean + y_std * max_x(mu_std + beta*sd_std)),
+    # one bound per beta (the argmax point differs per beta, so compute each).
+    lb = [
+        -(neg_mean_s + y_std_s * float((mu_std + beta * sd_std).max()))
+        for beta in betas
+    ]
+    alpha_max = float(ei_energy.max())
+    return {"mu_min": mu_min, "lb": lb, "alpha_max": alpha_max}
 
 
 def _select_next_points_botorch(
@@ -264,6 +408,10 @@ def _select_next_points_botorch(
     use_gradients: bool = False,
     gp_frozen_hypers: dict | None = None,
     gp_hyper_out: dict | None = None,
+    cert_out: dict | None = None,
+    cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
+    acq_num_restarts: int = ACQ_NUM_RESTARTS,
+    acq_raw_samples: int = ACQ_RAW_SAMPLES,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -283,6 +431,13 @@ def _select_next_points_botorch(
             are used. (The value-only GP path always uses the standard fit.)
         gp_hyper_out: If provided and gradients are used, this dict is populated
             with ``{"hypers": <fitted state-dict>}`` for the caller to carry forward.
+        cert_out: If provided, populated in place with the stopping-rule
+            certificate ``{"mu_min", "lb", "alpha_max"}`` (relative eV) computed
+            from the just-fitted GP -- see _compute_certificate. ``lb`` is a list
+            aligned with ``cert_betas``. None skips the (small) extra work.
+        cert_betas: Confidence multipliers for the certificate lower bound ``lb``
+            (``mu - beta*sigma``); one bound is computed per beta so the offline
+            replay can calibrate beta. Only used when ``cert_out`` is provided.
 
     Returns:
         np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
@@ -298,82 +453,100 @@ def _select_next_points_botorch(
     # Negate (minimize -> maximize) and standardize (matching botorch.standardize).
     # Keep the std so the gradient observations can be scaled by exactly the same
     # factor as the values -- see _fit_gradient_gp.
-    neg = (-1 * torch.minimum(raw_y, energy_cap))[:, None]
+    neg = (-torch.minimum(raw_y, energy_cap))[:, None]
     y_std = neg.std(dim=0, keepdim=True)
     y_std = torch.where(y_std >= 1e-9, y_std, torch.ones_like(y_std))
-    train_y = (neg - neg.mean(dim=0, keepdim=True)) / y_std
+    neg_mean = neg.mean(dim=0, keepdim=True)  # kept to invert the transform for cert_out
+    train_y = (neg - neg_mean) / y_std
 
-    if use_gradients and observed_gradients is not None:
-        gp = _fit_gradient_gp(
-            train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
-            frozen_hypers=gp_frozen_hypers,
-        )
-        # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
-        # steps), so frozen condition-only steps don't clone them needlessly.
-        if gp_hyper_out is not None:
-            gp_hyper_out["hypers"] = {
-                k: v.detach().clone() for k, v in gp.state_dict().items()
-            }
-    else:
-        # Make the GP
-        # TODO: make the GP only once and reuse via updates
-        gp = SingleTaskGP(
-            train_x,
-            train_y,
-            covar_module=_periodic_covar_module(train_x.shape[1]),
-        )
-        mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
-        fit_gpytorch_mll_torch(
-            mll,
-            step_limit=200,
-            optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
-        )
-
-    # Solve the optimization problem
-    n_sampled, n_dim = train_x.shape
-    # So far, this seems to be the best of the functions in botorch
-    # Create base acquisition function
-    base_acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
-
-    # Wrap with PiBO if prior is provided and exponent > 0
-    if prior_module is not None and prior_exponent > 0:
-        # botorch optimizes over normalized [0, 1] bounds (see below), so the
-        # prior must interpret its inputs the same way. A module built directly
-        # with the DihedralPriorModule default (input_in_degrees=True) would
-        # silently mis-scale; require the normalized convention from
-        # create_prior_module instead of failing quietly.
-        if getattr(prior_module, "input_in_degrees", False):
-            raise ValueError(
-                "prior_module expects inputs in degrees, but the acquisition "
-                "optimizer operates in normalized [0, 1] space. Build the "
-                "module with create_prior_module (or input_in_degrees=False)."
+    # Time the GP fit/condition and the acquisition optimization separately (logged
+    # to the certificate as t_gp_fit / t_acq) so the BO overhead can be attributed.
+    _t_fit0 = time.perf_counter()
+    with _suppress_fit_warnings():
+        if use_gradients and observed_gradients is not None:
+            gp = _fit_gradient_gp(
+                train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
+                frozen_hypers=gp_frozen_hypers,
             )
-        # base_acqf is LogExpectedImprovement (log-scale) and prior_module emits a
-        # log probability, so log=True makes botorch combine them additively
-        # (logEI + exponent * log_prior) -- the correct PiBO form. Without log=True
-        # botorch would multiply logEI by prior**exponent, inverting the prior.
-        acqf = PriorGuidedAcquisitionFunction(
-            acq_function=base_acqf,
-            prior_module=prior_module,
-            log=True,
-            prior_exponent=prior_exponent,
-        )
-    else:
-        acqf = base_acqf
+            # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
+            # steps), so frozen condition-only steps don't clone them needlessly.
+            if gp_hyper_out is not None:
+                gp_hyper_out["hypers"] = {
+                    k: v.detach().clone() for k, v in gp.state_dict().items()
+                }
+        else:
+            # TODO: make the GP only once and reuse via updates
+            gp = SingleTaskGP(
+                train_x,
+                train_y,
+                covar_module=_periodic_covar_module(train_x.shape[1]),
+            )
+            mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
+            fit_gpytorch_mll_torch(
+                mll,
+                step_limit=_GP_FIT_STEPS,
+                optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
+            )
+        t_gp_fit = time.perf_counter() - _t_fit0
 
-    # bounds are [0, 1] for each dihedral since we standardized above
-    bounds = torch.zeros(2, train_x.shape[1])
-    bounds[1, :] = 1.0
-    candidate, acq_value = optimize_acqf(
-        # at the moment use q = 1 for no batching
-        acqf,
-        bounds=bounds,
-        q=1,
-        num_restarts=ACQ_NUM_RESTARTS,
-        raw_samples=ACQ_RAW_SAMPLES,
-    )
-    # make sure to convert the candidate back to degrees
-    return candidate.detach().numpy()[0, :] * 360.0
+        _t_acq0 = time.perf_counter()
+        # LogExpectedImprovement has been the best-performing botorch acquisition here.
+        base_acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
+
+        # Wrap with PiBO if prior is provided and exponent > 0
+        if prior_module is not None and prior_exponent > 0:
+            # botorch optimizes over normalized [0, 1] bounds (see below), so the
+            # prior must interpret its inputs the same way. A module built directly
+            # with the DihedralPriorModule default (input_in_degrees=True) would
+            # silently mis-scale; require the normalized convention from
+            # create_prior_module instead of failing quietly.
+            if getattr(prior_module, "input_in_degrees", False):
+                raise ValueError(
+                    "prior_module expects inputs in degrees, but the acquisition "
+                    "optimizer operates in normalized [0, 1] space. Build the "
+                    "module with create_prior_module (or input_in_degrees=False)."
+                )
+            # base_acqf is LogExpectedImprovement (log-scale) and prior_module emits a
+            # log probability, so log=True makes botorch combine them additively
+            # (logEI + exponent * log_prior) -- the correct PiBO form. Without log=True
+            # botorch would multiply logEI by prior**exponent, inverting the prior.
+            acqf = PriorGuidedAcquisitionFunction(
+                acq_function=base_acqf,
+                prior_module=prior_module,
+                log=True,
+                prior_exponent=prior_exponent,
+            )
+        else:
+            acqf = base_acqf
+
+        # bounds are [0, 1] for each dihedral since we standardized above
+        bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
+        bounds[1, :] = 1.0
+        candidate, _ = optimize_acqf(
+            acqf,
+            bounds=bounds,
+            q=1,  # q = 1: no batching
+            num_restarts=acq_num_restarts,
+            raw_samples=acq_raw_samples,
+        )
+        t_acq = time.perf_counter() - _t_acq0
+
+    # Stopping-rule certificate: evaluate the just-fitted GP (and the unwrapped
+    # log-EI) over a candidate pool while it's still in hand -- re-deriving these
+    # offline would cost as much as re-running. Uses base_acqf (pure EI, no PiBO
+    # term) so the log-EI rule sees the unbiased acquisition.
+    if cert_out is not None:
+        cert_out["t_gp_fit"] = t_gp_fit  # GP construction + fit/condition
+        cert_out["t_acq"] = t_acq        # acquisition build + optimize_acqf
+        cert_out.update(
+            _compute_certificate(
+                gp, base_acqf, train_x, candidate, y_std, neg_mean, cert_betas
+            )
+        )
+
+    # make sure to convert the candidate back to degrees (.cpu() so a CUDA run
+    # can hand the array back to numpy).
+    return candidate.detach().cpu().numpy()[0, :] * 360.0
 
 
 def _setup_initial_state(
@@ -449,7 +622,6 @@ def _setup_initial_state(
         ),
         use_gradients=use_gradients,
         device=device,
-        best_atoms=start_atoms.copy(),
         best_step=0,
         add_entry=add_entry,
     )
@@ -580,13 +752,26 @@ def _evaluate_point(
     onto the torsion coordinates (eV/rad); otherwise the gradient is ``None``.
     """
     if state.use_gradients:
-        return evaluate_energy_with_gradient(
+        energy, cur_atoms, gradient = evaluate_energy_with_gradient(
             guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
         )
-    energy, cur_atoms = evaluate_energy(
-        guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
-    )
-    return energy, cur_atoms, None
+    else:
+        energy, cur_atoms = evaluate_energy(
+            guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
+        )
+        gradient = None
+    # --retain-bonds: a relaxed geometry that changed connectivity is a different
+    # species, not a conformer; give it a failure energy so it can never be picked
+    # as best (and drop its gradient so it doesn't bias the GP).
+    if (
+        state.required_bonds is not None
+        and energy < RELAX_FAILURE_ENERGY_EV
+        and bonds_broken(cur_atoms, state.required_bonds)
+    ):
+        state.n_bond_breaks += 1
+        energy = RELAX_FAILURE_ENERGY_EV
+        gradient = None
+    return energy, cur_atoms, gradient
 
 
 def _evaluate_initial_guesses(
@@ -617,66 +802,99 @@ def _evaluate_initial_guesses(
         initial_dihedrals: Optional array of dihedral guesses (degrees),
             shape (n_points, n_dihedrals), e.g. from ``plan_initial_points``
     """
+    # Build the list of guess angles (degrees) once, per the precedence above;
+    # only the source and a log label differ, so a single evaluation loop follows.
+    # Conformer angles are used as reported by get_angle; peak/random guesses are
+    # wrapped to [0, 360) so standardization later sees a consistent range.
     if initial_conformers is not None:
-        state.init_steps = len(initial_conformers)
-        logger.info(f"Using {state.init_steps} provided conformers as initial guesses")
-        for i, conformer in enumerate(initial_conformers):
-            guess = np.array([d.get_angle(conformer) for d in dihedrals])
-            energy, cur_atoms, gradient = _evaluate_point(
-                state, guess, dihedrals, calc, relaxCalc, relax
-            )
-            rel_energy = energy - state.start_energy
-            logger.info(
-                f"Evaluated conformer {i+1: >3}/{len(initial_conformers)}. Energy-E0: {rel_energy:12.6f}"
-            )
-
-            state.append_observation(guess, rel_energy, cur_atoms, gradient)
-
-            if state.add_entry is not None:
-                state.add_entry(guess, cur_atoms, energy)
+        guesses = [
+            np.array([d.get_angle(conformer) for d in dihedrals])
+            for conformer in initial_conformers
+        ]
+        label = "provided conformer"
     elif initial_dihedrals is not None:
-        state.init_steps = len(initial_dihedrals)
-        logger.info(
-            f"Using {state.init_steps} prior-peak initial guesses"
-        )
-        for i, guess in enumerate(initial_dihedrals):
-            guess = np.asarray(guess, dtype=float) % 360.0
-            energy, cur_atoms, gradient = _evaluate_point(
-                state, guess, dihedrals, calc, relaxCalc, relax
-            )
-            rel_energy = energy - state.start_energy
-            logger.info(
-                f"Evaluated peak guess {i+1: >3}/{len(initial_dihedrals)}. Energy-E0: {rel_energy:12.6f}"
-            )
-
-            state.append_observation(guess, rel_energy, cur_atoms, gradient)
-
-            if state.add_entry is not None:
-                state.add_entry(guess, cur_atoms, energy)
+        guesses = [np.asarray(g, dtype=float) % 360.0 for g in initial_dihedrals]
+        label = "prior-peak guess"
     else:
-        state.init_steps = init_steps
-        logger.info(f"Generating {init_steps} random initial guesses")
         rng = np.random.default_rng(seed)
-        init_guesses = rng.normal(
-            state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals))
+        guesses = list(
+            rng.normal(
+                state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals))
+            )
+            % 360.0
         )
+        label = "random initial guess"
 
-        for i, guess in enumerate(init_guesses):
-            # make sure angles are between 0 and 360
-            # to standardize later
-            guess = guess % 360.0
-            energy, cur_atoms, gradient = _evaluate_point(
-                state, guess, dihedrals, calc, relaxCalc, relax
-            )
-            rel_energy = energy - state.start_energy
-            logger.info(
-                f"Evaluated initial guess {i+1: >3}/{init_steps}. Energy-E0: {rel_energy:12.6f}"
-            )
+    state.init_steps = len(guesses)
+    logger.info(f"Evaluating {state.init_steps} initial guesses ({label}s)")
+    for i, guess in enumerate(guesses):
+        energy, cur_atoms, gradient = _evaluate_point(
+            state, guess, dihedrals, calc, relaxCalc, relax
+        )
+        rel_energy = energy - state.start_energy
+        logger.info(
+            f"Evaluated {label} {i+1: >3}/{state.init_steps}. "
+            f"Energy-E0: {rel_energy:12.6f}"
+        )
+        state.append_observation(guess, rel_energy, cur_atoms, gradient)
+        if state.add_entry is not None:
+            state.add_entry(guess, cur_atoms, energy)
 
-            state.append_observation(guess, rel_energy, cur_atoms, gradient)
 
-            if state.add_entry is not None:
-                state.add_entry(guess, cur_atoms, energy)
+def _grad_gp_refit_decision(
+    step: int,
+    step_uses_gradients: bool,
+    schedule_active: bool,
+    dense_until: int,
+    refit_every: int,
+    grad_gp_hypers: dict | None,
+) -> tuple[dict | None, dict | None]:
+    """Decide the gradient-GP fit mode for one BO step.
+
+    Returns ``(frozen_hypers, hyper_out)`` for ``_select_next_points_botorch``:
+    - ``frozen_hypers`` is None on a cold fit (optimize fresh hyperparameters) or
+      the stored hyperparameters on a condition-only update (reuse them, no Adam).
+    - ``hyper_out`` is a fresh dict to capture the fitted hyperparameters, but only
+      when a cold fit runs under an active schedule (so a later step can freeze on
+      them); otherwise None.
+
+    A cold fit happens when there is no active schedule, no frozen hyperparameters
+    yet, we are still in the dense phase (``step < dense_until``), or a periodic
+    refresh is due. See the schedule notes in ``_run_optimization_loop`` and
+    ``_fit_gradient_gp``.
+    """
+    cold_fit = True
+    if step_uses_gradients and schedule_active and grad_gp_hypers is not None:
+        on_refit = refit_every > 0 and (step - dense_until) % refit_every == 0
+        cold_fit = step < dense_until or on_refit
+    frozen_hypers = None if cold_fit else grad_gp_hypers
+    hyper_out = {} if step_uses_gradients and cold_fit and schedule_active else None
+    return frozen_hypers, hyper_out
+
+
+def _log_improvement_geometry(
+    state: OptimizationState,
+    atoms: Atoms,
+    kind: str,
+    n_calls: int | None = None,
+    e_e0_eV: float | None = None,
+) -> None:
+    """Append one geometry frame to the benchmark geometry trail (no-op if off).
+
+    ``kind`` is ``init_best`` (best after the initial guesses), ``improvement``
+    (a new best-so-far during the BO loop), or ``final`` (the unconstrained-relaxed
+    best). ``n_calls`` aligns the frame with the certificate CSV (n_calls there is
+    the cumulative evaluation count); it defaults to the current observation count.
+    Energies are relative eV (the e_e0 convention).
+    """
+    if state.geom_log_path is None:
+        return
+    if n_calls is None:
+        n_calls = len(state.observed_energies)
+    if e_e0_eV is None:
+        e_e0_eV = state.observed_energies.min().item()
+    comment = f"n_calls={n_calls} e_e0_eV={e_e0_eV:.6f} kind={kind}"
+    append_xyz_frame(state.geom_log_path, atoms, comment)
 
 
 def _run_optimization_loop(
@@ -720,6 +938,16 @@ def _run_optimization_loop(
     refit_every = state.grad_refit_every
     schedule_active = dense_until > 0 or refit_every > 1
 
+    # Geometry trail (benchmark): snapshot the best after the initial guesses, so a
+    # global minimum already found in the init phase is captured before any BO step.
+    if state.geom_log_path is not None and len(state.observed_energies):
+        best_idx = state.observed_energies.argmin().item()
+        _log_improvement_geometry(
+            state, state.observed_atoms[best_idx], "init_best",
+            n_calls=best_idx + 1, e_e0_eV=state.observed_energies[best_idx].item(),
+        )
+
+    loop_start = time.perf_counter()
     for step in range(n_steps):
         step_uses_gradients = state.use_gradients and (
             switch_at is None or step < switch_at
@@ -730,35 +958,44 @@ def _run_optimization_loop(
                 f"step(s) (gradient GP cost grows with observation count)."
             )
 
-        # Per-step gradient-GP cost: a cold full fit (no schedule, dense phase,
-        # periodic refresh, or the mandatory first fit) vs. a condition-only update
-        # that reuses the frozen hyperparameters and runs no Adam. Only a cold fit
-        # produces new hyperparameters, so only then do we snapshot them (via a
-        # non-None gp_hyper_out) to freeze on later steps.
-        cold_fit = True
-        if step_uses_gradients and schedule_active and state.grad_gp_hypers is not None:
-            on_refit = refit_every > 0 and (step - dense_until) % refit_every == 0
-            cold_fit = step < dense_until or on_refit
-        # Snapshot fitted hypers only on a cold fit under an active schedule -- i.e.
-        # only when a later step will actually freeze on them.
-        hyper_out = {} if step_uses_gradients and cold_fit and schedule_active else None
+        # Per-step gradient-GP cost: a cold full fit vs. a condition-only update that
+        # reuses the frozen hyperparameters and runs no Adam (see the schedule notes
+        # above and _grad_gp_refit_decision).
+        frozen_hypers, hyper_out = _grad_gp_refit_decision(
+            step, step_uses_gradients, schedule_active, dense_until, refit_every,
+            state.grad_gp_hypers,
+        )
 
+        cert_out = {} if state.cert_log is not None else None
+        # Time the two cost centers separately: GP fit/condition + acquisition
+        # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
+        _t0 = time.perf_counter()
         next_coords = _select_next_points_botorch(
             state.observed_coords, state.observed_energies,
             prior_module=state.prior_module,
             prior_exponent=state.prior_exponent,
             observed_gradients=state.observed_gradients,
             use_gradients=step_uses_gradients,
-            gp_frozen_hypers=None if cold_fit else state.grad_gp_hypers,
+            gp_frozen_hypers=frozen_hypers,
             gp_hyper_out=hyper_out,
+            cert_out=cert_out,
+            cert_betas=state.cert_betas,
+            acq_num_restarts=state.acq_num_restarts,
+            acq_raw_samples=state.acq_raw_samples,
         )
+        t_select = time.perf_counter() - _t0
         if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
             state.grad_gp_hypers = hyper_out["hypers"]
         # logger.info(f'Selected next point: {next_coords}')
 
+        _t0 = time.perf_counter()
         energy, cur_atoms, gradient = _evaluate_point(
             state, next_coords, dihedrals, calc, relaxCalc, relax
         )
+        t_eval = time.perf_counter() - _t0
+        if cert_out is not None:
+            cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
+            cert_out["t_eval"] = t_eval      # xTB energy + relaxation
         rel_energy = energy - state.start_energy
         logger.info(
             f"Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}"
@@ -766,14 +1003,34 @@ def _run_optimization_loop(
 
         if rel_energy < state.observed_energies.min().item():
             state.best_step = step
-            state.best_atoms = cur_atoms.copy()
             if out_dir is not None:
                 save_structure(out_dir, cur_atoms, "current_best.xyz")
+            # Geometry trail: this BO point is a new best-so-far. n_calls matches the
+            # certificate row about to be logged (post-append observation count).
+            _log_improvement_geometry(
+                state, cur_atoms, "improvement",
+                n_calls=len(state.observed_energies) + 1, e_e0_eV=rel_energy,
+            )
 
         if state.add_entry is not None:
             state.add_entry(next_coords, cur_atoms, energy)
 
         state.append_observation(next_coords, rel_energy, cur_atoms, gradient)
+
+        # Per-step stopping-rule certificate row. cert_out was filled during
+        # selection (GP fit on data through step-1, predicting this step); pair it
+        # with this step's realized outcome. n_calls counts cumulative energy
+        # evaluations (start + initial guesses + BO steps so far) -- the real cost
+        # axis -- which equals the post-append observation count.
+        if state.cert_log is not None:
+            state.cert_log(
+                step,
+                rel_energy,
+                state.observed_energies.min().item(),
+                len(state.observed_energies),
+                time.perf_counter() - loop_start,
+                cert_out,
+            )
 
         # Decay prior exponent
         if state.prior_module is not None:
@@ -804,33 +1061,22 @@ def _perform_final_relaxation(
 
     logger.info(f"Best energy found on step {state.best_step + 1}")
 
-    # go through the energies and find the first one within 0.001 of the best energy
-    # .. we'll need to subtract the number of initial guesses from the step count
-    first_low_energy = False
-    for i in range(len(state.observed_energies)):
-        if (
-            not first_low_energy
-            and abs(
-                state.observed_energies[i].item()
-                - state.observed_energies[best_idx].item()
-            )
-            < KCAL_TO_EV * 10.0
-        ):
-            first_low_energy = True
-            logger.info(f"Found low energy on step {i - state.init_steps}")
-        if (
-            abs(
-                state.observed_energies[i].item()
-                - state.observed_energies[best_idx].item()
-            )
-            < KCAL_TO_EV
-        ):
-            logger.info(f"Found first good energy on step {i - state.init_steps}")
-            break
+    # Report when the search first entered the best basin (within 10 kcal/mol of the
+    # best energy) and first reached it (within 1 kcal/mol). Step numbers are offset
+    # by init_steps so they count BO steps rather than initial guesses.
+    delta = (state.observed_energies - state.observed_energies[best_idx]).abs()
+    near = torch.nonzero(delta < KCAL_TO_EV * 10.0, as_tuple=False)
+    good = torch.nonzero(delta < KCAL_TO_EV, as_tuple=False)
+    if near.numel():
+        logger.info(f"Found low energy on step {near[0].item() - state.init_steps}")
+    if good.numel():
+        logger.info(
+            f"Found first good energy on step {good[0].item() - state.init_steps}"
+        )
 
     # Seed from the actual best observation (aligned with best_idx/best_coords),
     # which may come from the initial point, a seeded conformer, a random guess,
-    # or the BO loop -- not from state.best_atoms, which only tracks BO-loop wins.
+    # or the BO loop -- best_step only tracks BO-loop wins, so don't key off it here.
     best_energy, best_atoms = evaluate_energy(
         best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
     )
@@ -842,6 +1088,8 @@ def _perform_final_relaxation(
         state.add_entry(best_coords, best_atoms, best_energy)
 
     # Relaxation without dihedral constraints
+    constrained_atoms = best_atoms.copy()  # retained-bonds fallback
+    constrained_energy = best_energy  # its energy, restored alongside if we revert
     best_atoms.set_constraint()
     best_energy, best_atoms = evaluate_energy(
         best_coords, best_atoms, dihedrals, calc, relaxCalc, steps=None
@@ -850,6 +1098,17 @@ def _perform_final_relaxation(
         f"Performed final relaxation without dihedral constraints. "
         f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
     )
+    # --retain-bonds: if releasing the dihedral constraints let the geometry
+    # rearrange, keep the constrained (bond-preserving) result instead.
+    if state.required_bonds is not None and bonds_broken(
+        best_atoms, state.required_bonds
+    ):
+        logger.warning(
+            "Final unconstrained relaxation broke a bond; "
+            "reverting to the constrained best (--retain-bonds)."
+        )
+        best_atoms = constrained_atoms
+        best_energy = constrained_energy
 
     best_coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
     if state.add_entry is not None:
@@ -877,7 +1136,7 @@ def _build_selection_gp(
     )
     mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
     fit_gpytorch_mll_torch(
-        mll, step_limit=200, optimizer=lambda p: torch.optim.Adam(p, lr=0.01)
+        mll, step_limit=_GP_FIT_STEPS, optimizer=lambda p: torch.optim.Adam(p, lr=0.01)
     )
     return gp
 
@@ -917,10 +1176,11 @@ def _select_ensemble_candidates(
         # Too few points for a meaningful posterior: fall back to a flat window.
         mu, sigma = e, torch.full_like(e, sigma_floor_eV)
     else:
-        gp = _build_selection_gp(x, e)
-        gp.eval()
-        with torch.no_grad():
-            post = gp.posterior(x / 360.0)
+        with _suppress_fit_warnings():
+            gp = _build_selection_gp(x, e)
+            gp.eval()
+            with torch.no_grad():
+                post = gp.posterior(x / 360.0)
         mu = post.mean.flatten()
         sigma = post.variance.clamp_min(0.0).sqrt().flatten()
     sigma = sigma.clamp_min(sigma_floor_eV)
@@ -1070,6 +1330,12 @@ def run_optimization(
     gradient_steps: int = 0,
     grad_refit_dense_until: int = 20,
     grad_refit_every: int = 0,
+    acq_num_restarts: int = ACQ_NUM_RESTARTS,
+    acq_raw_samples: int = ACQ_RAW_SAMPLES,
+    cert_log_path: Path | None = None,
+    cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
+    geom_log_path: Path | None = None,
+    retain_bonds: bool = False,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
@@ -1141,6 +1407,26 @@ def run_optimization(
     state.gradient_steps = gradient_steps
     state.grad_refit_dense_until = grad_refit_dense_until
     state.grad_refit_every = grad_refit_every
+    state.acq_num_restarts = acq_num_restarts
+    state.acq_raw_samples = acq_raw_samples
+
+    # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
+    # reference every later evaluation must preserve. The start is computed inside
+    # _setup_initial_state above and defines the molecule's connectivity.
+    if retain_bonds:
+        state.required_bonds = geometry_bond_set(state.start_atoms)
+
+    # Optional per-step stopping-rule certificate log (calibration benchmark).
+    if cert_log_path is not None:
+        state.cert_betas = tuple(cert_betas)
+        state.cert_log = create_certificate_logger(cert_log_path, state.cert_betas)
+
+    # Optional geometry trail (benchmark): start a fresh file; frames are appended
+    # at each best-so-far improvement (and the final relaxed best) for the offline
+    # RMSD-identity / distinct-conformer analysis.
+    if geom_log_path is not None:
+        state.geom_log_path = Path(geom_log_path)
+        state.geom_log_path.open("w").close()
 
     # Add prior settings to state
     state.prior_module = prior_module
@@ -1156,6 +1442,12 @@ def run_optimization(
     # Run Bayesian optimization loop
     _run_optimization_loop(state, n_steps, dihedrals, calc, relaxCalc, relax, out_dir)
 
+    if state.required_bonds is not None and state.n_bond_breaks:
+        logger.info(
+            f"--retain-bonds: rejected {state.n_bond_breaks} evaluation(s) that "
+            f"changed connectivity."
+        )
+
     if return_ensemble:
         # Select and tightly optimize the low-energy ensemble. The best member
         # is the lowest-energy conformer; fall back to single-best relaxation if
@@ -1165,7 +1457,10 @@ def run_optimization(
             best_atoms = ensemble[0][0]
         else:
             best_atoms = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+        _log_improvement_geometry(state, best_atoms, "final")
         return best_atoms, ensemble
 
     # Final relaxation and return best structure
-    return _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+    best_atoms = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+    _log_improvement_geometry(state, best_atoms, "final")
+    return best_atoms

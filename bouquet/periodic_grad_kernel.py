@@ -63,8 +63,8 @@ class PeriodicKernelGrad(PeriodicKernel):
     r"""Periodic kernel that also models value/derivative covariances.
 
     A drop-in periodic analogue of :class:`gpytorch.kernels.RBFKernelGrad`. Like
-    that kernel it carries **no** outputscale; wrap it in a
-    :class:`~gpytorch.kernels.ScaleKernel` to add one. Lengthscale and period
+    that kernel it carries **no** output scale; wrap it in a
+    :class:`~gpytorch.kernels.ScaleKernel` to add one. Length scale and period
     follow :class:`~gpytorch.kernels.PeriodicKernel`; pass ``ard_num_dims=d`` for
     per-torsion hyperparameters or leave it unset to share one set across all
     torsions (mirroring the current ``ProductStructureKernel`` surrogate).

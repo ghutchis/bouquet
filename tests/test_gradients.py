@@ -36,15 +36,18 @@ def mmff_calc(butane):
     return RDKitMMFFCalculator(mol)
 
 
-def _finite_difference_gradient(atoms, di, calc, mol, delta_deg=0.5):
-    """Central finite-difference dE/dtheta (eV/rad) for one rigid-rotation dihedral."""
-    from bouquet.calc_rdkit import RDKitMMFFCalculator
+def _finite_difference_gradient(atoms, di, mol, calc_class, delta_deg=0.5):
+    """Central finite-difference dE/dtheta (eV/rad) for one rigid-rotation dihedral.
 
+    Rigidly rotates the dihedral by ``+/- delta_deg`` (the same group rotation
+    bouquet uses to set a torsion) and differences the ``calc_class`` energy. A
+    fresh calculator is built per probe so no result is served from cache.
+    """
     angle = atoms.get_dihedral(*di.chain)
 
     def energy_at(value):
         probe = atoms.copy()
-        probe.calc = RDKitMMFFCalculator(mol)
+        probe.calc = calc_class(mol)
         probe.set_dihedral(*di.chain, value, indices=di.group)
         return probe.get_potential_energy()
 
@@ -54,10 +57,90 @@ def _finite_difference_gradient(atoms, di, calc, mol, delta_deg=0.5):
     return per_deg * DEG_PER_RAD
 
 
+def _force_field_classes():
+    """The RDKit force-field calculators to validate, as (id, class) pairs."""
+    from bouquet.calc_rdkit import RDKitMMFFCalculator, RDKitUFFCalculator
+
+    return [("MMFF94", RDKitMMFFCalculator), ("UFF", RDKitUFFCalculator)]
+
+
+# Parametrization over the RDKit force fields. Lazily resolved so importing this
+# test module does not require rdkit at collection time.
+FORCE_FIELDS = [
+    pytest.param(cls, id=name) for name, cls in _force_field_classes()
+]
+
+
+def _numeric_cartesian_forces(atoms, mol, calc_class, delta=1e-3):
+    """Central finite-difference Cartesian forces (eV/Angstrom) for ``calc_class``.
+
+    Displaces every atomic coordinate by ``+/- delta`` and differences the
+    energy, yielding ``-dE/dx``. A fresh calculator is built per probe so the
+    ASE result cache never short-circuits an evaluation.
+    """
+    pos0 = atoms.get_positions()
+    forces = np.zeros_like(pos0)
+    for i in range(len(pos0)):
+        for j in range(3):
+            def energy_with_offset(step, i=i, j=j):
+                probe = atoms.copy()
+                pos = pos0.copy()
+                pos[i, j] += step
+                probe.set_positions(pos)
+                probe.calc = calc_class(mol)
+                return probe.get_potential_energy()
+
+            forces[i, j] = -(
+                energy_with_offset(delta) - energy_with_offset(-delta)
+            ) / (2 * delta)
+    return forces
+
+
+class TestForceFieldGradients:
+    """Validate each RDKit force field's analytic gradient against finite differences.
+
+    Both MMFF and UFF are checked here. The Cartesian test exercises the
+    calculator's own ``CalcGrad`` directly; the torsion test exercises the
+    dE/dtheta projection that bouquet actually consumes.
+    """
+
+    @pytest.mark.parametrize("calc_class", FORCE_FIELDS)
+    def test_cartesian_forces_match_finite_difference(self, butane, calc_class):
+        atoms, mol, dihedrals = butane
+        atoms = atoms.copy()
+        # Distort off the minimum so the gradient is large and unambiguous.
+        atoms.set_dihedral(*dihedrals[0].chain, 75.0, indices=dihedrals[0].group)
+        atoms.calc = calc_class(mol)
+
+        analytic = atoms.get_forces()
+        numeric = _numeric_cartesian_forces(atoms, mol, calc_class)
+
+        assert np.linalg.norm(analytic) > 1e-2  # genuinely off a stationary point
+        np.testing.assert_allclose(analytic, numeric, rtol=2e-2, atol=1e-3)
+
+    @pytest.mark.parametrize("calc_class", FORCE_FIELDS)
+    def test_torsion_gradient_matches_finite_difference(self, butane, calc_class):
+        atoms, mol, dihedrals = butane
+        atoms = atoms.copy()
+        # Perturb every rotatable bond to a distinct, non-stationary angle.
+        for offset, di in zip((40.0, 95.0, 155.0), dihedrals, strict=True):
+            atoms.set_dihedral(*di.chain, offset, indices=di.group)
+        atoms.calc = calc_class(mol)
+
+        grad = compute_torsion_gradient(atoms, dihedrals, atoms.calc)
+        assert grad.shape == (len(dihedrals),)
+
+        for i, di in enumerate(dihedrals):
+            fd = _finite_difference_gradient(atoms, di, mol, calc_class)
+            assert grad[i] == pytest.approx(fd, rel=3e-2, abs=1e-4)
+
+
 class TestProjectionAgainstFiniteDifference:
     """The projected gradient must match a rigid-scan finite difference."""
 
     def test_matches_finite_difference_off_minimum(self, butane, mmff_calc):
+        from bouquet.calc_rdkit import RDKitMMFFCalculator
+
         atoms, mol, dihedrals = butane
         di = dihedrals[0]
 
@@ -69,7 +152,7 @@ class TestProjectionAgainstFiniteDifference:
         grad = project_torsion_gradient(
             atoms.get_positions(), [di], atoms.get_forces()
         )[0]
-        fd = _finite_difference_gradient(atoms, di, mmff_calc, mol)
+        fd = _finite_difference_gradient(atoms, di, mol, RDKitMMFFCalculator)
 
         assert abs(grad) > 1e-3  # genuinely off a minimum
         assert grad == pytest.approx(fd, rel=2e-2, abs=1e-4)
@@ -80,7 +163,7 @@ class TestProjectionAgainstFiniteDifference:
         atoms, mol, dihedrals = butane
         atoms = atoms.copy()
         # Perturb every rotatable bond to a distinct, non-stationary angle.
-        for offset, di in zip((40.0, 95.0, 155.0), dihedrals):
+        for offset, di in zip((40.0, 95.0, 155.0), dihedrals, strict=True):
             atoms.set_dihedral(*di.chain, offset, indices=di.group)
         atoms.calc = RDKitMMFFCalculator(mol)
 
@@ -88,7 +171,7 @@ class TestProjectionAgainstFiniteDifference:
         assert grad.shape == (len(dihedrals),)
 
         for i, di in enumerate(dihedrals):
-            fd = _finite_difference_gradient(atoms, di, atoms.calc, mol)
+            fd = _finite_difference_gradient(atoms, di, mol, RDKitMMFFCalculator)
             assert grad[i] == pytest.approx(fd, rel=3e-2, abs=1e-4)
 
     def test_per_degree_is_radian_scaled(self, butane, mmff_calc):

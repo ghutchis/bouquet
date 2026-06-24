@@ -201,24 +201,52 @@ def run_one(
     timeout: Optional[float] = None,
     fail_log_dir: Optional[Path] = None,
     env: Optional[dict] = None,
-) -> Tuple[Dict, List[Dict]]:
+    num_steps: Optional[int] = None,
+    cert_dir: Optional[Path] = None,
+    cert_betas: Optional[str] = None,
+    geom_dir: Optional[Path] = None,
+) -> Tuple[Dict, List[Dict], List[Dict]]:
     """Run a single (config, molecule, seed) trial.
 
-    Returns ``(summary_row, traj_rows)``: the tidy summary dict and the
-    per-evaluation trajectory rows (running best-so-far) for this trial.
+    Returns ``(summary_row, traj_rows, cert_rows)``: the tidy summary dict, the
+    per-evaluation trajectory rows (running best-so-far), and the per-BO-step
+    stopping-rule certificate rows (empty unless ``cert_dir`` is given).
     ``extra_args`` fully specifies the arm (including ``--priors`` if needed).
     A trial exceeding ``timeout`` seconds is killed and recorded as a failure.
     On any failure, the captured stdout+stderr is written under ``fail_log_dir``
     (if given) so crashes can be told apart from timeouts after the fact.
+
+    ``num_steps`` overrides the budget: None uses ``--auto`` (the tiered table),
+    an int passes ``--num-steps`` instead (e.g. the stopping-rule benchmark's
+    per-molecule ceiling C(d), which must exceed the auto cap). ``cert_dir``
+    enables per-step certificate logging: bouquet writes a per-trial CSV there
+    (``--certificate-log``), which is read back and returned with id columns;
+    ``cert_betas`` is the comma-separated beta grid passed to ``--certificate-betas``.
     """
     cmd = [
         sys.executable, "-m", "bouquet.cli",
         "--smiles", smiles,
         "--name", name,
         "--seed", str(seed),
-        "--auto",
         "--relax",
     ]
+    # Budget: --auto (tiered table) by default, or an explicit per-molecule cap.
+    cmd += ["--num-steps", str(num_steps)] if num_steps is not None else ["--auto"]
+    # Per-step certificate logging (stopping-rule benchmark): bouquet writes the
+    # CSV to cert_file; one file per trial key so concurrent workers never collide.
+    cert_file = None
+    if cert_dir is not None:
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        cert_file = cert_dir / f"{config}_{_safe_filename(name)}_seed{seed}.csv"
+        cmd += ["--certificate-log", str(cert_file)]
+        if cert_betas:
+            cmd += ["--certificate-betas", cert_betas]
+    # Per-trial geometry trail (best-improvement + final relaxed XYZ). Written
+    # incrementally by the solver, so a timed-out trial keeps its improvements.
+    if geom_dir is not None:
+        geom_dir.mkdir(parents=True, exist_ok=True)
+        geom_file = geom_dir / f"{config}_{_safe_filename(name)}_seed{seed}.xyz"
+        cmd += ["--geometry-log", str(geom_file)]
     cmd += extra_args
     if energy_method:
         cmd += ["--energy", energy_method]
@@ -261,7 +289,28 @@ def run_one(
         if returncode == 0
         else []
     )
-    return row, traj_rows
+
+    # Certificate rows: read bouquet's per-trial CSV and prepend trial-identifying
+    # columns. Kept for clean exits AND timeouts (returncode 124): a timed-out
+    # high-d trial is a *right-censored* observation, and its partial trajectory is
+    # exactly what the survival analysis needs -- discarding it would bias the
+    # budget. Each row is stamped ``censored`` so the replay treats it correctly.
+    # A crash (other returncodes) may leave a truncated line, so guard the read and
+    # drop a trailing partial row defensively.
+    cert_rows: List[Dict] = []
+    if cert_file is not None and returncode in (0, 124) and cert_file.exists():
+        nd = parsed["num_dihedrals"] if parsed["num_dihedrals"] is not None else ""
+        censored = int(returncode == 124)
+        with open(cert_file, newline="") as f:
+            raw = list(csv.DictReader(f))
+        if censored and raw and any(v in (None, "") for v in raw[-1].values()):
+            raw = raw[:-1]  # drop a half-written final row from the kill
+        for crow in raw:
+            cert_rows.append(
+                {"config": config, "name": name, "seed": seed,
+                 "num_dihedrals": nd, "censored": censored, **crow}
+            )
+    return row, traj_rows, cert_rows
 
 
 def predict_bo_budget(smiles: str) -> Optional[int]:
@@ -358,13 +407,16 @@ def load_done_keys(output_path: Path) -> set:
     return done
 
 
-def drop_failed(output_path: Path, traj_path: Path) -> set:
+def drop_failed(
+    output_path: Path, traj_path: Path, cert_path: Optional[Path] = None
+) -> set:
     """Remove every failed (``success != 1``) trial from the summary CSV and purge
-    its rows from the trajectory CSV. Returns the set of removed (config, name,
-    seed) keys so a ``--resume`` afterwards re-runs exactly those trials.
+    its rows from the trajectory CSV (and certificate CSV, if given). Returns the
+    set of removed (config, name, seed) keys so a ``--resume`` afterwards re-runs
+    exactly those trials.
 
-    A clean-exit-but-unparsed trial can leave trajectory rows while still being
-    recorded ``success=0``; purging them prevents duplicate trajectory rows when
+    A clean-exit-but-unparsed trial can leave trajectory/certificate rows while
+    still being recorded ``success=0``; purging them prevents duplicate rows when
     the retry succeeds.
     """
     if not output_path.exists():
@@ -395,13 +447,42 @@ def drop_failed(output_path: Path, traj_path: Path) -> set:
                 w = csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES)
                 w.writeheader()
                 w.writerows(tkept)
+
+    # Purge failed trials from the certificate CSV too, preserving its (dynamic,
+    # beta-dependent) column set from the existing header.
+    if cert_path is not None and cert_path.exists():
+        with open(cert_path, newline="") as f:
+            reader = csv.DictReader(f)
+            cfields = reader.fieldnames
+            crows = list(reader)
+        ckept = [r for r in crows
+                 if (r["config"], r["name"], str(r["seed"])) not in failed]
+        if len(ckept) != len(crows):
+            with open(cert_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=cfields)
+                w.writeheader()
+                w.writerows(ckept)
     return failed
 
 
-def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) -> None:
+def run_sweep(
+    args: argparse.Namespace,
+    configurations: Dict[str, List[str]],
+    num_steps_fn=None,
+    mol_skip_fn=None,
+) -> None:
     """Run every (config, molecule, seed) trial; append to summary + trajectory CSVs.
 
     ``configurations`` maps each arm label to its full extra CLI args.
+    ``mol_skip_fn``: optional ``(smiles, name) -> bool``; when it returns True the
+    molecule is dropped from the run entirely (e.g. skip d > 12 in the benchmark).
+    ``num_steps_fn``: optional ``smiles -> Optional[int]`` giving a per-molecule
+    budget that overrides ``--auto`` (e.g. the stopping-rule benchmark's ceiling
+    C(d)); None (default) keeps every trial on the tiered ``--auto`` budget.
+
+    With ``args.certificate`` set, each trial also logs the per-BO-step
+    certificate; those rows are aggregated into a master certificate CSV
+    (``args.certificate_output`` or ``<output stem>_cert.csv``).
     """
     seeds = [int(s.strip()) for s in args.seeds.split(",")]
     configs = args.configs.split(",") if args.configs else list(configurations)
@@ -422,16 +503,56 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
     mols = load_molecules(args.input, args.smiles_column, args.name_column)
     print(f"Loaded {len(mols)} molecules; seeds={seeds}; configs={configs}")
 
+    # Ensure the output directory exists so the CSV writers below don't fail.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+
     # Trajectory CSV path: explicit, or "<output stem>_traj<suffix>".
     traj_path = args.traj_output or args.output.with_name(
         f"{args.output.stem}_traj{args.output.suffix or '.csv'}"
     )
 
+    # Certificate aggregation (stopping-rule benchmark). Master CSV columns are the
+    # id columns + bouquet's per-step certificate columns (one lb_b<beta> per beta);
+    # per-trial CSVs are written under cert_dir then read back in run_one.
+    cert_enabled = getattr(args, "certificate", False)
+    cert_path = cert_dir = cert_fieldnames = cert_betas = None
+    if cert_enabled:
+        from bouquet.config import (
+            DEFAULT_CERTIFICATE_BETAS,
+            format_certificate_betas,
+            parse_certificate_betas,
+        )
+        from bouquet.io import CERTIFICATE_BASE_FIELDNAMES, certificate_lb_column
+
+        cert_betas = getattr(args, "certificate_betas", None) or format_certificate_betas(
+            DEFAULT_CERTIFICATE_BETAS
+        )
+        betas = parse_certificate_betas(cert_betas)
+        cert_path = getattr(args, "certificate_output", None) or args.output.with_name(
+            f"{args.output.stem}_cert{args.output.suffix or '.csv'}"
+        )
+        cert_dir = getattr(args, "certificate_dir", None) or args.output.with_name(
+            f"{args.output.stem}_certfiles"
+        )
+        cert_fieldnames = (
+            ["config", "name", "seed", "num_dihedrals", "censored"]
+            + CERTIFICATE_BASE_FIELDNAMES
+            + [certificate_lb_column(b) for b in betas]
+        )
+
+    # Geometry trail: per-trial best-improvement XYZs under cert_dir's sibling dir.
+    geom_enabled = getattr(args, "geometry", False)
+    geom_dir = None
+    if geom_enabled:
+        geom_dir = getattr(args, "geometry_dir", None) or args.output.with_name(
+            f"{args.output.stem}_geom"
+        )
+
     # --retry-failed: strip prior failures from both CSVs so they re-run; everything
     # successful is still skipped (it implies resume). Without it, --resume skips ALL
     # recorded trials, failures included.
     if getattr(args, "retry_failed", False):
-        removed = drop_failed(args.output, traj_path)
+        removed = drop_failed(args.output, traj_path, cert_path)
         print(f"--retry-failed: removed {len(removed)} failed trial(s); they will be "
               f"re-run, successful trials skipped.")
 
@@ -444,6 +565,22 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
     if not traj_path.exists():
         with open(traj_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES).writeheader()
+    if cert_enabled:
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cert_path.exists():
+            with open(cert_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=cert_fieldnames).writeheader()
+        else:
+            # Resume/append: a header that doesn't match the current schema (e.g. the
+            # --certificate-betas grid changed) would silently misalign appended rows.
+            with open(cert_path, newline="") as f:
+                existing_header = next(csv.reader(f), [])
+            if existing_header != cert_fieldnames:
+                raise SystemExit(
+                    f"{cert_path} header does not match the current certificate schema "
+                    "(did --certificate-betas change?). Move it aside or pass a fresh "
+                    "--certificate-output."
+                )
 
     # Predictive skip: drop any gradient arm whose gradient-GP phase would exceed
     # this many BO steps for a molecule (its per-step cost grows steeply, so big
@@ -472,15 +609,43 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
             return True
         return False
 
+    # Per-molecule budget override (e.g. the ceiling C(d)); cached per smiles.
+    num_steps_cache: Dict[str, Optional[int]] = {}
+
+    def steps_for(smiles: str) -> Optional[int]:
+        if num_steps_fn is None:
+            return None
+        if smiles not in num_steps_cache:
+            num_steps_cache[smiles] = num_steps_fn(smiles)
+        return num_steps_cache[smiles]
+
+    # Molecule-level skip (e.g. d above a cap): drop the molecule for all configs
+    # and seeds before the run. Cached by name so the predicate runs once each.
+    mol_skipped = []
+    skip_cache: Dict[str, bool] = {}
+
+    def mol_skip(smiles: str, name: str) -> bool:
+        if mol_skip_fn is None:
+            return False
+        if name not in skip_cache:
+            skip_cache[name] = bool(mol_skip_fn(smiles, name))
+            if skip_cache[name]:
+                mol_skipped.append(name)
+        return skip_cache[name]
+
     tasks = []
     for config in configs:
         for smiles, name in mols:
-            if predicted_skip(config, smiles, name):
+            if mol_skip(smiles, name) or predicted_skip(config, smiles, name):
                 continue
             for seed in seeds:
                 if (config, name, str(seed)) in done:
                     continue
-                tasks.append((config, smiles, name, seed))
+                tasks.append((config, smiles, name, seed, steps_for(smiles)))
+
+    if mol_skipped:
+        print(f"Skipped {len(mol_skipped)} molecule(s) via mol_skip_fn "
+              f"(e.g. above the dihedral cap).")
 
     if skipped:
         print(f"\nPredictively skipped {len(skipped)} (config, molecule) cell(s) "
@@ -520,11 +685,13 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
               "the paired comparison carries a ~0.02 eV run-to-run noise floor.")
 
     def submit(task):
-        config, smiles, name, seed = task
+        config, smiles, name, seed, num_steps = task
         return run_one(
             config, configurations[config], smiles, name, seed,
             args.energy, args.optimizer, timeout=timeout, fail_log_dir=fail_log_dir,
-            env=env,
+            env=env, num_steps=num_steps,
+            cert_dir=cert_dir if cert_enabled else None, cert_betas=cert_betas,
+            geom_dir=geom_dir,
         )
 
     t0 = time.time()
@@ -533,13 +700,14 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
         for fut in as_completed(futures):
             task = futures[fut]
             try:
-                row, traj_rows = fut.result()
+                row, traj_rows, cert_rows = fut.result()
             except Exception as e:  # keep the sweep alive on a single failure
-                config, smiles, name, seed = task
+                config, smiles, name, seed, _ = task
                 row = {f: "" for f in FIELDNAMES}
                 row.update({"config": config, "name": name, "smiles": smiles,
                             "seed": seed, "success": 0})
                 traj_rows = []
+                cert_rows = []
                 print(f"  ERROR {config}/{name}/{seed}: {e}")
             with write_lock:
                 with open(args.output, "a", newline="") as f:
@@ -547,6 +715,9 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
                 if traj_rows:
                     with open(traj_path, "a", newline="") as f:
                         csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES).writerows(traj_rows)
+                if cert_enabled and cert_rows:
+                    with open(cert_path, "a", newline="") as f:
+                        csv.DictWriter(f, fieldnames=cert_fieldnames).writerows(cert_rows)
                 counter["n"] += 1
                 n = counter["n"]
             e = row.get("e_e0_unconstrained", "")
@@ -557,6 +728,10 @@ def run_sweep(args: argparse.Namespace, configurations: Dict[str, List[str]]) ->
 
     prog = Path(sys.argv[0]).name
     print(f"\nDone in {time.time() - t0:.0f}s. Wrote {args.output} and {traj_path}")
+    if cert_enabled:
+        print(f"      certificate rows -> {cert_path}")
+    if geom_enabled:
+        print(f"      geometry trails  -> {geom_dir}/")
     print(f"Next: python {prog} analyze {args.output}")
     print(f"      python {prog} traj {traj_path}")
 
@@ -1027,6 +1202,29 @@ def add_run_args(parser, config_names, priors_default=PRIORS_FILE_DEFAULT,
                             f"{'on' if gradients_default else 'off'}. Requires "
                             "--energy == --optimizer (single surface); --no-use-gradients "
                             "runs the value-only GP everywhere.")
+    parser.add_argument("--certificate", action="store_true",
+                        help="Log the per-BO-step stopping-rule certificate "
+                        "(mu_min/alpha_max/lb-grid + e_eval/e_best/n_calls/wall_s) "
+                        "for every trial and aggregate it into a master CSV "
+                        "(--certificate-output). Used by the stopping-rule "
+                        "calibration benchmark.")
+    parser.add_argument("--certificate-betas", default=None,
+                        help="Comma-separated beta grid for the certificate lower "
+                        "bound (default: bouquet's DEFAULT_CERTIFICATE_BETAS). One "
+                        "lb_b<beta> column is logged per value.")
+    parser.add_argument("--certificate-output", type=Path, default=None,
+                        help="Master certificate CSV (default <output stem>_cert.csv).")
+    parser.add_argument("--certificate-dir", type=Path, default=None,
+                        help="Directory for per-trial certificate CSVs "
+                        "(default <output stem>_certfiles/).")
+    parser.add_argument("--geometry", action="store_true",
+                        help="Also save, per trial, the geometry at each best-so-far "
+                        "improvement plus the final relaxed best (multi-frame XYZ "
+                        "under --geometry-dir), for the RMSD-identity / "
+                        "distinct-conformer analysis.")
+    parser.add_argument("--geometry-dir", type=Path, default=None,
+                        help="Directory for per-trial geometry XYZs "
+                        "(default <output stem>_geom/).")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the plan and trial count, then exit")
 

@@ -78,7 +78,7 @@ pandas = ">=3.0.3,<4"
 # `import bouquet` and scripts/ resolve without setting PYTHONPATH. The key must
 # match the local [project].name, not the PyPI distribution name.
 [tool.pixi.pypi-dependencies]
-bouquet = { path = ".", editable = true }
+bouquet-mol = { path = ".", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
