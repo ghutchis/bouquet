@@ -53,11 +53,16 @@ def mol_to_ase_atoms(mol: Chem.Mol, conf_id: int = -1) -> Atoms:
     return atoms
 
 
-def get_initial_structure(smiles: str) -> tuple[Atoms, Chem.Mol]:
+def get_initial_structure(smiles: str, seed: int = 42) -> tuple[Atoms, Chem.Mol]:
     """Generate an initial guess for a molecular structure from SMILES.
 
     Args:
         smiles: SMILES string
+        seed: ETKDG random seed for the embedding. Pass the run seed so different
+            runs start from different 3D embeddings -- this is the ONLY source of
+            ring-pucker / non-rotatable-DOF diversity across seeds, since the BO
+            loop and its initial guesses perturb rotatable dihedrals only. Default
+            42 (reproducible single embedding).
 
     Returns:
         Tuple of (ASE Atoms object, RDKit Mol object)
@@ -69,15 +74,18 @@ def get_initial_structure(smiles: str) -> tuple[Atoms, Chem.Mol]:
     # Add hydrogens
     mol = Chem.AddHs(mol)
 
-    # Generate 3D coordinates using ETKDG
+    # Generate 3D coordinates using ETKDG (seed-dependent, so multi-seed runs
+    # sample distinct ring conformations -- see the seed docstring above).
     params = AllChem.ETKDGv3()
-    params.randomSeed = 42  # For reproducibility
+    params.randomSeed = seed
     embed_result = AllChem.EmbedMolecule(mol, params)
 
     if embed_result == -1:
         # Embedding failed, try with random coordinates
         logger.warning("ETKDG embedding failed, trying with random coordinates")
-        AllChem.EmbedMolecule(mol, AllChem.EmbedParameters())
+        fallback = AllChem.EmbedParameters()
+        fallback.randomSeed = seed
+        AllChem.EmbedMolecule(mol, fallback)
 
     if mol.GetNumConformers() == 0:
         raise ValueError(f"Could not generate 3D coordinates for: {smiles}")
@@ -292,6 +300,54 @@ def get_bonding_graph(mol: Chem.Mol) -> nx.Graph:
         )
 
     return g
+
+
+def geometry_bond_set(atoms: Atoms, tol: float = 1.3) -> set[tuple[int, int]]:
+    """Perceive bonds from a 3D geometry by covalent-radius distance cutoff.
+
+    A pair (i, j) is bonded when ``dist < tol * (r_cov[i] + r_cov[j])``. Returns a
+    set of sorted index pairs. ``tol`` 1.3 is a standard tolerance that flags both
+    broken bonds (dissociation) and newly formed bonds (rearrangement).
+    """
+    import numpy as np
+    from ase.data import covalent_radii
+
+    z = atoms.get_atomic_numbers()
+    pos = atoms.get_positions()
+    rcov = np.array([covalent_radii[zi] for zi in z])
+    d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
+    cutoff = tol * (rcov[:, None] + rcov[None, :])
+    iu = np.triu_indices(len(z), k=1)
+    mask = d[iu] < cutoff[iu]
+    return {(int(i), int(j)) for i, j, m in zip(iu[0], iu[1], mask) if m}
+
+
+def mol_bond_set(mol: Chem.Mol) -> set[tuple[int, int]]:
+    """Expected bond set (sorted index pairs) from an RDKit mol's bond table. The
+    mol must have explicit Hs and atom order matching the geometry being checked
+    (e.g. both from ``AddHs(MolFromSmiles(...))``)."""
+    return {
+        tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+        for b in mol.GetBonds()
+    }
+
+
+def bonds_broken(atoms: Atoms, required_bonds: set[tuple[int, int]],
+                 tol: float = 1.3) -> bool:
+    """True if any of ``required_bonds`` is no longer present in the geometry (the
+    structure dissociated or rearranged). Only *broken* bonds count -- newly *close*
+    non-bonded contacts (folded or strained/caged conformers, e.g. bicyclo[1.1.1]
+    bridgeheads) are legitimate conformations, not connectivity changes, so they are
+    deliberately ignored. This is the "retain the molecule's bonds" criterion."""
+    return bool(set(required_bonds) - geometry_bond_set(atoms, tol))
+
+
+def connectivity_changed(atoms: Atoms, mol: Chem.Mol, tol: float = 1.3) -> bool:
+    """True if the geometry has lost any of the mol's bonds -- i.e. it dissociated
+    or rearranged and is no longer the same molecule. Used to reject broken-bond
+    conformers (the optimizer can rearrange odd species). Newly formed close
+    contacts are ignored (see bonds_broken). ``atoms``/``mol`` share atom ordering."""
+    return bonds_broken(atoms, mol_bond_set(mol), tol)
 
 
 def get_dihedral_info(

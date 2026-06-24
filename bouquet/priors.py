@@ -308,6 +308,18 @@ class DihedralPriorModule(nn.Module):
         """Dimensions handled by bivariate priors."""
         return {d for pair in self.bivariate_assignments for d in pair}
 
+    @cached_property
+    def n_active_dims(self) -> int:
+        """Number of dihedral dimensions carrying a non-uniform prior factor.
+
+        A bivariate pair spans two dihedrals, so it counts as 2; a univariate
+        dimension whose distribution is ``None`` (uniform) does not count.
+        ``forward`` divides the summed log-prior by this so the joint log-prior is
+        the *mean* over informative dihedrals rather than a sum (see ``forward``).
+        """
+        n_uni = sum(1 for dist in self.univariate_dists.values() if dist is not None)
+        return n_uni + 2 * len(self.bivariate_dists)
+
     def _build_univariate(self):
         """Build 1D von Mises mixture distributions."""
         self.univariate_dists: Dict[int, Optional[MixtureSameFamily]] = {
@@ -386,10 +398,17 @@ class DihedralPriorModule(nn.Module):
         Args:
             X: Shape (..., q, dim) - dihedral values
 
+        The per-dihedral log-densities are *averaged*, not summed: the joint
+        log-prior is ``mean_d log p_d(x_d)`` over the informative dihedrals
+        (``n_active_dims``). A summed prior grows like O(dim), so under the additive
+        PiBO objective it swamps ``logEI`` on larger molecules and freezes the search
+        at the prior's joint mode; averaging keeps the prior's magnitude -- and hence
+        ``prior_exponent``'s strength-vs-data tradeoff -- invariant to dimensionality.
+
         Returns:
-            Log probability (unnormalized), shape (..., q). With
-            ``background_weight == 0`` the far field is clamped at -20; with a
-            background the uniform component provides the (smooth) lower floor.
+            Mean log probability (unnormalized), shape (..., q). With
+            ``background_weight == 0`` the (averaged) far field is clamped at -20;
+            with a background the uniform component provides the (smooth) lower floor.
         """
         log_prob = torch.zeros(X.shape[:-1], dtype=X.dtype, device=X.device)
 
@@ -420,10 +439,16 @@ class DihedralPriorModule(nn.Module):
             angle2 = self._to_radians(X[..., d2])
             log_prob = log_prob + dist.log_prob(angle1, angle2)
 
+        # Average over informative dihedrals (mean, not sum) so the prior's
+        # magnitude is O(1) in dim. n_active_dims == 0 means an all-uniform prior
+        # (no preference anywhere); leave log_prob at its zero init.
+        if self.n_active_dims > 0:
+            log_prob = log_prob / self.n_active_dims
+
         if w_bg > 0.0:
             # The per-dimension uniform background already bounds log_prob from
-            # below (>= dim * log(w/(2*pi))), so no hard clamp is needed -- clamping
-            # here would flatten the smooth background floor back to a dead region.
+            # below (>= log(w/(2*pi))), so no hard clamp is needed -- clamping here
+            # would flatten the smooth background floor back to a dead region.
             return log_prob
         # No background: clamp the floor so a candidate far from every prior mode
         # incurs a bounded penalty (still carrying a gradient) instead of -inf.

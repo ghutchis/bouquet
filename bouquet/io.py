@@ -92,6 +92,17 @@ def save_structure(out_dir: Path, atoms: Atoms, filename: str, comment: str = ""
         simple_write_xyz(fp, [atoms], comment=comment)
 
 
+def append_xyz_frame(path: Path, atoms: Atoms, comment: str = "") -> None:
+    """Append one structure as a frame to a multi-frame XYZ file (created if absent).
+
+    Used for the stopping-rule benchmark's geometry trail (one frame per best-so-far
+    improvement, plus the final relaxed best); writing incrementally means a
+    timed-out/censored run still keeps the improvements it found before the kill.
+    """
+    with path.open("a") as fp:
+        simple_write_xyz(fp, [atoms], comment=comment)
+
+
 def atoms_to_xyz_string(atoms: Atoms) -> str:
     """Convert an Atoms object to an XYZ format string.
 
@@ -157,6 +168,84 @@ def create_structure_logger(
             simple_write_xyz(fp, [atoms], comment=f"\t{energy}")
 
     return add_entry
+
+
+# Base columns for the per-step stopping-rule certificate log. Energies are in
+# relative eV (the e_e0 convention); n_calls is cumulative energy evaluations. One
+# ``lb_b<beta>`` column per calibration beta is appended at logger-creation time
+# (see certificate_lb_column / create_certificate_logger).
+CERTIFICATE_BASE_FIELDNAMES = [
+    "step",       # 0-based BO step index
+    "e_eval",     # relative energy evaluated this step (eV)
+    "e_best",     # running best (min) relative energy after this step (eV)
+    "mu_min",     # GP posterior global-min estimate min_x mu_t(x) (eV)
+    "alpha_max",  # max expected improvement over the pool (eV, plain not log)
+    "n_calls",    # cumulative energy evaluations (start + init + BO so far)
+    "wall_s",     # seconds elapsed in the BO loop up to this step
+    "t_select",   # seconds this step in GP fit/condition + acquisition (+certificate)
+    "t_eval",     # seconds this step in the xTB energy evaluation + relaxation
+    "t_gp_fit",   # subset of t_select: GP construction + fit/condition
+    "t_acq",      # subset of t_select: acquisition build + optimize_acqf
+    # ... then one lb_b<beta> column per beta (the certificate lower bound).
+]
+
+
+def certificate_lb_column(beta: float) -> str:
+    """Column name for the certificate lower bound at confidence multiplier ``beta``."""
+    return f"lb_b{beta:g}"
+
+
+def create_certificate_logger(
+    log_path: Path, betas: tuple[float, ...]
+) -> Callable[..., None]:
+    """Create a per-BO-step logger for the stopping-rule certificate.
+
+    Writes the header to ``log_path`` (base columns + one ``lb_b<beta>`` column
+    per entry in ``betas``), one row per BO step. Returned callable signature:
+    ``(step, e_eval, e_best, n_calls, wall_s, cert)`` where ``cert`` is the dict
+    produced by ``solver._compute_certificate`` (keys ``mu_min``/``alpha_max`` and
+    ``lb``, a list of bounds aligned with ``betas``).
+
+    Args:
+        log_path: Path to the certificate CSV (overwritten with a fresh header).
+        betas: Confidence multipliers whose lower bounds were logged, in the same
+            order ``cert["lb"]`` is produced.
+
+    Returns:
+        Callable that appends one certificate row per step.
+    """
+    lb_cols = [certificate_lb_column(b) for b in betas]
+    fieldnames = CERTIFICATE_BASE_FIELDNAMES + lb_cols
+    with log_path.open("w", newline="") as fp:
+        DictWriter(fp, fieldnames).writeheader()
+
+    def add_cert(
+        step: int,
+        e_eval: float,
+        e_best: float,
+        n_calls: int,
+        wall_s: float,
+        cert: dict,
+    ) -> None:
+        row = {
+            "step": step,
+            "e_eval": e_eval,
+            "e_best": e_best,
+            "mu_min": cert.get("mu_min"),
+            "alpha_max": cert.get("alpha_max"),
+            "n_calls": n_calls,
+            "wall_s": wall_s,
+            "t_select": cert.get("t_select"),
+            "t_eval": cert.get("t_eval"),
+            "t_gp_fit": cert.get("t_gp_fit"),
+            "t_acq": cert.get("t_acq"),
+        }
+        for col, val in zip(lb_cols, cert.get("lb", [])):
+            row[col] = val
+        with log_path.open("a", newline="") as fp:
+            DictWriter(fp, fieldnames).writerow(row)
+
+    return add_cert
 
 
 def save_ensemble(

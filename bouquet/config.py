@@ -30,6 +30,24 @@ AUTO_STEPS_THRESHOLDS = {
     7: 100,  # <= 7 dihedrals
 }
 AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
+
+# Default confidence-multiplier grid for the stopping-rule certificate lower bound
+# (mu - beta*sigma). Logged per step (one lb_b<beta> column each) so the offline
+# replay can pick/calibrate beta without re-running. See solver._compute_certificate.
+DEFAULT_CERTIFICATE_BETAS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0)
+
+
+def format_certificate_betas(betas: tuple) -> str:
+    """Serialize a certificate beta grid to the comma-separated CLI form."""
+    return ",".join(f"{b:g}" for b in betas)
+
+
+def parse_certificate_betas(s: str) -> tuple:
+    """Parse the comma-separated CLI form of a certificate beta grid."""
+    return tuple(float(b) for b in s.split(",") if b.strip())
+
+
+
 # Under --auto, reserve at least this many BO refinement steps when seeding many
 # initial points (e.g. a systematic peak grid): the seeded points are capped to
 # total - this, so a large grid can't consume the whole budget and leave zero
@@ -61,8 +79,15 @@ DEFAULT_INIT_METHOD = "random"
 # to weighted sampling (e.g. 3 modes x 3 dihedrals = 27 fits; x4 = 81 does not).
 DEFAULT_INIT_GRID_BUDGET = 64
 
-# Prior (PiBO) defaults
-DEFAULT_PRIOR_EXPONENT = 2.0
+# Prior (PiBO) defaults. The exponent weights the prior against logEI in the
+# additive PiBO objective. Since priors.DihedralPriorModule.forward now *averages*
+# the per-dihedral log-prior (was a sum), its magnitude is O(1) in dihedral count,
+# so the exponent means the same thing across molecule sizes. Smoke sweeps on
+# straight-chain diols (gfn2) show exponent <= 0.25 matches the no-prior baseline
+# while >= 0.5 over-steers and hurts (worse on larger molecules); 0.25 keeps the
+# most early guidance without degrading. (Was 2.0, calibrated for the old summed
+# prior, which froze the search after the mean change.)
+DEFAULT_PRIOR_EXPONENT = 0.25
 DEFAULT_PRIOR_DECAY = 0.9
 # Cap on von Mises concentration when fitted priors are used for search; see
 # bouquet.priors.DEFAULT_MAX_CONCENTRATION.
@@ -124,6 +149,12 @@ class Configuration:
     init_grid_budget: int = DEFAULT_INIT_GRID_BUDGET
     auto_steps: bool = False
     relax: bool = True
+    # Acquisition-optimizer effort (optimize_acqf). num_restarts L-BFGS runs seeded
+    # from raw_samples random points. These dominate per-step BO cost (each eval
+    # queries the GP posterior ~n(1+d)), so they are the main speed lever; lowering
+    # them trades search quality for speed (see scripts/acq_sweep / the timing study).
+    acq_num_restarts: int = ACQ_NUM_RESTARTS
+    acq_raw_samples: int = ACQ_RAW_SAMPLES
     # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
     # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
@@ -153,6 +184,30 @@ class Configuration:
     # Ensemble selection
     ensemble: bool = False
 
+    # When set, reject any evaluated geometry whose covalent bond graph differs
+    # from the initial structure's (the optimizer can rearrange/dissociate strained
+    # or unusual species into a spuriously low, non-conformer minimum). Such points
+    # get a failure energy so they are never selected; a final relaxation that
+    # breaks bonds reverts to the constrained best. See bouquet.setup.connectivity.
+    retain_bonds: bool = False
+
+    # Stopping-rule calibration benchmark: when set, the solver logs a per-BO-step
+    # certificate (mu_min/alpha_max/lb + e_eval/e_best/n_calls/wall_s) to this CSV.
+    # certificate_betas is the grid of confidence multipliers for the lower-bound
+    # term -- one lb_b<beta> column per beta, so the offline replay can calibrate
+    # beta without re-running.
+    certificate_log: Optional[Path] = None
+    certificate_betas: tuple = DEFAULT_CERTIFICATE_BETAS
+
+    # Stopping-rule benchmark, geometry trail: when set, the solver writes the
+    # geometry at each best-so-far improvement (constrained-relaxed, the geometry
+    # actually visited) plus the final unconstrained-relaxed best to this
+    # multi-frame XYZ. Written incrementally so a timed-out (censored) run still
+    # keeps its improvements. Enables the RMSD-identity success criterion and
+    # distinct-conformer (basin) analysis offline -- the torsion vector alone can't,
+    # since it omits ring pucker and other non-dihedral DOF.
+    geometry_log: Optional[Path] = None
+
     # Output
     out_dir: Optional[Path] = None
 
@@ -175,6 +230,8 @@ class Configuration:
             self.out_dir = Path(self.out_dir)
         if isinstance(self.priors_file, str):
             self.priors_file = Path(self.priors_file)
+        if isinstance(self.certificate_log, str):
+            self.certificate_log = Path(self.certificate_log)
 
         # Derive a run name from the input if one wasn't provided: prefer the
         # SMILES string, otherwise fall back to the input file's stem.
