@@ -175,8 +175,12 @@ def _read_trail(path):
     from ase.io import read
     frames = read(path, index=":")
     out = []
-    comments = [ln.strip() for ln in open(path) if "kind=" in ln]
-    for atoms, c in zip(frames, comments):
+    with open(path) as fh:
+        comments = [ln.strip() for ln in fh if "kind=" in ln]
+    # Every trail frame carries a "kind=" comment line, so the counts match by
+    # construction; strict pairing surfaces a desync (e.g. a dropped frame) instead
+    # of silently truncating trailing BO frames.
+    for atoms, c in zip(frames, comments, strict=True):
         kv = dict(tok.split("=", 1) for tok in c.split() if "=" in tok)
         out.append((atoms, float(kv.get("e_e0_eV", "nan")), kv.get("kind", "")))
     return out

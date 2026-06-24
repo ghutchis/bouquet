@@ -319,7 +319,7 @@ def geometry_bond_set(atoms: Atoms, tol: float = 1.3) -> set[tuple[int, int]]:
     cutoff = tol * (rcov[:, None] + rcov[None, :])
     iu = np.triu_indices(len(z), k=1)
     mask = d[iu] < cutoff[iu]
-    return {(int(i), int(j)) for i, j, m in zip(iu[0], iu[1], mask) if m}
+    return {(int(i), int(j)) for i, j, m in zip(iu[0], iu[1], mask, strict=True) if m}
 
 
 def mol_bond_set(mol: Chem.Mol) -> set[tuple[int, int]]:

@@ -1089,6 +1089,7 @@ def _perform_final_relaxation(
 
     # Relaxation without dihedral constraints
     constrained_atoms = best_atoms.copy()  # retained-bonds fallback
+    constrained_energy = best_energy  # its energy, restored alongside if we revert
     best_atoms.set_constraint()
     best_energy, best_atoms = evaluate_energy(
         best_coords, best_atoms, dihedrals, calc, relaxCalc, steps=None
@@ -1107,6 +1108,7 @@ def _perform_final_relaxation(
             "reverting to the constrained best (--retain-bonds)."
         )
         best_atoms = constrained_atoms
+        best_energy = constrained_energy
 
     best_coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
     if state.add_entry is not None:

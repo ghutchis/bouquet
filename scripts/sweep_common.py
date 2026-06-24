@@ -565,9 +565,22 @@ def run_sweep(
     if not traj_path.exists():
         with open(traj_path, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES).writeheader()
-    if cert_enabled and not cert_path.exists():
-        with open(cert_path, "w", newline="") as f:
-            csv.DictWriter(f, fieldnames=cert_fieldnames).writeheader()
+    if cert_enabled:
+        cert_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cert_path.exists():
+            with open(cert_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=cert_fieldnames).writeheader()
+        else:
+            # Resume/append: a header that doesn't match the current schema (e.g. the
+            # --certificate-betas grid changed) would silently misalign appended rows.
+            with open(cert_path, newline="") as f:
+                existing_header = next(csv.reader(f), [])
+            if existing_header != cert_fieldnames:
+                raise SystemExit(
+                    f"{cert_path} header does not match the current certificate schema "
+                    "(did --certificate-betas change?). Move it aside or pass a fresh "
+                    "--certificate-output."
+                )
 
     # Predictive skip: drop any gradient arm whose gradient-GP phase would exceed
     # this many BO steps for a molecule (its per-step cost grows steeply, so big

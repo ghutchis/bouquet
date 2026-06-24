@@ -215,7 +215,10 @@ def select(args):
     # Dedup by structure (InChIKey); rows are already in source-priority order from
     # ingest, so keep="first" retains the highest-priority source. Rows missing an
     # InChIKey fall back to raw SMILES so they aren't all collapsed together.
-    df["dedup_key"] = df.inchikey.where(df.inchikey.astype(bool), df.raw_smiles)
+    # A missing InChIKey is NaN (truthy under astype(bool)) or empty; treat both as
+    # absent and fall back to raw_smiles, else all keyless rows collapse to one key.
+    _has_key = df.inchikey.notna() & df.inchikey.astype(str).str.strip().astype(bool)
+    df["dedup_key"] = df.inchikey.where(_has_key, df.raw_smiles)
     n_before = len(df)
     df["n_sources"] = df.groupby("dedup_key")["source"].transform("nunique")
     df = df.drop_duplicates("dedup_key", keep="first")
@@ -231,7 +234,8 @@ def select(args):
         if "dedup_key" in edf.columns:
             keys = edf.dedup_key.astype(str)
         elif "inchikey" in edf.columns:
-            keys = edf.inchikey.where(edf.inchikey.astype(bool), edf.raw_smiles).astype(str)
+            _ek = edf.inchikey.notna() & edf.inchikey.astype(str).str.strip().astype(bool)
+            keys = edf.inchikey.where(_ek, edf.raw_smiles).astype(str)
         else:
             keys = edf.raw_smiles.astype(str)
         excluded.update(keys)

@@ -78,8 +78,8 @@ def main() -> None:
         sel += f", seed={args.seed}"
 
     if args.dry_run:
-        for path, fields in ((args.output, sc.FIELDNAMES),
-                             (traj_path, sc.TRAJ_FIELDNAMES)):
+        for path, _fields in ((args.output, sc.FIELDNAMES),
+                              (traj_path, sc.TRAJ_FIELDNAMES)):
             if not path.exists():
                 print(f"{path}: (missing)")
                 continue

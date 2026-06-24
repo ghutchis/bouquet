@@ -77,7 +77,13 @@ def run(args):
         bin_count[d] = bin_count.get(d, 0) + 1
         return False
 
-    configs = {k: CONFIGS[k] for k in (args.arms.split(",") if args.arms else CONFIGS)}
+    requested = args.arms.split(",") if args.arms else list(CONFIGS)
+    unknown = [a for a in requested if a not in CONFIGS]
+    if unknown:
+        raise SystemExit(
+            f"Unknown arm(s) {unknown}; choose from {list(CONFIGS)}."
+        )
+    configs = {k: CONFIGS[k] for k in requested}
     print(f"acq_sweep arms: {list(configs)}")
     sc.run_sweep(args, configs, num_steps_fn=num_steps_fn, mol_skip_fn=mol_skip_fn)
 
@@ -95,8 +101,10 @@ def analyze(args):
         fin = g.e_best_k.min()
         # energy-convergence: first call within --eps of the trial's own final best
         hit = g.loc[g.e_best_k <= fin + args.eps, "n_calls"]
+        d0 = g.d.iloc[0]  # num_dihedrals can be NaN if a trial's count didn't parse
         per.append({
-            "config": cfg, "name": name, "seed": seed, "d": int(g.d.iloc[0]),
+            "config": cfg, "name": name, "seed": seed,
+            "d": int(d0) if pd.notna(d0) else -1,
             "final_eb": fin, "wall_s": g.wall_s.max(),
             "t_acq_step": g.t_acq.mean() if "t_acq" in g else np.nan,
             "n_converge": int(hit.iloc[0]) if len(hit) else int(g.n_calls.max()),

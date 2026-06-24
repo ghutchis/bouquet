@@ -82,7 +82,7 @@ def _numeric_cartesian_forces(atoms, mol, calc_class, delta=1e-3):
     forces = np.zeros_like(pos0)
     for i in range(len(pos0)):
         for j in range(3):
-            def energy_with_offset(step):
+            def energy_with_offset(step, i=i, j=j):
                 probe = atoms.copy()
                 pos = pos0.copy()
                 pos[i, j] += step
@@ -123,7 +123,7 @@ class TestForceFieldGradients:
         atoms, mol, dihedrals = butane
         atoms = atoms.copy()
         # Perturb every rotatable bond to a distinct, non-stationary angle.
-        for offset, di in zip((40.0, 95.0, 155.0), dihedrals):
+        for offset, di in zip((40.0, 95.0, 155.0), dihedrals, strict=True):
             atoms.set_dihedral(*di.chain, offset, indices=di.group)
         atoms.calc = calc_class(mol)
 
@@ -163,7 +163,7 @@ class TestProjectionAgainstFiniteDifference:
         atoms, mol, dihedrals = butane
         atoms = atoms.copy()
         # Perturb every rotatable bond to a distinct, non-stationary angle.
-        for offset, di in zip((40.0, 95.0, 155.0), dihedrals):
+        for offset, di in zip((40.0, 95.0, 155.0), dihedrals, strict=True):
             atoms.set_dihedral(*di.chain, offset, indices=di.group)
         atoms.calc = RDKitMMFFCalculator(mol)
 

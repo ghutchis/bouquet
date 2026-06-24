@@ -33,6 +33,7 @@ Usage:
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -265,7 +266,8 @@ def fit_scaling(d, y, through_origin=True):
     under-populated/outlier d-bin -- filter those out before fitting). Forcing the
     origin is typically within a few percent RMSE of the free fit on clean data.
     """
-    d = np.asarray(d, float); y = np.asarray(y, float)
+    d = np.asarray(d, float)
+    y = np.asarray(y, float)
     m = np.isfinite(y) & (d > 0)
     d, y = d[m], y[m]
     if len(d) < 3:
@@ -441,11 +443,17 @@ def _load_ref_min(ref_dir: Path, mol_id: str):
         return None
 
 
+def _safe_filename(name: str) -> str:
+    """Sanitize a molecule name to a filename component -- must match the form
+    sweep_common._safe_filename uses at write time, else the trail file isn't found."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "mol"
+
+
 def _trail_frames(geom_dir: Path, config: str, mol_id: str, seed):
     """Geometry-trail frames for one trial as (n_calls, atoms), in n_calls order.
     Frames are the best-so-far improvements + final relaxed best (init_best too)."""
     from ase.io import read
-    f = geom_dir / f"{config}_{mol_id}_seed{seed}.xyz"
+    f = geom_dir / f"{config}_{_safe_filename(mol_id)}_seed{seed}.xyz"
     if not f.exists():
         return []
     frames = read(f, index=":")
@@ -563,12 +571,12 @@ def load_classes(manifest: Path) -> dict:
 def _trail_full(geom_dir: Path, config: str, mol_id: str, seed):
     """Trail frames as (n_calls, e_e0_eV, atoms) in n_calls order."""
     from ase.io import read
-    f = geom_dir / f"{config}_{mol_id}_seed{seed}.xyz"
+    f = geom_dir / f"{config}_{_safe_filename(mol_id)}_seed{seed}.xyz"
     if not f.exists():
         return []
     frames = read(f, index=":")
     out = []
-    for a, ln in zip(frames, [l for l in open(f) if "kind=" in l]):
+    for a, ln in zip(frames, [c for c in open(f) if "kind=" in c]):
         kv = dict(t.split("=", 1) for t in ln.split() if "=" in t)
         out.append((int(kv.get("n_calls", "0")), float(kv.get("e_e0_eV", "nan")), a))
     out.sort(key=lambda x: x[0])

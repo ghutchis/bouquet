@@ -233,6 +233,15 @@ class Configuration:
         if isinstance(self.certificate_log, str):
             self.certificate_log = Path(self.certificate_log)
 
+        # Acquisition-optimizer effort must be positive: 0 or negative would reach
+        # optimize_acqf as an opaque failure (or silently skip the search).
+        if self.acq_num_restarts < 1 or self.acq_raw_samples < 1:
+            raise ValueError(
+                "acq_num_restarts and acq_raw_samples must be positive integers; got "
+                f"acq_num_restarts={self.acq_num_restarts}, "
+                f"acq_raw_samples={self.acq_raw_samples}."
+            )
+
         # Derive a run name from the input if one wasn't provided: prefer the
         # SMILES string, otherwise fall back to the input file's stem.
         if self.name is None:
