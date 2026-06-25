@@ -24,6 +24,32 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
 
+# Kappa (concentration) bounds shared by the fitters and the init estimators.
+# With 1 degree histogram bins, a von Mises peak narrower than ~8 degrees FWHM
+# is fitting bin discretization rather than real structure, so cap kappa there.
+# FWHM(deg) ~= 2*rad2deg(arccos(1 - ln2/kappa)); kappa=500 -> FWHM ~= 8.5 deg.
+KAPPA_MAX = 500.0
+LOG_KAPPA_MIN = -2.0  # kappa_min ~= 0.14
+LOG_KAPPA_MAX = float(np.log(KAPPA_MAX))
+
+# Component pruning thresholds. MIN_KAPPA must stay near kappa_min: broad, low-
+# contrast distributions (e.g. amine C-N torsions, peak/trough ratio ~2) are best
+# represented by a single kappa ~= 0.3 component. A higher floor (the old 1.0)
+# deletes that component and forces the optimizer into a spurious "broad
+# background + spikes" fit, so keep this just above the optimizer's kappa_min.
+MIN_KAPPA = 0.15
+MIN_WEIGHT = 0.01
+
+# The symmetric fitter mixes in an explicit uniform background component
+# (weight w_bg, density 1/2pi) alongside the von Mises peaks. This is essential
+# for floppy torsions (e.g. ether C-O is ~90% uniform): without it the optimizer
+# is forced to approximate a near-flat distribution with sharp spikes. bouquet's
+# consumer takes a von Mises mixture (means/concentrations/weights) and requires
+# concentration > 0, so the background is emitted as a near-uniform von Mises
+# with this tiny concentration rather than a literal kappa=0 component.
+BACKGROUND_KAPPA = 0.01
+
+
 def _round_floats(obj):
     if isinstance(obj, float):
         return round(obj, 4)
@@ -227,13 +253,17 @@ def load_torlib(torlib_path: Path) -> List[Tuple[int, str]]:
     return patterns
 
 
-def load_histogram(data_dirs: List[Path], pattern_idx: int) -> Optional[np.ndarray]:
+def load_histogram(data_dirs: List[Path], file_pos: int) -> Optional[np.ndarray]:
     """Load and sum histogram counts across all data sources.
+
+    ``file_pos`` is the 0-based torlib row position used by
+    create-torsion-histograms.py to name its tl<N>.txt output files (it does
+    not use the torlib first-column index).
 
     Also mirrors counts around 180° to enforce symmetry (e.g., count at 179°
     is added to 181°, count at 270° is added to 90°).
     """
-    filename = f"tl{pattern_idx}.txt"
+    filename = f"tl{file_pos}.txt"
     total_counts = np.zeros(360, dtype=np.float64)
     found_any = False
 
@@ -253,16 +283,15 @@ def load_histogram(data_dirs: List[Path], pattern_idx: int) -> Optional[np.ndarr
     if not found_any:
         return None
 
-    # Mirror counts around 180° to enforce symmetry
-    # Angle i maps to (360 - i) % 360:
-    #   179° -> 181°, 270° -> 90°, 0° -> 0°, 180° -> 180°
-    mirrored_counts = np.zeros(360, dtype=np.float64)
-    for i in range(360):
-        mirror_idx = (360 - i) % 360
-        mirrored_counts[i] = total_counts[i] + total_counts[mirror_idx]
-        # 0° and 180° map to themselves, so the line above already doubles them.
+    # Mirror counts around 180° to enforce symmetry. Average (not sum) the two
+    # mirror bins so the total count is preserved -- summing would double every
+    # observation and overstate "N obs" by 2x. Angle i maps to (360 - i) % 360:
+    #   179° -> 181°, 270° -> 90°, 0° -> 0°, 180° -> 180°. Self-mirror bins
+    # (0° and 180°) average with themselves, leaving them unchanged.
+    mirror_idx = (360 - np.arange(360)) % 360
+    symmetric_counts = 0.5 * (total_counts + total_counts[mirror_idx])
 
-    return mirrored_counts
+    return symmetric_counts
 
 
 def histogram_to_angles(counts: np.ndarray) -> np.ndarray:
@@ -293,6 +322,46 @@ def mixture_von_mises_pdf(
     for mu, kappa, w in zip(means, kappas, weights):
         pdf += w * von_mises_pdf(theta, mu, kappa)
     return pdf
+
+
+def expand_symmetric_pairs(
+    params: np.ndarray, n_pairs: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Expand a symmetric-pair parameter vector into full component arrays.
+
+    params layout: [n_pairs means (rad), n_pairs log_kappas, (n_pairs+1)
+    raw_weights]. The softmax over the n_pairs+1 raw weights yields the per-pair
+    weights plus a trailing uniform-background weight; the pair weights therefore
+    sum to (1 - background_weight). Each pair at angle mu expands to components at
+    mu and -mu (sharing kappa and splitting weight), except near-self-symmetric
+    angles (0 or 180 deg) which stay as a single component.
+
+    Returns (means_deg, kappas, weights, background_weight) for the peaks only,
+    before pruning; the caller appends the uniform background separately.
+    """
+    pair_means = params[:n_pairs]
+    log_kappas = np.clip(params[n_pairs : 2 * n_pairs], LOG_KAPPA_MIN, LOG_KAPPA_MAX)
+    pair_kappas = np.exp(log_kappas)
+    raw_weights = params[2 * n_pairs :]  # length n_pairs + 1
+    exp_weights = np.exp(raw_weights - raw_weights.max())
+    all_weights = exp_weights / exp_weights.sum()
+    pair_weights = all_weights[:n_pairs]
+    background_weight = float(all_weights[n_pairs])
+
+    means_deg, kappas, weights = [], [], []
+    for mu, kappa, w in zip(pair_means, pair_kappas, pair_weights):
+        mu_deg = np.rad2deg(mu) + 180
+        is_self_symmetric = mu_deg < 5 or mu_deg > 355 or abs(mu_deg - 180) < 5
+        if is_self_symmetric:
+            means_deg.append(mu_deg % 360)
+            kappas.append(kappa)
+            weights.append(w)
+        else:
+            means_deg.append(mu_deg % 360)
+            means_deg.append((360 - mu_deg) % 360)
+            kappas.extend([kappa, kappa])
+            weights.extend([w / 2, w / 2])
+    return np.array(means_deg), np.array(kappas), np.array(weights), background_weight
 
 
 def detect_peaks(
@@ -415,9 +484,9 @@ def estimate_kappa_from_peak(counts: np.ndarray, peak_idx: int) -> float:
     if cos_half_fwhm < 0.99999:
         kappa = 2 * np.log(2) / (1 - cos_half_fwhm)
     else:
-        kappa = 10000  # Extremely sharp peak
+        kappa = KAPPA_MAX  # Extremely sharp peak (capped at bin resolution)
 
-    return np.clip(kappa, 1, 10000)
+    return np.clip(kappa, MIN_KAPPA, KAPPA_MAX)
 
 
 def smart_initialization(
@@ -479,7 +548,7 @@ def fit_symmetric_von_mises_mixture(
     angles: np.ndarray,
     counts: np.ndarray,
     n_pairs: int,
-    n_restarts: int = 10,
+    n_restarts: int = 20,
     use_smart_init: bool = True,
 ) -> Dict:
     """Fit a mixture of symmetric von Mises pairs to histogram data.
@@ -503,22 +572,22 @@ def fit_symmetric_von_mises_mixture(
     total = counts.sum()
     bin_width = angles[1] - angles[0] if len(angles) > 1 else np.deg2rad(1)
 
-    LOG_KAPPA_MIN = -2
-    LOG_KAPPA_MAX = 9.2
-
     def neg_log_likelihood(params):
-        """Negative log likelihood for symmetric pairs."""
-        # params: [n_pairs means, n_pairs log_kappas, n_pairs raw_weights]
-        # Means are in [0, π] and will be mirrored to [-π, 0]
+        """Negative log likelihood for symmetric pairs + uniform background."""
+        # params: [n_pairs means, n_pairs log_kappas, (n_pairs+1) raw_weights]
+        # Means are in [0, π] and will be mirrored to [-π, 0]; the trailing raw
+        # weight is the uniform background.
         pair_means = params[:n_pairs]
         log_kappas = np.clip(
             params[n_pairs : 2 * n_pairs], LOG_KAPPA_MIN, LOG_KAPPA_MAX
         )
         pair_kappas = np.exp(log_kappas)
 
-        raw_weights = params[2 * n_pairs :]
-        raw_weights = raw_weights - raw_weights.max()
-        pair_weights = np.exp(raw_weights) / np.exp(raw_weights).sum()
+        raw_weights = params[2 * n_pairs :]  # length n_pairs + 1
+        exp_weights = np.exp(raw_weights - raw_weights.max())
+        all_w = exp_weights / exp_weights.sum()
+        pair_weights = all_w[:n_pairs]
+        w_bg = all_w[n_pairs]
 
         # Build full component arrays with symmetric pairs
         all_means = []
@@ -548,7 +617,9 @@ def fit_symmetric_von_mises_mixture(
         all_kappas = np.array(all_kappas)
         all_weights = np.array(all_weights)
 
+        # Peak mixture integrates to (1 - w_bg); add the uniform background.
         pdf = mixture_von_mises_pdf(angles, all_means, all_kappas, all_weights)
+        pdf = pdf + w_bg / (2 * np.pi)
         pdf = np.maximum(pdf, 1e-10)
 
         nll = -np.sum(counts * np.log(pdf))
@@ -598,26 +669,28 @@ def fit_symmetric_von_mises_mixture(
             init_kappas = np.array(
                 [estimate_kappa_from_peak(counts, int(p)) for p in init_means_deg]
             )
-            init_log_kappas = np.log(np.clip(init_kappas, 0.2, 10000))
+            init_log_kappas = np.log(np.clip(init_kappas, 0.2, KAPPA_MAX))
             prominence_sum = init_prominences.sum()
             if prominence_sum > 0:
                 init_weights = init_prominences / prominence_sum
             else:
                 # Uniform weights if all prominences are zero
                 init_weights = np.ones(len(init_prominences)) / len(init_prominences)
-            init_raw_weights = np.log(init_weights + 1e-10)
+            # Trailing raw weight seeds the uniform background as a modest minority.
+            init_raw_weights = np.append(np.log(init_weights + 1e-10), np.log(0.1))
         else:
-            # Random initialization - means in [0, π] (will be mirrored)
+            # Random initialization - means in [0, π] (will be mirrored). The extra
+            # raw weight is the uniform background (starts comparable to a peak).
             init_means = np.random.uniform(-np.pi, 0, n_pairs)
             init_log_kappas = np.random.uniform(2, 7, n_pairs)
-            init_raw_weights = np.zeros(n_pairs)
+            init_raw_weights = np.zeros(n_pairs + 1)
 
         init_params = np.concatenate([init_means, init_log_kappas, init_raw_weights])
 
         try:
             bounds = [(-np.pi, np.pi)] * n_pairs  # means
             bounds += [(LOG_KAPPA_MIN, LOG_KAPPA_MAX)] * n_pairs  # log_kappas
-            bounds += [(None, None)] * n_pairs  # raw_weights
+            bounds += [(None, None)] * (n_pairs + 1)  # raw_weights + background
 
             result = minimize(
                 neg_log_likelihood,
@@ -626,6 +699,11 @@ def fit_symmetric_von_mises_mixture(
                 bounds=bounds,
                 options={"maxiter": 2000, "ftol": 1e-10},
             )
+            # Rank restarts by likelihood. nll correctly rewards placing density
+            # on tall, narrow peaks; R^2 is pathological for spiky histograms
+            # (it favors a broad smear that avoids large per-bin residuals and
+            # erases real peaks). Determinism comes from the per-pattern seed and
+            # the larger restart count, not from changing the objective.
             if result.fun < best_nll:
                 best_nll = result.fun
                 best_result = result
@@ -642,55 +720,34 @@ def fit_symmetric_von_mises_mixture(
     if best_result is None:
         return None
 
-    # Extract parameters and expand symmetric pairs
-    params = best_result.x
-    pair_means = params[:n_pairs]
-    log_kappas = np.clip(params[n_pairs : 2 * n_pairs], LOG_KAPPA_MIN, LOG_KAPPA_MAX)
-    pair_kappas = np.exp(log_kappas)
-    raw_weights = params[2 * n_pairs :]
-    raw_weights = raw_weights - raw_weights.max()
-    pair_weights = np.exp(raw_weights) / np.exp(raw_weights).sum()
+    # Extract peak parameters (and the uniform-background weight) from the fit.
+    means_deg, kappas, weights, w_bg = expand_symmetric_pairs(best_result.x, n_pairs)
 
-    # Expand to full component arrays
-    all_means_deg = []
-    all_kappas = []
-    all_weights = []
-
-    for mu, kappa, w in zip(pair_means, pair_kappas, pair_weights):
-        mu_deg = np.rad2deg(mu) + 180
-        is_self_symmetric = mu_deg < 5 or mu_deg > 355 or abs(mu_deg - 180) < 5
-
-        if is_self_symmetric:
-            all_means_deg.append(mu_deg % 360)
-            all_kappas.append(kappa)
-            all_weights.append(w)
-        else:
-            all_means_deg.append(mu_deg % 360)
-            all_means_deg.append((360 - mu_deg) % 360)
-            all_kappas.append(kappa)
-            all_kappas.append(kappa)
-            all_weights.append(w / 2)
-            all_weights.append(w / 2)
-
-    means_deg = np.array(all_means_deg)
-    kappas = np.array(all_kappas)
-    weights = np.array(all_weights)
-
-    # Prune degenerate components
-    MIN_WEIGHT = 0.01
-    MIN_KAPPA = 1.0
+    # Prune degenerate peak components (the background is handled separately,
+    # since it is intentionally near-uniform and below MIN_KAPPA).
     valid_mask = (weights >= MIN_WEIGHT) & (kappas >= MIN_KAPPA)
-
     if valid_mask.sum() > 0:
         means_deg = means_deg[valid_mask]
         kappas = kappas[valid_mask]
         weights = weights[valid_mask]
-        weights = weights / weights.sum()
-    elif len(weights) > 0:
+    elif w_bg < MIN_WEIGHT and len(weights) > 0:
+        # No surviving peaks and no real background: keep the strongest peak.
         best_idx = np.argmax(weights)
         means_deg = np.array([means_deg[best_idx]])
         kappas = np.array([max(kappas[best_idx], MIN_KAPPA)])
         weights = np.array([1.0])
+    else:
+        means_deg = np.array([])
+        kappas = np.array([])
+        weights = np.array([])
+
+    # Append the uniform background as a near-uniform von Mises component.
+    if w_bg >= MIN_WEIGHT:
+        means_deg = np.append(means_deg, 180.0)
+        kappas = np.append(kappas, BACKGROUND_KAPPA)
+        weights = np.append(weights, w_bg)
+
+    weights = weights / weights.sum()
 
     # Sort by weight
     sort_idx = np.argsort(-weights)
@@ -739,7 +796,7 @@ def fit_von_mises_mixture(
     angles: np.ndarray,
     counts: np.ndarray,
     n_components: int,
-    n_restarts: int = 10,
+    n_restarts: int = 20,
     use_smart_init: bool = True,
     symmetric: bool = True,
 ) -> Dict:
@@ -770,11 +827,6 @@ def fit_von_mises_mixture(
 
     total = counts.sum()
     bin_width = angles[1] - angles[0] if len(angles) > 1 else np.deg2rad(1)
-    empirical_pdf = counts / (total * bin_width)
-
-    # Kappa bounds - allow very high values for sharp peaks
-    LOG_KAPPA_MIN = -2  # kappa_min ≈ 0.14
-    LOG_KAPPA_MAX = 9.2  # kappa_max ≈ 10000
 
     def neg_log_likelihood(params):
         """Negative log likelihood for optimization."""
@@ -803,7 +855,7 @@ def fit_von_mises_mixture(
             init_means, init_kappas, init_weights = smart_initialization(
                 angles, counts, n_components
             )
-            init_log_kappas = np.log(np.clip(init_kappas, 0.2, 10000))
+            init_log_kappas = np.log(np.clip(init_kappas, 0.2, KAPPA_MAX))
             # Convert weights to raw (pre-softmax) form
             init_raw_weights = np.log(init_weights + 1e-10)
         else:
@@ -873,9 +925,6 @@ def fit_von_mises_mixture(
 
     # ============ PRUNE DEGENERATE COMPONENTS ============
     # Remove components with very low weight or very low kappa (essentially uniform)
-    MIN_WEIGHT = 0.01
-    MIN_KAPPA = 1.0
-
     valid_mask = (weights >= MIN_WEIGHT) & (kappas >= MIN_KAPPA)
 
     if valid_mask.sum() > 0:
@@ -953,9 +1002,10 @@ def select_n_components(
     if total == 0:
         return 0, None
 
-    # First pass: find BIC-optimal number of components
+    # Fit every candidate component count once and select by BIC. BIC (built on
+    # the likelihood) is the right criterion here: it preserves sharp peaks,
+    # unlike an R^2-based rule which favors broad smears for spiky histograms.
     best_bic = np.inf
-    best_n = 1
     best_fit = None
     all_fits = {}
 
@@ -963,46 +1013,32 @@ def select_n_components(
         fit = fit_von_mises_mixture(angles, counts, n)
         if fit is None:
             continue
-
-        # Actual components after pruning
-        actual_n = len(fit["means_deg"])
-
-        # BIC with slightly reduced penalty for complex models
-        # Use actual number of components after pruning
+        actual_n = len(fit["means_deg"])  # actual count after pruning
         k = 3 * actual_n - 1
-        bic = 2 * fit["nll"] + 0.8 * k * np.log(total)
-
-        fit["bic"] = bic
-        fit["n_components"] = actual_n  # Use actual count after pruning
+        fit["bic"] = 2 * fit["nll"] + 0.8 * k * np.log(total)
+        fit["n_components"] = actual_n
         all_fits[n] = fit
 
-        if bic < best_bic:
-            best_bic = bic
-            best_n = actual_n
+        if fit["bic"] < best_bic:
+            best_bic = fit["bic"]
             best_fit = fit
 
-    # Second pass: if fit quality is poor, try more components
-    if best_fit is not None and best_fit["r2"] < min_r2:
-        for n in range(best_fit["n_components"] + 1, max_components + 1):
-            if n in all_fits:
-                fit = all_fits[n]
-            else:
-                fit = fit_von_mises_mixture(angles, counts, n)
-                if fit is None:
-                    continue
-                actual_n = len(fit["means_deg"])
-                k = 3 * actual_n - 1
-                fit["bic"] = 2 * fit["nll"] + 0.8 * k * np.log(total)
-                fit["n_components"] = actual_n
+    if best_fit is None:
+        return 0, None
 
+    # If the BIC-selected model is a poor fit, allow more components to improve
+    # it (compared by R^2 only among candidates BIC already deemed acceptable).
+    if best_fit["r2"] < min_r2:
+        for n in range(best_fit["n_components"] + 1, max_components + 1):
+            fit = all_fits.get(n)
+            if fit is None:
+                continue
             if fit["r2"] > best_fit["r2"]:
                 best_fit = fit
-                best_n = fit["n_components"]
-
             if fit["r2"] >= min_r2:
                 break
 
-    return best_n, best_fit
+    return best_fit["n_components"], best_fit
 
 
 def plot_fit(
@@ -1168,8 +1204,15 @@ def main():
     parser.add_argument(
         "--similarity-threshold",
         type=float,
-        default=0.90,
+        default=0.925,
         help="Bhattacharyya coefficient threshold for using generic priors (0-1)",
+    )
+    parser.add_argument(
+        "--generic-max-counts",
+        type=int,
+        default=5000,
+        help="Only substitute a generic prior for patterns with fewer than this "
+        "many observations; well-sampled patterns keep their custom fit",
     )
     args = parser.parse_args()
 
@@ -1193,10 +1236,14 @@ def main():
     generic_matches = {"sp3_sp3": 0, "sp3_sp2": 0}
     custom_fits = 0
 
-    for idx, smarts in patterns:
-        print(f"Processing pattern {idx}: {smarts[:50]}...")
+    # create-torsion-histograms.py names files tl<N>.txt by 0-based enumerate
+    # position over the torlib rows (it discards the first column). The prior
+    # key/SMARTS label come from the torlib row, but the histogram MUST be loaded
+    # by file position or every prior is fit to the next pattern's data.
+    for file_pos, (idx, smarts) in enumerate(patterns):
+        print(f"Processing pattern {idx} (tl{file_pos}.txt): {smarts[:50]}...")
 
-        raw_counts = load_histogram(args.data_dirs, idx)
+        raw_counts = load_histogram(args.data_dirs, file_pos)
         if raw_counts is None:
             if args.verbose:
                 print(f"  No data found, skipping")
@@ -1211,6 +1258,9 @@ def main():
             continue
 
         angles, counts = histogram_to_angles(raw_counts)
+        # Seed per pattern so fits are reproducible and independent of the order
+        # patterns are processed (the fitter draws random restarts internally).
+        np.random.seed(idx)
         n_comp, fit = select_n_components(
             angles, counts, args.max_components, args.min_r2
         )
@@ -1221,10 +1271,16 @@ def main():
             skipped += 1
             continue
 
-        # Compare to generic priors
+        # Compare to generic priors. Only substitute a generic for sparsely
+        # sampled patterns, where the custom fit is statistically shaky: a
+        # well-sampled pattern (e.g. >generic_max_counts observations) keeps its
+        # data-driven fit even when it resembles a generic, since collapsing it
+        # would discard real, hard-won specificity.
         generic_type, similarity = compare_to_generic_priors(
             fit, args.similarity_threshold
         )
+        if generic_type and total >= args.generic_max_counts:
+            generic_type = None
 
         if args.verbose:
             if generic_type:
@@ -1299,7 +1355,10 @@ def main():
     print(f"Patterns processed: {len(patterns)}")
     print(f"Priors fitted:      {len(univariate_priors)}")
     print(f"Skipped:            {skipped}")
-    print(f"\nGeneric prior matching (threshold={args.similarity_threshold}):")
+    print(
+        f"\nGeneric prior matching (similarity>={args.similarity_threshold}, "
+        f"only when counts<{args.generic_max_counts}):"
+    )
     print(f"  sp3_sp3 matches: {generic_matches['sp3_sp3']}")
     print(f"  sp3_sp2 matches: {generic_matches['sp3_sp2']}")
     print(f"  Custom fits:     {custom_fits}")
