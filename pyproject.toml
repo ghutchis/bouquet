@@ -64,15 +64,28 @@ packages = ["bouquet"]
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
+# Default dependencies — the lightweight xtb stack (GFN-FF / GFN2 / GFN0) plus
+# tooling. Heavy ab initio calculators live in optional features below so a plain
+# `pixi install` stays small.
 [tool.pixi.dependencies]
 tblite = "*"
 xtb-python = "*"
-psi4 = "*"
-gcp-correction = "*"
 pytest = ">=9.0.2,<10"
 pytest-cov = ">=7.0.0,<8"
 python = "==3.12"
 pandas = ">=3.0.3,<4"
+
+# Optional Psi4 DFT stack (the b3lyp / b97 methods in calculator.py). gcp-correction
+# supplies the geometric-counterpoise / dispersion tooling those methods rely on.
+# Pulled in only via the `psi4` (or `all`) environment.
+[tool.pixi.feature.psi4.dependencies]
+psi4 = "*"
+gcp-correction = "*"
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+psi4 = { features = ["psi4"], solve-group = "default" }
+all = { features = ["psi4"], solve-group = "default" }
 
 # Install bouquet itself editably (the pixi equivalent of `pip install -e .`) so
 # `import bouquet` and scripts/ resolve without setting PYTHONPATH. The key must

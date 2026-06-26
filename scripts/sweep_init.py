@@ -61,7 +61,14 @@ def main() -> None:
 
     r = sub.add_parser("run", help="Run the sweep")
     sc.add_run_args(r, CONFIG_NAMES, gradients_default=True)
-    r.set_defaults(func=lambda a: sc.run_sweep(a, build_configurations(a.priors_file)))
+    r.add_argument("--max-dihedrals", type=int, default=None,
+                   help="Skip molecules with more than this many rotatable "
+                   "dihedrals (detected by bouquet, matching --auto). Use e.g. "
+                   "--max-dihedrals 10 to run only the d<=10 subset of a larger "
+                   "benchmark. Off by default.")
+    r.set_defaults(func=lambda a: sc.run_sweep(
+        a, build_configurations(a.priors_file),
+        mol_skip_fn=sc.max_dihedral_skip(a.max_dihedrals)))
 
     a = sub.add_parser("analyze", help="Summarize a sweep CSV")
     sc.add_analyze_args(a)

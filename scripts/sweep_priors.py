@@ -39,20 +39,28 @@ import sweep_common as sc  # noqa: E402
 # ---------------------------------------------------------------------------
 # Configurations to sweep. Each maps a label to the extra CLI args (beyond
 # --priors, which is added automatically for every non-baseline arm). "noprior"
-# passes no --priors flag at all; the others vary the two knobs that matter for
-# the PiBO search prior: the concentration cap and the uniform background weight.
-# Keep "noprior" present -- it is the paired-comparison baseline.
+# passes no --priors flag at all and is the paired-comparison baseline -- keep it.
+#
+# Corrected-prior settings: concentration cap = 50 and global background_weight = 0
+# (the fitted priors carry their own per-pattern uniform background, so the blunt
+# global knob stays 0). Earlier sweeps drove the exponent toward ~0 only because
+# the priors were wrong (off-by-one histogram->SMARTS mapping + smeared/spiky fits).
+#
+# DECAY sweep at exp=0.5 (decay is geometric: prior_exponent *= prior_decay every
+# BO step, so smaller = faster fade). The exponent sweep on the EASY stopbench-50
+# set (d=1..10) was null on final energy and showed no anytime/speed lead; the only
+# positive signal was exp0.5 on d>6. So fix exponent at 0.5 (the best arm) and test
+# whether a faster-fading prior -- strong early guidance that gets out of the way
+# before it can trap the search at its mode -- helps, on the harder stopbench-hard
+# set (d=6..12, where the headroom is). All previous runs used the 0.9 default.
 # ---------------------------------------------------------------------------
+_BASE = ["--prior-max-concentration", "50", "--prior-background-weight", "0",
+         "--prior-exponent", "0.5"]
 CONFIGURATIONS = {
     "noprior": [],
-    "cap50_bg0.0": ["--prior-max-concentration", "50", "--prior-background-weight", "0"],
-    "cap50_bg0.1": ["--prior-max-concentration", "50", "--prior-background-weight", "0.1"],
-    "cap20_bg0.1": ["--prior-max-concentration", "20", "--prior-background-weight", "0.1"],
-    # Exponent sweep on the best cap/background base: does a weaker prior win, or
-    # does it just converge to no-prior (modes uninformative for GFN2)? Default
-    # exponent is 2.0 (the cap20_bg0.1 entry above). Select with --configs.
-    "cap20_bg0.1_exp1.0": ["--prior-max-concentration", "20", "--prior-background-weight", "0.1", "--prior-exponent", "1.0"],
-    "cap20_bg0.1_exp0.5": ["--prior-max-concentration", "20", "--prior-background-weight", "0.1", "--prior-exponent", "0.5"],
+    "exp0.5_decay0.9": _BASE + ["--prior-decay", "0.9"],   # default decay, reference
+    "exp0.5_decay0.7": _BASE + ["--prior-decay", "0.7"],   # faster fade
+    "exp0.5_decay0.5": _BASE + ["--prior-decay", "0.5"],   # much faster fade
 }
 
 BASELINE_LABEL = "noprior"

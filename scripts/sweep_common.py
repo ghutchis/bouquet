@@ -333,6 +333,42 @@ def predict_bo_budget(smiles: str) -> Optional[int]:
         return None
 
 
+def dihedral_count(smiles: str) -> Optional[int]:
+    """Number of rotatable dihedrals bouquet detects for ``smiles`` (None if it
+    can't be computed -- bad SMILES, import failure -- so callers can decline to
+    skip and just run it).
+
+    Uses bouquet's own ``detect_dihedrals`` so the count matches what the CLI
+    sees under ``--auto``. Imported lazily so the analyze/traj paths never pay the
+    rdkit import.
+    """
+    try:
+        from bouquet.setup import detect_dihedrals, get_initial_structure
+
+        _, mol = get_initial_structure(smiles)
+        return len(detect_dihedrals(mol))
+    except Exception:
+        return None
+
+
+def max_dihedral_skip(max_dihedrals: Optional[int]):
+    """Build a ``mol_skip_fn`` (for ``run_sweep``) dropping molecules with more
+    than ``max_dihedrals`` rotatable dihedrals; returns None when the cap is None
+    (skip nothing). A molecule whose count can't be determined is kept and run.
+
+    ``run_sweep`` memoizes the predicate by molecule name, so the dihedral
+    detection runs once per molecule regardless of seeds/configs.
+    """
+    if max_dihedrals is None:
+        return None
+
+    def skip(smiles: str, name: str) -> bool:
+        d = dihedral_count(smiles)
+        return d is not None and d > max_dihedrals
+
+    return skip
+
+
 def _flag_int(extra_args: List[str], flag: str) -> Optional[int]:
     """The int value following ``flag`` in a CLI-arg list, or None if the flag is
     absent or its value can't be parsed."""
