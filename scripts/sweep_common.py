@@ -44,8 +44,11 @@ from typing import Dict, List, Optional, Tuple
 # Reuse the log parser from batch.py (same directory).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batch import parse_log_output  # noqa: E402
+from bouquet.calculator import CalculatorFactory  # noqa: E402
 
-ENERGY_CHOICES = ["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"]
+# Energy/optimizer choices come from the calculator registry (installed subset),
+# so they track new methods automatically and never offer an unavailable one.
+ENERGY_CHOICES = list(CalculatorFactory.available_methods())
 PRIORS_FILE_DEFAULT = "gfn2_priors.json"
 
 # Tidy summary-CSV columns.

@@ -14,6 +14,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from bouquet.calculator import CalculatorFactory
+
+# Method choices from the calculator registry (installed subset) -- tracks new
+# methods and never offers an unavailable one.
+_METHOD_CHOICES = list(CalculatorFactory.available_methods())
+
 
 def parse_log_output(log_text: str) -> dict:
     """
@@ -249,13 +255,13 @@ def main():
     parser.add_argument(
         "--energy",
         default=None,
-        choices=["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"],
+        choices=_METHOD_CHOICES,
         help="Energy method (uses default if not specified)",
     )
     parser.add_argument(
         "--optimizer",
         default=None,
-        choices=["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"],
+        choices=_METHOD_CHOICES,
         help="Optimizer method (uses default if not specified)",
     )
     parser.add_argument(

@@ -17,6 +17,10 @@ keywords = [
     "molecular-modeling",
     "computational-chemistry",
     "rdkit",
+    "ase",
+    "ani",
+    "psi4",
+    "quantum-chemistry",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -24,6 +28,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Scientific/Engineering :: Chemistry",
     "Operating System :: OS Independent",
 ]
@@ -75,12 +82,14 @@ pytest-cov = ">=7.0.0,<8"
 python = "==3.12"
 pandas = ">=3.0.3,<4"
 
-# Optional Psi4 DFT stack (the b3lyp / b97 methods in calculator.py). gcp-correction
+# Optional Psi4 DFT stack
 # supplies the geometric-counterpoise / dispersion tooling those methods rely on.
 # Pulled in only via the `psi4` (or `all`) environment.
 [tool.pixi.feature.psi4.dependencies]
 psi4 = "*"
 gcp-correction = "*"
+#dftd3 = "*"
+#dftd4 = "*"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

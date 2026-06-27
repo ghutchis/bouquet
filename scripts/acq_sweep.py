@@ -46,6 +46,16 @@ CONFIGS = {
     "acq8":      ["--use-gradients", "--acq-num-restarts", "8", "--acq-raw-samples", "8"],
     "hybrid75":  ["--use-gradients", "--gradient-steps", "75"],
     "hybrid100": ["--use-gradients", "--gradient-steps", "100"],
+    # High-leverage gradient subset: keep gradients on only N points, so the
+    # augmented GP stays ~n + N*d. Unlike hybrid, gradients stay live in the active
+    # region. At window 75, three arms DISENTANGLE the selection criterion --
+    # recency (search frontier) vs near-best (incumbent basin) vs both -- and
+    # gwin150 adds the window-size axis (2x) at the best-performing criterion's
+    # default ('both').
+    "gwin75":      ["--use-gradients", "--gradient-window", "75", "--gradient-keep", "both"],
+    "gwin75_rec":  ["--use-gradients", "--gradient-window", "75", "--gradient-keep", "recent"],
+    "gwin75_best": ["--use-gradients", "--gradient-window", "75", "--gradient-keep", "best"],
+    "gwin150":     ["--use-gradients", "--gradient-window", "150", "--gradient-keep", "both"],
 }
 
 
@@ -91,7 +101,8 @@ def run(args):
 def analyze(args):
     import numpy as np
     import pandas as pd
-    cert = pd.read_csv(args.cert)
+    # Accept one or many per-seed cert CSVs (distributed SLURM run) and concat.
+    cert = pd.concat([pd.read_csv(c) for c in args.cert], ignore_index=True)
     cert["e_best_k"] = cert.e_best * KCAL
     cert["d"] = pd.to_numeric(cert.num_dihedrals, errors="coerce")
     # per trial: final e_best (kcal), total wall, per-step t_acq, energy-convergence
@@ -130,8 +141,9 @@ def analyze(args):
     print("\nreliability by d (fraction reaching best-of-arms minimum):")
     piv = df.pivot_table(index="d", columns="config", values="hit_best", aggfunc="mean")
     print(piv.round(2).to_string())
-    df.to_csv(Path(args.cert).with_name("acq_sweep_summary.csv"), index=False)
-    print(f"\nwrote {Path(args.cert).with_name('acq_sweep_summary.csv')}")
+    out_csv = Path(args.cert[0]).with_name("acq_sweep_summary.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"\nwrote {out_csv}")
     print("Read: an arm wins if reliability ~= base AND speedup > 1. acq* = constant "
           "speedup; hybrid* should help more at high d (cheaper posterior).")
 
@@ -155,15 +167,16 @@ def main():
     r.set_defaults(func=run)
 
     a = sub.add_parser("analyze", help="Per-arm speed vs quality")
-    a.add_argument("cert", type=Path, nargs="?", default=None,
-                   help="acq_sweep certificate CSV (<output stem>_cert.csv)")
+    a.add_argument("cert", type=Path, nargs="*", default=None,
+                   help="acq_sweep certificate CSV(s); pass several per-seed "
+                   "<stem>_cert.csv from a distributed run and they are concatenated")
     a.add_argument("--eps", type=float, default=0.5,
                    help="kcal/mol tolerance for convergence / reaching best-of-arms")
     a.set_defaults(func=analyze)
 
     args = p.parse_args()
-    if args.command == "analyze" and args.cert is None:
-        sys.exit("analyze needs the *_cert.csv path")
+    if args.command == "analyze" and not args.cert:
+        sys.exit("analyze needs at least one *_cert.csv path")
     args.func(args)
 
 

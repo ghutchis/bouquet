@@ -145,10 +145,17 @@ class TestComputeAutoSteps:
 class TestConstants:
     """Tests for module-level constants."""
 
-    def test_supported_methods(self):
-        """Test that supported methods are correctly defined."""
-        expected = {"ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff", "mmff", "uff"}
-        assert CalculatorFactory.SUPPORTED_METHODS == expected
+    def test_available_methods(self):
+        """available_methods() is the installed subset of the registry."""
+        from bouquet.calculator import _FULL_REGISTRY
+
+        avail = CalculatorFactory.available_methods()
+        assert isinstance(avail, tuple)
+        assert list(avail) == sorted(avail)  # stable, sorted
+        # every available method must be a registered one
+        assert set(avail) <= set(_FULL_REGISTRY)
+        # rdkit force fields have no optional deps, so they're always available
+        assert {"mmff", "uff"} <= set(avail)
 
     def test_auto_steps_thresholds_ordering(self):
         """Test that auto_steps thresholds are properly ordered."""

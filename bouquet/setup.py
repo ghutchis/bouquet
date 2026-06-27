@@ -53,6 +53,49 @@ def mol_to_ase_atoms(mol: Chem.Mol, conf_id: int = -1) -> Atoms:
     return atoms
 
 
+def apply_charge_spin(atoms: Atoms, charge: int, multiplicity: int) -> None:
+    """Stamp total charge and spin on an Atoms object, in place.
+
+    xtb's ASE calculator reads charge and the number of unpaired electrons from the
+    atoms (``get_initial_charges().sum()`` and ``get_initial_magnetic_moments().sum()``),
+    so charge/spin must live on the Atoms (psi4 instead takes them via its
+    constructor). These arrays are preserved across ``Atoms.copy()`` and relaxation,
+    so stamping the starting structure carries them into every evaluation.
+
+    ``charge`` is applied as the sum of per-atom initial charges (lumped onto the
+    first atom; only the sum matters to xtb), preserving any existing per-atom
+    formal charges only when they already match. ``multiplicity`` (2S+1) maps to
+    ``uhf = multiplicity - 1`` unpaired electrons, lumped likewise.
+    """
+    n = len(atoms)
+    if n == 0:
+        return
+    # Charge: keep the per-atom formal charges from mol_to_ase_atoms when they sum
+    # to the requested total; otherwise set a sum-correct array (lumped on atom 0).
+    if round(float(atoms.get_initial_charges().sum())) != int(charge):
+        q = [0.0] * n
+        q[0] = float(charge)
+        atoms.set_initial_charges(q)
+    atoms.info["charge"] = int(charge)
+    # Spin: uhf = multiplicity - 1 unpaired electrons (0 for a singlet -> no-op).
+    mag = [0.0] * n
+    mag[0] = float(multiplicity - 1)
+    atoms.set_initial_magnetic_moments(mag)
+
+
+def default_multiplicity(atoms: Atoms, charge: int = 0) -> int:
+    """Lowest-spin multiplicity consistent with the electron count.
+
+    The total electron count is ``sum(atomic numbers) - charge``. An odd electron
+    count cannot pair into a closed shell, so it defaults to a doublet (2);
+    an even count defaults to a singlet (1). This is only a sensible default for
+    the common case -- genuinely high-spin even-electron species (e.g. O2 triplet)
+    must be requested explicitly via ``--spin``.
+    """
+    electrons = int(atoms.get_atomic_numbers().sum()) - int(charge)
+    return 2 if electrons % 2 else 1
+
+
 def get_initial_structure(smiles: str, seed: int = 42) -> tuple[Atoms, Chem.Mol]:
     """Generate an initial guess for a molecular structure from SMILES.
 

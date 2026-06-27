@@ -1,111 +1,287 @@
-"""Factory for creating ASE calculators."""
+"""Factory for creating ASE calculators with capability detection.
 
-from typing import TYPE_CHECKING, Literal, Optional, get_args
+   If you want to add a new calculator, see
+   for example _ani() or _psi4_calculator().
+   And add it to _build_full_registry().
+"""
+
+import shutil
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from ase.calculators.calculator import Calculator
     from bouquet.config import Configuration
     from rdkit import Chem
 
-# Type alias for supported methods - this is the single source of truth
-# If you add new calculators below, update this list
-MethodType = Literal["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff", "mmff", "uff"]
-
-# Derive SUPPORTED_METHODS from MethodType for runtime checks
-SUPPORTED_METHODS: frozenset[str] = frozenset(get_args(MethodType))
-
-# Default number of threads (matches config.NUM_THREADS)
-# (currently only used for Psi4)
 _DEFAULT_NUM_THREADS = 4
 
 
-class CalculatorFactory:
-    """Factory for creating ASE calculators based on method name."""
+# ---- Metadata model ---------------------------------------------------------
 
-    # Class-level access to supported methods
-    SUPPORTED_METHODS = SUPPORTED_METHODS
+
+@dataclass(frozen=True)
+class MethodSpec:
+    builder: Callable[[Optional["Chem.Mol"], int, int, int], "Calculator"]
+    category: str
+    requires: Tuple[str, ...] = ()       # importable Python modules
+    executables: Tuple[str, ...] = ()    # CLI tools that must be on PATH (e.g. gcp)
+    description: str = ""
+
+
+# ---- Dependency checking ----------------------------------------------------
+
+
+def _module_available(module: str) -> bool:
+    try:
+        __import__(module)
+        return True
+    except Exception:
+        return False
+
+
+def _check_requirements(spec: MethodSpec) -> bool:
+    return all(_module_available(m) for m in spec.requires) and all(
+        shutil.which(exe) is not None for exe in spec.executables
+    )
+
+
+# ---- Helpers ----------------------------------------------------------------
+
+
+def _psi4_calculator(
+    method: str,
+    *,
+    basis: Optional[str],
+    num_threads: int,
+    charge: int,
+    multiplicity: int,
+) -> "Calculator":
+    try:
+        from ase.calculators.psi4 import Psi4
+    except ImportError as e:
+        raise RuntimeError("Psi4 is required for this method") from e
+
+    kwargs = dict(
+        method=method,
+        num_threads=num_threads,
+        charge=charge,
+        multiplicity=multiplicity,
+    )
+
+    if basis is not None:
+        kwargs["basis"] = basis
+
+    return Psi4(**kwargs)
+
+
+# ---- Builders ---------------------------------------------------------------
+
+
+def _ani(*_):
+    import torchani
+    return torchani.models.ANI2x().ase()
+
+
+def _xtb(method: str):
+    # xtb's ASE calculator takes neither charge nor spin in its constructor -- it
+    # reads them from each Atoms it evaluates (sum of initial charges / magnetic
+    # moments). So the builder ignores the charge/multiplicity args; those are
+    # stamped on the Atoms instead (see setup.apply_charge_spin).
+    def builder(*_):
+        from xtb.ase.calculator import XTB
+        return XTB(method=method)
+    return builder
+
+
+def _rdkit_mmff(mol, *_):
+    if mol is None:
+        raise ValueError("MMFF requires RDKit molecule")
+    from bouquet.calc_rdkit import RDKitMMFFCalculator
+    return RDKitMMFFCalculator(mol)
+
+
+def _rdkit_uff(mol, *_):
+    if mol is None:
+        raise ValueError("UFF requires RDKit molecule")
+    from bouquet.calc_rdkit import RDKitUFFCalculator
+    return RDKitUFFCalculator(mol)
+
+
+# ---- Full registry ----------------------------------------------------------
+
+
+def _build_full_registry() -> Dict[str, MethodSpec]:
+    return {
+        # ---- ML --------------------------------------------------------------
+        "ani": MethodSpec(
+            builder=_ani,
+            category="ml",
+            requires=("torchani",),
+            description="ANI-2x neural network potential",
+        ),
+
+        # ---- xTB -------------------------------------------------------------
+        "gfn2": MethodSpec(
+            builder=_xtb("GFN2xTB"),
+            category="semiempirical",
+            requires=("xtb.ase.calculator",),
+            description="GFN2-xTB tight-binding method",
+        ),
+        "gfn0": MethodSpec(
+            builder=_xtb("GFN0xTB"),
+            category="semiempirical",
+            requires=("xtb.ase.calculator",),
+            description="GFN0-xTB very fast tight-binding",
+        ),
+        "gfnff": MethodSpec(
+            builder=_xtb("gfnff"),
+            category="forcefield",
+            requires=("xtb.ase.calculator",),
+            description="GFN-FF force field",
+        ),
+
+        # ---- DFT -------------------------------------------------------------
+        "b3lyp": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "b3lyp-d4", basis="def2-svp",
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="dft",
+            requires=("ase.calculators.psi4",),
+            description="B3LYP with D4 dispersion",
+        ),
+        "wb97x": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "wb97x-d3bj", basis="def2-svp",
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="dft",
+            requires=("ase.calculators.psi4",),
+            description="ωB97X with D3(BJ) dispersion",
+        ),
+
+        # ---- Wavefunction ----------------------------------------------------
+        "mp2": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "df-mp2", basis="def2-tzvp",
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="wavefunction",
+            requires=("ase.calculators.psi4",),
+            description="Density-fitted MP2",
+        ),
+
+        # ---- 3c methods ------------------------------------------------------
+        # The -3c composites need psi4 plus the gCP and dispersion CLI tools
+        # (conda-forge: gcp-correction -> `gcp`; s-dftd3 -> `s-dftd3`; dftd4 ->
+        # `dftd4`). These are command-line programs, not importable modules, so
+        # they are checked via `executables` (shutil.which), not `requires`.
+        "hf3c": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "hf3c", basis=None,
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="qm-fast",
+            requires=("ase.calculators.psi4",),
+            executables=("gcp", "s-dftd3"),
+            description="HF-3c composite method",
+        ),
+        "b973c": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "b973c", basis=None,
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="qm-fast",
+            requires=("ase.calculators.psi4",),
+            executables=("gcp", "s-dftd3"),
+            description="B97-3c composite DFT",
+        ),
+        "r2scan3c": MethodSpec(
+            builder=lambda m, nt, q, mult: _psi4_calculator(
+                "r2scan3c", basis=None,
+                num_threads=nt, charge=q, multiplicity=mult
+            ),
+            category="qm-fast",
+            requires=("ase.calculators.psi4",),
+            executables=("gcp", "dftd4"),
+            description="r2SCAN-3c composite DFT",
+        ),
+
+        # ---- RDKit ----------------------------------------------------------
+        "mmff": MethodSpec(
+            builder=_rdkit_mmff,
+            category="forcefield",
+            requires=("rdkit",),
+            description="MMFF94 force field",
+        ),
+        "uff": MethodSpec(
+            builder=_rdkit_uff,
+            category="forcefield",
+            requires=("rdkit",),
+            description="Universal force field",
+        ),
+    }
+
+
+_FULL_REGISTRY = _build_full_registry()
+
+
+def _build_available_registry() -> Dict[str, MethodSpec]:
+    return {
+        name: spec
+        for name, spec in _FULL_REGISTRY.items()
+        if _check_requirements(spec)
+    }
+
+
+_REGISTRY = _build_available_registry()
+
+
+# Methods are registry-driven (not a fixed Literal), so the config field/type-hint
+# alias is just a str. The selectable set is CalculatorFactory.available_methods()
+# -- the installed subset of the registry.
+MethodType = str
+
+
+# ---- Factory ----------------------------------------------------------------
+
+
+class CalculatorFactory:
+    """Factory for creating ASE calculators with automatic capability detection."""
 
     @staticmethod
     def create(
-        method: MethodType,
+        method: str,
         mol: Optional["Chem.Mol"] = None,
         num_threads: int = _DEFAULT_NUM_THREADS,
         charge: int = 0,
         multiplicity: int = 1,
     ) -> "Calculator":
-        """Create an ASE-compatible calculator for the specified method.
-
-        Args:
-            method: The calculation method to use
-            mol: RDKit molecule (required for mmff/uff methods)
-            num_threads: Number of threads for calculations
-            charge: Molecular charge
-            multiplicity: Spin multiplicity
-
-        Returns:
-            An ASE Calculator instance
-
-        Raises:
-            ValueError: If the method is not recognized or mol is missing for RDKit methods
-        """
-        if method == "ani":
-            import torchani
-
-            return torchani.models.ANI2x().ase()
-
-        elif method == "gfn2":
-            from xtb.ase.calculator import XTB
-
-            return XTB(method="GFN2xTB")
-
-        elif method == "gfn0":
-            from xtb.ase.calculator import XTB
-
-            return XTB(method="GFN0xTB")
-
-        elif method == "gfnff":
-            from xtb.ase.calculator import XTB
-
-            return XTB(method="gfnff")
-
-        elif method == "b3lyp":
-            from ase.calculators.psi4 import Psi4
-
-            return Psi4(
-                method="b3lyp-D3MBJ2B",
-                basis="def2-svp",
-                num_threads=num_threads,
-                multiplicity=multiplicity,
-                charge=charge,
+        try:
+            spec = _REGISTRY[method]
+        except KeyError:
+            available = ", ".join(sorted(_REGISTRY))
+            raise ValueError(
+                f"Method '{method}' is not available. Available methods: {available}"
             )
 
-        elif method == "b97":
-            from ase.calculators.psi4 import Psi4
+        return spec.builder(mol, num_threads, charge, multiplicity)
 
-            return Psi4(
-                method="b97-d3bj",
-                basis="def2-svp",
-                num_threads=num_threads,
-                multiplicity=multiplicity,
-                charge=charge,
-            )
+    @classmethod
+    def available_methods(cls) -> Tuple[str, ...]:
+        return tuple(sorted(_REGISTRY))
 
-        elif method == "mmff":
-            from bouquet.calc_rdkit import RDKitMMFFCalculator
+    @classmethod
+    def describe_methods(cls) -> Dict[str, str]:
+        return {name: spec.description for name, spec in _REGISTRY.items()}
 
-            if mol is None:
-                raise ValueError("RDKit MMFF calculator: requires a molecule (mol)")
-            return RDKitMMFFCalculator(mol)
-
-        elif method == "uff":
-            from bouquet.calc_rdkit import RDKitUFFCalculator
-
-            if mol is None:
-                raise ValueError("RDKit UFF calculator: requires a molecule (mol)")
-            return RDKitUFFCalculator(mol)
-
-        else:
-            raise ValueError(f"Unrecognized calculation method: {method}")
+    @classmethod
+    def methods_by_category(cls) -> Dict[str, Tuple[str, ...]]:
+        out: Dict[str, list[str]] = {}
+        for name, spec in _REGISTRY.items():
+            out.setdefault(spec.category, []).append(name)
+        return {k: tuple(sorted(v)) for k, v in out.items()}
 
     @classmethod
     def from_config(
@@ -114,17 +290,6 @@ class CalculatorFactory:
         for_optimizer: bool = False,
         mol: Optional["Chem.Mol"] = None,
     ) -> "Calculator":
-        """Create a calculator from a Configuration object.
-
-        Args:
-            config: The configuration object
-            for_optimizer: If True, create the optimizer calculator;
-                          if False, create the energy calculator
-            mol: RDKit molecule (required for mmff/uff methods)
-
-        Returns:
-            An ASE Calculator instance
-        """
         method = config.optimizer_method if for_optimizer else config.energy_method
         return cls.create(
             method=method,

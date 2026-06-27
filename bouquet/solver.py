@@ -183,6 +183,10 @@ class OptimizationState:
     # Acquisition-optimizer effort (optimize_acqf); see Configuration.
     acq_num_restarts: int = ACQ_NUM_RESTARTS
     acq_raw_samples: int = ACQ_RAW_SAMPLES
+    # High-leverage gradient subset: keep gradients for only this many points
+    # (0 = all). gradient_keep = recent|best|both. See _restrict_gradient_mask.
+    gradient_window: int = 0
+    gradient_keep: str = "recent"
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
@@ -244,6 +248,34 @@ def _periodic_covar_module(num_dims: int) -> gpykernels.ScaleKernel:
     )
 
 
+def _restrict_gradient_mask(
+    mask: torch.Tensor, raw_y: torch.Tensor, window: int, mode: str
+) -> torch.Tensor:
+    """Keep gradients for only ``window`` high-leverage points (others stay
+    value-only), shrinking the augmented GP from n*(1+d) to n + window*d.
+
+    ``mode``: 'recent' (the last ``window`` gradient-valid points -- local
+    navigation at the search frontier), 'best' (the ``window`` lowest-energy --
+    refining the incumbent basin), or 'both' (half each, union). Points are
+    selected only among those already in ``mask`` (gradient-valid, clamp-inactive);
+    every point still contributes its value. No-op if <= window valid gradients."""
+    valid = torch.nonzero(mask, as_tuple=False).flatten()  # ascending obs order
+    if window <= 0 or valid.numel() <= window:
+        return mask
+    if mode == "recent":
+        sel = valid[-window:]
+    elif mode == "best":
+        sel = valid[torch.argsort(raw_y[valid])[:window]]
+    else:  # both: half lowest-energy + half most-recent, unioned
+        n_best = window // 2
+        best_sel = valid[torch.argsort(raw_y[valid])[:n_best]]
+        recent_sel = valid[-(window - n_best):]
+        sel = torch.unique(torch.cat([best_sel, recent_sel]))
+    new_mask = torch.zeros_like(mask)
+    new_mask[sel] = True
+    return new_mask
+
+
 def _fit_gradient_gp(
     train_x: torch.Tensor,
     train_y: torch.Tensor,
@@ -252,6 +284,8 @@ def _fit_gradient_gp(
     observed_gradients: torch.Tensor,
     y_std: torch.Tensor,
     frozen_hypers: dict | None = None,
+    gradient_window: int = 0,
+    gradient_keep: str = "recent",
 ) -> GradientEnhancedPeriodicGP:
     """Build and fit the gradient-enhanced periodic GP on standardized data.
 
@@ -285,6 +319,9 @@ def _fit_gradient_gp(
     clamp_inactive = raw_y <= energy_cap  # (n,)
     grad_valid = ~torch.isnan(grad).any(dim=1)  # (n,)
     mask = clamp_inactive & grad_valid
+    # High-leverage subset: optionally keep gradients for only a window of points
+    # (caps the augmented matrix at n + window*d -- the main high-d/late cost).
+    mask = _restrict_gradient_mask(mask, raw_y, gradient_window, gradient_keep)
     grad_scaled = torch.nan_to_num(grad_scaled, nan=0.0)
 
     gp = GradientEnhancedPeriodicGP(
@@ -412,6 +449,8 @@ def _select_next_points_botorch(
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     acq_num_restarts: int = ACQ_NUM_RESTARTS,
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
+    gradient_window: int = 0,
+    gradient_keep: str = "recent",
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -467,6 +506,7 @@ def _select_next_points_botorch(
             gp = _fit_gradient_gp(
                 train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
                 frozen_hypers=gp_frozen_hypers,
+                gradient_window=gradient_window, gradient_keep=gradient_keep,
             )
             # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
             # steps), so frozen condition-only steps don't clone them needlessly.
@@ -982,6 +1022,8 @@ def _run_optimization_loop(
             cert_betas=state.cert_betas,
             acq_num_restarts=state.acq_num_restarts,
             acq_raw_samples=state.acq_raw_samples,
+            gradient_window=state.gradient_window,
+            gradient_keep=state.gradient_keep,
         )
         t_select = time.perf_counter() - _t0
         if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
@@ -1332,6 +1374,8 @@ def run_optimization(
     grad_refit_every: int = 0,
     acq_num_restarts: int = ACQ_NUM_RESTARTS,
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
+    gradient_window: int = 0,
+    gradient_keep: str = "recent",
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     geom_log_path: Path | None = None,
@@ -1409,6 +1453,8 @@ def run_optimization(
     state.grad_refit_every = grad_refit_every
     state.acq_num_restarts = acq_num_restarts
     state.acq_raw_samples = acq_raw_samples
+    state.gradient_window = gradient_window
+    state.gradient_keep = gradient_keep
 
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
     # reference every later evaluation must preserve. The start is computed inside

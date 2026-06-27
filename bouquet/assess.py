@@ -1,4 +1,8 @@
-"""Tools for computing the energy of a molecule"""
+"""Tools for computing the energy of a molecule
+
+   Actual energy evaluation is done via the calculator.py module
+   (or calc_rdkit.py if using UFF and MMFF94 via RDKit)
+"""
 
 from __future__ import annotations
 
