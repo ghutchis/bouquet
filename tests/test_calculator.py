@@ -54,6 +54,20 @@ class TestCalculatorFactory:
             assert calc is not None
             mock_xtb_class.assert_called_once_with(method="gfnff")
 
+    def test_create_aimnet2_passes_charge(self):
+        """AIMNet2 is charge-aware: charge must reach the AIMNet2ASE constructor."""
+        mock_aimnet2_class = MagicMock()
+        mock_module = MagicMock()
+        mock_module.AIMNet2ASE = mock_aimnet2_class
+
+        with patch.dict(
+            "sys.modules",
+            {"aimnet.calculators": mock_module, "aimnet": MagicMock()},
+        ):
+            calc = CalculatorFactory.create("aimnet2", charge=-1)
+            assert calc is not None
+            mock_aimnet2_class.assert_called_once_with("aimnet2", charge=-1)
+
     def test_create_invalid_method(self):
         """Test that an unregistered/unavailable method raises ValueError."""
         with pytest.raises(ValueError, match="not available"):
@@ -150,5 +164,13 @@ class TestCalculatorFactoryIntegration:
         """Test creating a real ANI calculator."""
         pytest.importorskip("torchani")
         calc = CalculatorFactory.create("ani")
+        assert calc is not None
+        assert hasattr(calc, "get_potential_energy")
+
+    @pytest.mark.slow
+    def test_create_aimnet2_real(self):
+        """Test creating a real AIMNet2 calculator."""
+        pytest.importorskip("aimnet")
+        calc = CalculatorFactory.create("aimnet2")
         assert calc is not None
         assert hasattr(calc, "get_potential_energy")
