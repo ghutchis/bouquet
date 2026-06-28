@@ -5,11 +5,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Import MethodType and SUPPORTED_METHODS from calculator (single source of truth)
-from bouquet.calculator import MethodType, SUPPORTED_METHODS
+# Method names are registry-driven in calculator.py; MethodType is just the str
+# alias used for the energy/optimizer config field hints. The selectable set is
+# CalculatorFactory.available_methods() (the installed subset).
+from bouquet.calculator import MethodType
 
-# Re-export for backwards compatibility
-__all__ = ["MethodType", "SUPPORTED_METHODS", "Configuration"]
+__all__ = ["Configuration", "MethodType"]
 
 
 # Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation
@@ -155,6 +156,13 @@ class Configuration:
     # them trades search quality for speed (see scripts/acq_sweep / the timing study).
     acq_num_restarts: int = ACQ_NUM_RESTARTS
     acq_raw_samples: int = ACQ_RAW_SAMPLES
+    # High-leverage gradient subset (gradient GP): keep gradients for only this many
+    # points (0 = all), shrinking the augmented GP from n*(1+d) to n + window*d -- a
+    # high-d speedup that, unlike value-only-late, keeps gradients in the active
+    # region. gradient_keep selects which: recent | best | both. See
+    # solver._restrict_gradient_mask.
+    gradient_window: int = 0
+    gradient_keep: str = "recent"
     # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
     # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False

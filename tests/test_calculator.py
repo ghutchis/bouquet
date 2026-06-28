@@ -55,8 +55,8 @@ class TestCalculatorFactory:
             mock_xtb_class.assert_called_once_with(method="gfnff")
 
     def test_create_invalid_method(self):
-        """Test that invalid method raises ValueError."""
-        with pytest.raises(ValueError, match="Unrecognized calculation method"):
+        """Test that an unregistered/unavailable method raises ValueError."""
+        with pytest.raises(ValueError, match="not available"):
             CalculatorFactory.create("invalid_method")
 
     def test_from_config_energy_calculator(self, tmp_path):

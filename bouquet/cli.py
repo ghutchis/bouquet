@@ -34,6 +34,8 @@ from bouquet.io import (
     setup_logging,
 )
 from bouquet.setup import (
+    apply_charge_spin,
+    default_multiplicity,
     detect_dihedrals,
     get_conformers_from_file,
     get_initial_structure,
@@ -100,15 +102,32 @@ def main():
     )
     parser.add_argument(
         "--energy",
-        choices=sorted(CalculatorFactory.SUPPORTED_METHODS),
+        choices=CalculatorFactory.available_methods(),
         default=DEFAULT_ENERGY_METHOD,
-        help="Energy method",
+        help="Energy method (only methods whose dependencies are installed are listed)",
     )
     parser.add_argument(
         "--optimizer",
-        choices=sorted(CalculatorFactory.SUPPORTED_METHODS),
+        choices=CalculatorFactory.available_methods(),
         default=DEFAULT_OPTIMIZER_METHOD,
-        help="Optimizer method",
+        help="Optimizer method (only methods whose dependencies are installed are listed)",
+    )
+    parser.add_argument(
+        "--charge",
+        type=int,
+        default=None,
+        help="Total molecular charge. Default: the SMILES/structure's formal charge.",
+    )
+    parser.add_argument(
+        "--spin",
+        "--multiplicity",
+        dest="spin",
+        type=int,
+        default=None,
+        help="Spin multiplicity (2S+1). Default: the lowest spin consistent with "
+        "the electron count (singlet for an even number of electrons, doublet for "
+        "odd). Used by all calculators: psi4 via its constructor, xtb via "
+        "uhf=multiplicity-1 on the atoms.",
     )
     parser.add_argument(
         "--relax",
@@ -230,6 +249,21 @@ def main():
         help=f"optimize_acqf raw initialization samples (default {ACQ_RAW_SAMPLES}).",
     )
     parser.add_argument(
+        "--gradient-window",
+        type=int,
+        default=0,
+        help="Gradient GP: keep gradients for only this many high-leverage points "
+        "(0 = all). Shrinks the augmented GP to n + window*d -- a high-d speedup "
+        "that keeps gradients in the active region (unlike value-only-late).",
+    )
+    parser.add_argument(
+        "--gradient-keep",
+        choices=["recent", "best", "both"],
+        default="recent",
+        help="Which points keep gradients under --gradient-window: recent (search "
+        "frontier), best (lowest-energy basin), or both (half each). Default recent.",
+    )
+    parser.add_argument(
         "--retain-bonds",
         action="store_true",
         help="Reject any evaluated geometry whose covalent bond graph differs from "
@@ -239,6 +273,19 @@ def main():
         "reverts to the constrained best.",
     )
     args = parser.parse_args()
+
+    # Multiplicity (2S+1) must be a positive integer; anything <= 0 yields an
+    # invalid unpaired-electron count (uhf = multiplicity - 1) when stamped onto
+    # the atoms in apply_charge_spin. Reject it before touching any structure.
+    if args.spin is not None and args.spin < 1:
+        parser.error(f"--spin/--multiplicity must be a positive integer, got {args.spin}")
+
+    # Gradient window is a count of points to keep gradients for (0 = all); a
+    # negative value is meaningless and would corrupt the GP windowing logic.
+    if args.gradient_window < 0:
+        parser.error(
+            f"--gradient-window must be >= 0 (0 = all), got {args.gradient_window}"
+        )
 
     # Create configuration from parsed arguments
     config = Configuration(
@@ -271,6 +318,8 @@ def main():
         retain_bonds=args.retain_bonds,
         acq_num_restarts=args.acq_num_restarts,
         acq_raw_samples=args.acq_raw_samples,
+        gradient_window=args.gradient_window,
+        gradient_keep=args.gradient_keep,
     )
 
     # Gradient labels are only consistent with the energy objective when the
@@ -315,12 +364,21 @@ def main():
         init_atoms, mol = get_initial_structure(config.smiles, seed=config.seed)
     else:
         # this will just read the geometry from the file
-        # and parse using Pybel
         init_atoms, mol = get_initial_structure_from_file(str(config.input_file))
     logger.info(f"Determined initial structure with {len(init_atoms)} atoms")
 
-    # charge
-    config.charge = Chem.GetFormalCharge(mol)
+    # Charge + spin. Charge defaults to the molecule's formal charge (--charge
+    # overrides); multiplicity comes from --multiplicity. psi4 reads these from its
+    # constructor (CalculatorFactory.from_config -> config.charge/multiplicity);
+    # xtb reads them off the Atoms (sum of initial charges / magnetic moments), so
+    # stamp them here too -- they propagate through atoms.copy() into every
+    # evaluation. uhf = multiplicity - 1 (number of unpaired electrons).
+    config.charge = args.charge if args.charge is not None else Chem.GetFormalCharge(mol)
+    config.multiplicity = (
+        args.spin if args.spin is not None
+        else default_multiplicity(init_atoms, config.charge)
+    )
+    apply_charge_spin(init_atoms, config.charge, config.multiplicity)
 
     # Detect the dihedral angles
     dihedrals = detect_dihedrals(mol)
@@ -333,6 +391,9 @@ def main():
         logger.info(
             f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}"
         )
+        # Stamp charge/spin on conformer atoms too, so xtb reads them per-eval.
+        for conf in initial_conformers:
+            apply_charge_spin(conf, config.charge, config.multiplicity)
         # Validate that conformers have the same number of atoms
         for i, conf in enumerate(initial_conformers):
             if len(conf) != len(init_atoms):
@@ -441,6 +502,8 @@ def main():
         grad_refit_every=config.grad_refit_every,
         acq_num_restarts=config.acq_num_restarts,
         acq_raw_samples=config.acq_raw_samples,
+        gradient_window=config.gradient_window,
+        gradient_keep=config.gradient_keep,
         cert_log_path=config.certificate_log,
         cert_betas=config.certificate_betas,
         geom_log_path=config.geometry_log,

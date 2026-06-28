@@ -44,8 +44,11 @@ from typing import Dict, List, Optional, Tuple
 # Reuse the log parser from batch.py (same directory).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from batch import parse_log_output  # noqa: E402
+from bouquet.calculator import CalculatorFactory  # noqa: E402
 
-ENERGY_CHOICES = ["ani", "b3lyp", "b97", "gfn0", "gfn2", "gfnff"]
+# Energy/optimizer choices come from the calculator registry (installed subset),
+# so they track new methods automatically and never offer an unavailable one.
+ENERGY_CHOICES = list(CalculatorFactory.available_methods())
 PRIORS_FILE_DEFAULT = "gfn2_priors.json"
 
 # Tidy summary-CSV columns.
@@ -331,6 +334,47 @@ def predict_bo_budget(smiles: str) -> Optional[int]:
         return cfg.compute_auto_steps(d, cfg.init_steps)
     except Exception:
         return None
+
+
+def dihedral_count(smiles: str) -> Optional[int]:
+    """Number of rotatable dihedrals bouquet detects for ``smiles`` (None if it
+    can't be computed -- bad SMILES, import failure -- so callers can decline to
+    skip and just run it).
+
+    Uses bouquet's own ``detect_dihedrals`` so the count matches what the CLI
+    sees under ``--auto``. Imported lazily so the analyze/traj paths never pay the
+    rdkit import.
+    """
+    try:
+        from rdkit import Chem
+        from bouquet.setup import detect_dihedrals
+    except ImportError:
+        return None
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return len(detect_dihedrals(Chem.AddHs(mol)))
+
+
+def max_dihedral_skip(max_dihedrals: Optional[int]):
+    """Build a ``mol_skip_fn`` (for ``run_sweep``) dropping molecules with more
+    than ``max_dihedrals`` rotatable dihedrals; returns None when the cap is None
+    (skip nothing). A molecule whose count can't be determined is kept and run.
+
+    ``run_sweep`` memoizes the predicate by molecule name, so the dihedral
+    detection runs once per molecule regardless of seeds/configs.
+    """
+    if max_dihedrals is None:
+        return None
+    if max_dihedrals < 0:
+        raise ValueError("max_dihedrals must be >= 0")
+
+    def skip(smiles: str, name: str) -> bool:
+        d = dihedral_count(smiles)
+        return d is not None and d > max_dihedrals
+
+    return skip
 
 
 def _flag_int(extra_args: List[str], flag: str) -> Optional[int]:
