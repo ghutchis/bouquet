@@ -259,9 +259,9 @@ def select_initial_structure(
             best_atoms, best_energy = cand, energy
 
     if best_atoms is None:
-        # Every candidate failed to evaluate; fall back to the first.
-        logger.warning("All initial candidates failed to evaluate; using the first")
-        return candidates[0], float("nan")
+        raise RuntimeError(
+            f"Energy evaluation failed for all {len(candidates)} initial candidates"
+        ) from last_error
 
     logger.info(
         f"Selected lowest-energy initial structure from {len(candidates)} "

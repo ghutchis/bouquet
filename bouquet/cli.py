@@ -376,8 +376,11 @@ def main():
         # flexibility) and pick the lowest-energy one below -- this is the only
         # way to sample distinct ring puckers, since the BO loop perturbs
         # rotatable dihedrals only, never ring bonds.
+        candidate_cap = (
+            1 if config.conformer_file is not None else config.init_conformer_cap
+        )
         candidates, mol = get_initial_candidates(
-            config.smiles, seed=config.seed, max_confs=config.init_conformer_cap
+            config.smiles, seed=config.seed, max_confs=candidate_cap
         )
     else:
         # this will just read the geometry from the file (single candidate)
