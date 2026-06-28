@@ -652,13 +652,13 @@ def _setup_initial_state(
         start_energy=start_energy,
         init_steps=0,
         observed_coords=torch.tensor(
-            [start_coords], dtype=torch.float64, device=device
+            np.asarray([start_coords]), dtype=torch.float64, device=device
         ),
         observed_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
         # Start-point gradient (real dE/dtheta when use_gradients, else NaN),
         # index-aligned with the energy/coord tensors.
         observed_gradients=torch.tensor(
-            [start_gradient], dtype=torch.float64, device=device
+            np.asarray([start_gradient]), dtype=torch.float64, device=device
         ),
         use_gradients=use_gradients,
         device=device,

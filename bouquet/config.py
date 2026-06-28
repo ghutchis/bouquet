@@ -79,6 +79,12 @@ DEFAULT_INIT_METHOD = "random"
 # Maximum systematic peak-grid size for --init-method peaks before falling back
 # to weighted sampling (e.g. 3 modes x 3 dihedrals = 27 fits; x4 = 81 does not).
 DEFAULT_INIT_GRID_BUDGET = 64
+# Upper bound on the number of ETKDG embeddings generated and scored (with the
+# energy calculator) when picking the initial 3D structure from SMILES. The
+# actual count scales with ring flexibility (see setup.num_initial_embeddings);
+# this caps the cost on highly flexible polycyclic systems. 1 disables the
+# multi-embedding search and restores the single-conformer behavior.
+DEFAULT_INIT_CONFORMER_CAP = 16
 
 # Prior (PiBO) defaults. The exponent weights the prior against logEI in the
 # additive PiBO objective. Since priors.DihedralPriorModule.forward now *averages*
@@ -148,6 +154,7 @@ class Configuration:
     init_steps: int = DEFAULT_INIT_STEPS
     init_method: str = DEFAULT_INIT_METHOD
     init_grid_budget: int = DEFAULT_INIT_GRID_BUDGET
+    init_conformer_cap: int = DEFAULT_INIT_CONFORMER_CAP
     auto_steps: bool = False
     relax: bool = True
     # Acquisition-optimizer effort (optimize_acqf). num_restarts L-BFGS runs seeded
