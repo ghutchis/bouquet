@@ -92,6 +92,15 @@ def _ani(*_):
     return torchani.models.ANI2x().ase()
 
 
+def _aimnet2(mol, num_threads, charge, multiplicity):
+    # AIMNet2's ASE calculator takes the total charge in its constructor (it is a
+    # charge-aware potential). Spin/multiplicity is not part of the documented
+    # AIMNet2ASE API, so only charge is passed; the charge stamped on the Atoms by
+    # setup.apply_charge_spin is redundant here but harmless.
+    from aimnet.calculators import AIMNet2ASE
+    return AIMNet2ASE("aimnet2", charge=charge)
+
+
 def _xtb(method: str):
     # xtb's ASE calculator takes neither charge nor spin in its constructor -- it
     # reads them from each Atoms it evaluates (sum of initial charges / magnetic
@@ -128,6 +137,12 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             category="ml",
             requires=("torchani",),
             description="ANI-2x neural network potential",
+        ),
+        "aimnet2": MethodSpec(
+            builder=_aimnet2,
+            category="ml",
+            requires=("aimnet.calculators",),
+            description="AIMNet2 neural network potential",
         ),
 
         # ---- xTB -------------------------------------------------------------

@@ -70,7 +70,7 @@ Call `bouquet --help` for the full list. The most useful flags:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--energy` | `gfn2` | Energy method (`ani`, `b3lyp`, `b97`, `gfn0`, `gfn2`, `gfnff`, `mmff`, `uff`) |
+| `--energy` | `gfn2` | Energy method (`aimnet2`, `ani`, `b3lyp`, `b97`, `gfn0`, `gfn2`, `gfnff`, `mmff`, `uff`) |
 | `--optimizer` | `gfnff` | Method used for geometry relaxation |
 | `--relax` | off | Relax non-dihedral degrees of freedom before scoring each energy |
 | `--ensemble` | off | Select a Boltzmann ensemble of low-energy conformers, tightly optimize them, and write `ensemble_final.xyz` + `ensemble.csv` |

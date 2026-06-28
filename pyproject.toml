@@ -45,7 +45,8 @@ dependencies = [
 
 [project.optional-dependencies]
 ani = ["torchani"]
-all = ["torchani"]
+aimnet = ["aimnet[ase]"]
+all = ["torchani","aimnet[ase]","irmsd>=0.1.1"]
 test = ["pytest>=9.0", "pytest-cov>=7.0"]
 # Rotation/permutation-invariant RMSD for ensemble dedup. Optional because it
 # only ships wheels for some platforms (macOS 15+ arm64, manylinux x86_64; no

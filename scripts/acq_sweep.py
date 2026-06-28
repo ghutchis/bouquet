@@ -56,6 +56,23 @@ CONFIGS = {
     "gwin75_rec":  ["--use-gradients", "--gradient-window", "75", "--gradient-keep", "recent"],
     "gwin75_best": ["--use-gradients", "--gradient-window", "75", "--gradient-keep", "best"],
     "gwin150":     ["--use-gradients", "--gradient-window", "150", "--gradient-keep", "both"],
+    # Round 2 finalists (matched/paired analysis 2026-06-28): acq32 was quality-
+    # neutral vs base, acq8 a real regression -> acq24 probes the 16->32 sweet spot;
+    # gwin150 was quality-neutral, gwin100 fills the window axis below it. The acqN_gwinM
+    # arms test whether the two ORTHOGONAL levers STACK (acq restart-count speed +
+    # wide-window high-d quality) -- the production-default candidate. base is the
+    # paired reference; run e.g. --arms base,acq24,acq32,gwin100,gwin150,acq24_gwin100,
+    # acq24_gwin150,acq32_gwin100,acq32_gwin150.
+    "acq24":         ["--use-gradients", "--acq-num-restarts", "24", "--acq-raw-samples", "24"],
+    "gwin100":       ["--use-gradients", "--gradient-window", "100", "--gradient-keep", "both"],
+    "acq24_gwin100": ["--use-gradients", "--acq-num-restarts", "24", "--acq-raw-samples", "24",
+                      "--gradient-window", "100", "--gradient-keep", "both"],
+    "acq24_gwin150": ["--use-gradients", "--acq-num-restarts", "24", "--acq-raw-samples", "24",
+                      "--gradient-window", "150", "--gradient-keep", "both"],
+    "acq32_gwin100": ["--use-gradients", "--acq-num-restarts", "32", "--acq-raw-samples", "32",
+                      "--gradient-window", "100", "--gradient-keep", "both"],
+    "acq32_gwin150": ["--use-gradients", "--acq-num-restarts", "32", "--acq-raw-samples", "32",
+                      "--gradient-window", "150", "--gradient-keep", "both"],
 }
 
 
@@ -98,7 +115,13 @@ def run(args):
     sc.run_sweep(args, configs, num_steps_fn=num_steps_fn, mol_skip_fn=mol_skip_fn)
 
 
-def analyze(args):
+def _per_trial(args):
+    """Concat per-seed cert CSVs and reduce to one row per (config, name, seed).
+
+    `censored` (per-trial constant in the cert) flags trials that hit the wall
+    clock before finishing; downstream analyses can drop them so an arm's quality
+    is not judged on its truncated, timed-out trajectories.
+    """
     import numpy as np
     import pandas as pd
     # Accept one or many per-seed cert CSVs (distributed SLURM run) and concat.
@@ -119,8 +142,13 @@ def analyze(args):
             "final_eb": fin, "wall_s": g.wall_s.max(),
             "t_acq_step": g.t_acq.mean() if "t_acq" in g else np.nan,
             "n_converge": int(hit.iloc[0]) if len(hit) else int(g.n_calls.max()),
+            "censored": bool(g.censored.iloc[-1]) if "censored" in g else False,
         })
-    df = pd.DataFrame(per)
+    return pd.DataFrame(per)
+
+
+def analyze(args):
+    df = _per_trial(args)
     # cross-arm reference: best final_eb per molecule over all arms
     best = df.groupby("name").final_eb.min().rename("best_eb")
     df = df.merge(best, on="name")
@@ -146,6 +174,71 @@ def analyze(args):
     print(f"\nwrote {out_csv}")
     print("Read: an arm wins if reliability ~= base AND speedup > 1. acq* = constant "
           "speedup; hybrid* should help more at high d (cheaper posterior).")
+
+
+def paired(args):
+    """Fair head-to-head vs base on the molecules every arm actually finished.
+
+    The arms ran unequal molecule sets (the slow ones get censored more often on
+    `base`), so the plain `analyze` reliability/best-of-arms mixes different
+    denominators. Here we (1) drop censored trials, (2) keep the matched set of
+    (name, seed) trials finished by ALL arms for an apples-to-apples table, and
+    (3) compare every arm to base on the trials they BOTH finished (paired by
+    (name, seed)): median paired speedup, median energy gap, win/tie/loss at
+    --eps, and a two-sided sign test on wins-vs-losses.
+    """
+    import numpy as np
+    from scipy.stats import binomtest
+
+    df = _per_trial(args)
+    arms = sorted(df.config.unique())
+    fin = df[~df.censored].copy()
+    fin["key"] = list(zip(fin.name, fin.seed))
+
+    print(f"acq_sweep paired: arms {arms}, eps={args.eps} kcal\n")
+    print("finished (uncensored) trials per arm:")
+    for a in arms:
+        print(f"  {a:12s} finished {int((fin.config == a).sum()):4d} / "
+              f"{int((df.config == a).sum()):4d}")
+
+    # (2) matched set: (name, seed) finished by every arm -> apples-to-apples table
+    cnt = fin.groupby("key").config.nunique()
+    common = set(cnt[cnt == len(arms)].index)
+    m = fin[fin.key.isin(common)].copy()
+    best = m.groupby("name").final_eb.min().rename("best_eb")
+    m = m.merge(best, on="name")
+    m["hit_best"] = m.final_eb <= m.best_eb + args.eps
+    base_wall = m[m.config == BASELINE].set_index("key").wall_s
+    print(f"\n=== matched set (finished by ALL {len(arms)} arms): {len(common)} trials, "
+          f"{len({k[0] for k in common})} molecules ===")
+    print(f"{'arm':12s} {'reliab':>7s} {'med wall(s)':>11s} {'t_acq/step':>11s} {'speedup':>8s}")
+    for cfg, g in m.groupby("config"):
+        sp = np.nanmedian(base_wall.reindex(g.key).values / g.wall_s.values)
+        print(f"{cfg:12s} {g.hit_best.mean():7.2f} {g.wall_s.median():11.0f} "
+              f"{g.t_acq_step.mean():11.3f} {sp:7.2f}x")
+
+    # (3) paired vs base on the trials each arm and base BOTH finished
+    base = fin[fin.config == BASELINE].set_index("key")
+    print("\n=== paired vs base (trials both finished) ===")
+    print(f"{'arm':12s} {'npair':>5s} {'speedup':>8s} {'dEb_med':>8s} "
+          f"{'win':>4s} {'tie':>4s} {'loss':>4s} {'reachBase':>9s} {'sign_p':>7s}")
+    for cfg in arms:
+        if cfg == BASELINE:
+            continue
+        g = fin[fin.config == cfg].set_index("key")
+        keys = g.index.intersection(base.index)
+        a, b = g.loc[keys], base.loc[keys]
+        delta = a.final_eb.values - b.final_eb.values   # <0 => arm finds lower E
+        win = int((delta < -args.eps).sum())
+        loss = int((delta > args.eps).sum())
+        tie = int((np.abs(delta) <= args.eps).sum())
+        reach = float((delta <= args.eps).mean()) if len(keys) else float("nan")
+        sp = np.nanmedian(b.wall_s.values / a.wall_s.values)
+        p = binomtest(win, win + loss).pvalue if (win + loss) else float("nan")
+        print(f"{cfg:12s} {len(keys):5d} {sp:7.2f}x {np.median(delta):8.3f} "
+              f"{win:4d} {tie:4d} {loss:4d} {reach:9.2f} {p:7.3f}")
+    print("\nRead: dEb_med<0 => arm reaches lower energy than base; reachBase = frac "
+          "within eps of base or better; sign_p<0.05 => quality differs from base.")
 
 
 def main():
@@ -174,9 +267,17 @@ def main():
                    help="kcal/mol tolerance for convergence / reaching best-of-arms")
     a.set_defaults(func=analyze)
 
+    pr = sub.add_parser("paired", help="Matched-set + paired-vs-base comparison "
+                        "(drops censored trials; controls for unequal molecule sets)")
+    pr.add_argument("cert", type=Path, nargs="*", default=None,
+                    help="same <stem>_cert.csv path(s) as analyze")
+    pr.add_argument("--eps", type=float, default=0.5,
+                    help="kcal/mol tolerance for win/tie/loss vs base")
+    pr.set_defaults(func=paired)
+
     args = p.parse_args()
-    if args.command == "analyze" and not args.cert:
-        sys.exit("analyze needs at least one *_cert.csv path")
+    if args.command in ("analyze", "paired") and not args.cert:
+        sys.exit(f"{args.command} needs at least one *_cert.csv path")
     args.func(args)
 
 
