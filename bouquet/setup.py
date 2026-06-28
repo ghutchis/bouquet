@@ -15,13 +15,16 @@ __lazy_modules__ = [
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import networkx as nx
 from ase import Atoms
 from ase.io import read
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds
+
+if TYPE_CHECKING:
+    from bouquet.calculator import Calculator
 
 logger = logging.getLogger(__name__)
 
@@ -110,40 +113,161 @@ def get_initial_structure(smiles: str, seed: int = 42) -> tuple[Atoms, Chem.Mol]
     Returns:
         Tuple of (ASE Atoms object, RDKit Mol object)
     """
+    # A single embedding is just the multi-embedding path with the cap pinned to
+    # one (see get_initial_candidates), so delegate to keep one embed/optimize
+    # implementation.
+    candidates, mol = get_initial_candidates(smiles, seed=seed, max_confs=1)
+    return candidates[0], mol
+
+
+def count_flexible_ring_atoms(mol: Chem.Mol) -> int:
+    """Count sp3 atoms that sit in a non-aromatic ring.
+
+    These atoms carry the ring-puckering degrees of freedom that the BO loop
+    never explores (it perturbs rotatable dihedrals only, never ring bonds), so
+    they are the right proxy for how many distinct ETKDG embeddings are worth
+    generating: a rigid or fully aromatic molecule has none, while saturated
+    mono-/poly-cyclic systems have several. Aromatic / sp2 ring atoms (planar,
+    no pucker) and acyclic atoms are excluded.
+
+    Args:
+        mol: RDKit molecule (hydrogens may or may not be present; only heavy
+            ring atoms can match).
+
+    Returns:
+        Number of sp3 non-aromatic ring atoms.
+    """
+    return sum(
+        1
+        for atom in mol.GetAtoms()
+        if atom.IsInRing()
+        and not atom.GetIsAromatic()
+        and atom.GetHybridization() == Chem.HybridizationType.SP3
+    )
+
+
+def num_initial_embeddings(mol: Chem.Mol, cap: int) -> int:
+    """Number of ETKDG embeddings to try for the initial structure.
+
+    Scales with ring flexibility -- one embedding per flexible ring atom plus a
+    baseline embedding -- and is clamped to ``[1, cap]``. A ``cap`` <= 1 forces
+    the single embedding used historically.
+
+    Args:
+        mol: RDKit molecule to inspect for ring flexibility.
+        cap: Upper bound on the embedding count.
+
+    Returns:
+        Embedding count in ``[1, cap]``.
+    """
+    if cap <= 1:
+        return 1
+    return max(1, min(cap, 1 + count_flexible_ring_atoms(mol)))
+
+
+def get_initial_candidates(
+    smiles: str, seed: int = 42, max_confs: int = 16
+) -> tuple[list[Atoms], Chem.Mol]:
+    """Generate several ETKDG conformers as initial-structure candidates.
+
+    The number of embeddings scales with ring flexibility (see
+    :func:`num_initial_embeddings`), capped at ``max_confs``; every conformer is
+    MMFF94-optimized (UFF fallback). Because the BO loop perturbs rotatable
+    dihedrals only, these embeddings are the main way to sample distinct ring
+    puckers, and scoring them with the run's energy calculator lets the caller
+    start from the lowest-energy basin rather than a seed-dependent one.
+
+    Args:
+        smiles: SMILES string.
+        seed: ETKDG random seed (the run seed, so different seeds explore
+            different embeddings).
+        max_confs: Upper bound on the number of conformers to generate.
+
+    Returns:
+        Tuple of (list of ASE Atoms, one per generated conformer, in conformer
+        order) and the RDKit Mol carrying every embedded conformer.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Could not parse SMILES: {smiles}")
-
-    # Add hydrogens
     mol = Chem.AddHs(mol)
 
-    # Generate 3D coordinates using ETKDG (seed-dependent, so multi-seed runs
-    # sample distinct ring conformations -- see the seed docstring above).
+    n_confs = num_initial_embeddings(mol, max_confs)
+
+    # ETKDG embedding (seed-dependent). EmbedMultipleConfs returns the IDs of the
+    # conformers it managed to embed (may be fewer than requested).
     params = AllChem.ETKDGv3()
     params.randomSeed = seed
-    embed_result = AllChem.EmbedMolecule(mol, params)
+    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=params))
 
-    if embed_result == -1:
-        # Embedding failed, try with random coordinates
+    if not conf_ids:
         logger.warning("ETKDG embedding failed, trying with random coordinates")
-        fallback = AllChem.EmbedParameters()
+        fallback = AllChem.ETKDGv3()
         fallback.randomSeed = seed
-        AllChem.EmbedMolecule(mol, fallback)
+        fallback.useRandomCoords = True
+        conf_ids = list(
+            AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=fallback)
+        )
 
     if mol.GetNumConformers() == 0:
         raise ValueError(f"Could not generate 3D coordinates for: {smiles}")
 
-    # Optimize with MMFF94
+    # Optimize each conformer with MMFF94 (UFF fallback for unparameterized atoms).
     try:
-        mmff_result = AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
-        if mmff_result == -1:
-            logger.warning("MMFF optimization failed, trying UFF")
-            AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+        results = AllChem.MMFFOptimizeMoleculeConfs(mol, maxIters=200)
+        if any(rc == -1 for rc, _ in results):
+            logger.warning("MMFF optimization failed for a conformer, trying UFF")
+            AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=200)
     except Exception as e:
         logger.warning(f"Force field optimization failed: {e}")
 
-    atoms = mol_to_ase_atoms(mol)
-    return atoms, mol
+    candidates = [mol_to_ase_atoms(mol, conf_id=cid) for cid in conf_ids]
+    return candidates, mol
+
+
+def select_initial_structure(
+    candidates: list[Atoms], calc: Calculator
+) -> tuple[Atoms, float]:
+    """Pick the lowest single-point-energy structure from a candidate list.
+
+    Used to choose the starting geometry among the ETKDG embeddings from
+    :func:`get_initial_candidates`. A single candidate is returned unscored.
+    Scoring is a single-point energy (no relaxation), so it stays cheap relative
+    to the BO loop. Candidates whose energy evaluation raises are skipped.
+
+    Args:
+        candidates: Candidate structures (at least one), e.g. from
+            get_initial_candidates; charge/spin should already be stamped.
+        calc: Energy calculator used for the single-point scoring.
+
+    Returns:
+        Tuple of (chosen Atoms, its energy in eV). When only one candidate is
+        supplied its energy is ``nan`` (it is not evaluated).
+    """
+    if len(candidates) == 1:
+        return candidates[0], float("nan")
+
+    best_atoms, best_energy = None, float("inf")
+    for i, cand in enumerate(candidates):
+        try:
+            energy = calc.get_potential_energy(cand)
+        except Exception as e:
+            logger.warning(f"Energy evaluation failed for candidate {i}: {e}")
+            continue
+        logger.info(f"Initial candidate {i}: {energy:.6f} eV")
+        if energy < best_energy:
+            best_atoms, best_energy = cand, energy
+
+    if best_atoms is None:
+        raise RuntimeError(
+            f"Energy evaluation failed for all {len(candidates)} initial candidates"
+        ) from last_error
+
+    logger.info(
+        f"Selected lowest-energy initial structure from {len(candidates)} "
+        f"ETKDG embeddings ({best_energy:.6f} eV)"
+    )
+    return best_atoms, best_energy
 
 
 def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:

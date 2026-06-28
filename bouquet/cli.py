@@ -12,6 +12,7 @@ from bouquet.config import (
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
     DEFAULT_ENERGY_METHOD,
+    DEFAULT_INIT_CONFORMER_CAP,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
     DEFAULT_INIT_STEPS,
@@ -38,8 +39,9 @@ from bouquet.setup import (
     default_multiplicity,
     detect_dihedrals,
     get_conformers_from_file,
-    get_initial_structure,
+    get_initial_candidates,
     get_initial_structure_from_file,
+    select_initial_structure,
 )
 from bouquet.solver import plan_initial_points, run_optimization
 
@@ -99,6 +101,16 @@ def main():
         default=DEFAULT_INIT_GRID_BUDGET,
         help="Maximum systematic peak-grid size for --init-method peaks before "
         "falling back to weighted sampling of --init-steps points.",
+    )
+    parser.add_argument(
+        "--init-conformers",
+        type=int,
+        default=DEFAULT_INIT_CONFORMER_CAP,
+        help="Maximum number of ETKDG embeddings to generate from SMILES and "
+        "score with the energy method, keeping the lowest-energy one as the "
+        "starting structure. The actual count scales with ring flexibility; 1 "
+        "disables the search (single embedding). Ignored for file/conformer "
+        "input.",
     )
     parser.add_argument(
         "--energy",
@@ -299,6 +311,7 @@ def main():
         init_steps=args.init_steps,
         init_method=args.init_method,
         init_grid_budget=args.init_grid_budget,
+        init_conformer_cap=args.init_conformers,
         auto_steps=args.auto,
         relax=args.relax,
         use_gradients=args.use_gradients,
@@ -359,26 +372,45 @@ def main():
     if config.input_file is None:
         # this will do some initial cleanup from the SMILES string. Seed the ETKDG
         # embedding from the run seed so different seeds start from different 3D
-        # geometries -- the only way multi-seed runs sample distinct ring puckers
-        # (the BO loop perturbs rotatable dihedrals only, never ring bonds).
-        init_atoms, mol = get_initial_structure(config.smiles, seed=config.seed)
+        # geometries. We generate several embeddings (count scales with ring
+        # flexibility) and pick the lowest-energy one below -- this is the only
+        # way to sample distinct ring puckers, since the BO loop perturbs
+        # rotatable dihedrals only, never ring bonds.
+        candidate_cap = (
+            1 if config.conformer_file is not None else config.init_conformer_cap
+        )
+        candidates, mol = get_initial_candidates(
+            config.smiles, seed=config.seed, max_confs=candidate_cap
+        )
     else:
-        # this will just read the geometry from the file
+        # this will just read the geometry from the file (single candidate)
         init_atoms, mol = get_initial_structure_from_file(str(config.input_file))
-    logger.info(f"Determined initial structure with {len(init_atoms)} atoms")
+        candidates = [init_atoms]
+    logger.info(f"Determined initial structure with {len(candidates[0])} atoms")
 
     # Charge + spin. Charge defaults to the molecule's formal charge (--charge
     # overrides); multiplicity comes from --multiplicity. psi4 reads these from its
     # constructor (CalculatorFactory.from_config -> config.charge/multiplicity);
     # xtb reads them off the Atoms (sum of initial charges / magnetic moments), so
     # stamp them here too -- they propagate through atoms.copy() into every
-    # evaluation. uhf = multiplicity - 1 (number of unpaired electrons).
+    # evaluation. uhf = multiplicity - 1 (number of unpaired electrons). Stamp
+    # every candidate so the calculator reads the right state when scoring them
+    # (all candidates share composition, so the multiplicity is the same).
     config.charge = args.charge if args.charge is not None else Chem.GetFormalCharge(mol)
     config.multiplicity = (
         args.spin if args.spin is not None
-        else default_multiplicity(init_atoms, config.charge)
+        else default_multiplicity(candidates[0], config.charge)
     )
-    apply_charge_spin(init_atoms, config.charge, config.multiplicity)
+    for cand in candidates:
+        apply_charge_spin(cand, config.charge, config.multiplicity)
+
+    # Energy calculator, built early so we can score the initial-structure
+    # candidates with the run's energy method (relaxCalc is built later, just
+    # before the BO loop, since scoring needs single-point energies only).
+    calc = CalculatorFactory.from_config(config, for_optimizer=False, mol=mol)
+
+    # Pick the lowest-energy ETKDG embedding as the starting structure.
+    init_atoms, _ = select_initial_structure(candidates, calc)
 
     # Detect the dihedral angles
     dihedrals = detect_dihedrals(mol)
@@ -476,8 +508,8 @@ def main():
     # Save the initial guess
     save_structure(out_dir, init_atoms, "initial.xyz")
 
-    # Create calculators using the factory
-    calc = CalculatorFactory.from_config(config, for_optimizer=False, mol=mol)
+    # Optimizer calculator for the BO relaxations (the energy calc was built
+    # earlier to score the initial-structure candidates).
     relaxCalc = CalculatorFactory.from_config(config, for_optimizer=True, mol=mol)
 
     result = run_optimization(

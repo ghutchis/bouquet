@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bouquet.setup import (
     get_initial_structure,
     get_initial_structure_from_file,
+    get_initial_candidates,
+    count_flexible_ring_atoms,
+    num_initial_embeddings,
     get_conformers_from_file,
     detect_dihedrals,
     get_bonding_graph,
@@ -243,6 +246,64 @@ def test_charge_handling():
     print("  ✓ Charge handling test passed\n")
 
 
+def test_flexible_ring_atoms():
+    """Test the ring-flexibility heuristic that sizes the embedding search"""
+    print("=" * 60)
+    print("Test 8: Flexible ring-atom count and embedding count")
+    print("=" * 60)
+
+    from rdkit import Chem
+
+    # (SMILES, expected flexible sp3 non-aromatic ring atoms)
+    cases = [
+        ("CC", 0),            # acyclic -> no ring flexibility
+        ("c1ccccc1", 0),      # aromatic ring -> planar, no pucker
+        ("C1CCCCC1", 6),      # cyclohexane -> 6 sp3 ring atoms
+        ("CC1CCCCC1", 6),     # methylcyclohexane -> ring atoms only (methyl acyclic)
+        ("C1CCC2CCCCC2C1", 10),  # decalin -> fused saturated rings
+    ]
+    for smiles, expected in cases:
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        n_flex = count_flexible_ring_atoms(mol)
+        print(f"  {smiles:18}: {n_flex} flexible ring atoms (expected {expected})")
+        assert n_flex == expected, f"flexible ring atoms mismatch for {smiles}"
+
+    # Embedding count scales with flexibility (baseline + one per flex atom),
+    # clamped to [1, cap]; a cap <= 1 forces a single embedding.
+    rigid = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    flexible = Chem.AddHs(Chem.MolFromSmiles("C1CCCCC1"))
+    assert num_initial_embeddings(rigid, cap=16) == 1, "rigid molecule -> 1 embedding"
+    assert num_initial_embeddings(flexible, cap=16) == 7, "cyclohexane -> 1 + 6"
+    assert num_initial_embeddings(flexible, cap=4) == 4, "cap should clamp the count"
+    assert num_initial_embeddings(flexible, cap=1) == 1, "cap <= 1 disables search"
+    print("  ✓ Flexible ring-atom heuristic test passed\n")
+
+
+def test_initial_candidates():
+    """Test multi-conformer candidate generation from SMILES"""
+    print("=" * 60)
+    print("Test 9: Initial candidate generation")
+    print("=" * 60)
+
+    # Flexible ring -> several candidates, all with the same atom count.
+    candidates, mol = get_initial_candidates("C1CCCCC1", seed=7, max_confs=16)
+    print(f"  cyclohexane: {len(candidates)} candidates")
+    assert len(candidates) == 7, "cyclohexane should yield 1 + 6 candidates"
+    assert mol.GetNumConformers() == len(candidates), "mol confs align with candidates"
+    n_atoms = len(candidates[0])
+    assert all(len(c) == n_atoms for c in candidates), "candidates share atom count"
+
+    # Rigid / acyclic molecule -> single candidate (no wasted embeddings).
+    candidates, _ = get_initial_candidates("CC", seed=7, max_confs=16)
+    print(f"  ethane: {len(candidates)} candidate")
+    assert len(candidates) == 1, "ethane should yield a single candidate"
+
+    # Cap of 1 disables the search even for a flexible ring.
+    candidates, _ = get_initial_candidates("C1CCCCC1", seed=7, max_confs=1)
+    assert len(candidates) == 1, "cap=1 should yield a single candidate"
+    print("  ✓ Initial candidate generation test passed\n")
+
+
 def main():
     """Run all tests"""
     print("\n" + "=" * 60)
@@ -256,6 +317,8 @@ def main():
     test_dihedral_detection()
     test_bonding_graph()
     test_charge_handling()
+    test_flexible_ring_atoms()
+    test_initial_candidates()
 
     print("=" * 60)
     print("ALL TESTS PASSED!")
