@@ -1435,6 +1435,18 @@ def run_optimization(
         by energy ascending (``best_atoms`` is the lowest-energy ensemble member,
         or the single-best relaxation if the ensemble is empty).
     """
+    # Validate the gradient-windowing knobs up front: _restrict_gradient_mask
+    # silently treats window <= 0 as keep-all and any unknown mode as "both", so
+    # an out-of-range value would otherwise change the surrogate without warning.
+    if gradient_keep not in ("recent", "best", "both"):
+        raise ValueError(
+            f"gradient_keep must be one of 'recent', 'best', 'both', got {gradient_keep!r}"
+        )
+    if gradient_window < 0:
+        raise ValueError(
+            f"gradient_window must be a non-negative integer (0 = all), got {gradient_window}"
+        )
+
     # Seed every RNG the run touches from `seed`, so a run is reproducible and the
     # seed actually controls the search. The acquisition optimizer (optimize_acqf)
     # draws its restart points from torch's global RNG at every BO step; without

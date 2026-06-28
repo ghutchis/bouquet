@@ -5,7 +5,9 @@
    And add it to _build_full_registry().
 """
 
+import importlib.util
 import shutil
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
@@ -33,10 +35,17 @@ class MethodSpec:
 
 
 def _module_available(module: str) -> bool:
-    try:
-        __import__(module)
+    # Already-imported (or test-injected) modules count as available without
+    # re-importing -- mirrors __import__'s sys.modules-first lookup and lets tests
+    # inject mocks via patch.dict("sys.modules", ...).
+    if module in sys.modules:
         return True
-    except Exception:
+    # Otherwise check importability without executing the module, so building the
+    # registry never eagerly imports heavy backends. For dotted names, find_spec
+    # imports the parent packages and raises ModuleNotFoundError if one is missing.
+    try:
+        return importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
         return False
 
 
@@ -149,6 +158,7 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
+            executables=("dftd4"),
             description="B3LYP with D4 dispersion",
         ),
         "wb97x": MethodSpec(
@@ -158,6 +168,7 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
+            executables=("s-dftd3"),
             description="ωB97X with D3(BJ) dispersion",
         ),
 
@@ -228,14 +239,15 @@ _FULL_REGISTRY = _build_full_registry()
 
 
 def _build_available_registry() -> Dict[str, MethodSpec]:
+    # Resolved at call time (not import time) so that requirement checks reflect
+    # the modules/executables present when a calculator is actually requested.
+    # This also lets tests inject optional dependencies via
+    # `patch.dict("sys.modules", ...)` before the registry is consulted.
     return {
         name: spec
         for name, spec in _FULL_REGISTRY.items()
         if _check_requirements(spec)
     }
-
-
-_REGISTRY = _build_available_registry()
 
 
 # Methods are registry-driven (not a fixed Literal), so the config field/type-hint
@@ -258,10 +270,11 @@ class CalculatorFactory:
         charge: int = 0,
         multiplicity: int = 1,
     ) -> "Calculator":
+        registry = _build_available_registry()
         try:
-            spec = _REGISTRY[method]
+            spec = registry[method]
         except KeyError:
-            available = ", ".join(sorted(_REGISTRY))
+            available = ", ".join(sorted(registry))
             raise ValueError(
                 f"Method '{method}' is not available. Available methods: {available}"
             ) from None
@@ -270,16 +283,19 @@ class CalculatorFactory:
 
     @classmethod
     def available_methods(cls) -> Tuple[str, ...]:
-        return tuple(sorted(_REGISTRY))
+        return tuple(sorted(_build_available_registry()))
 
     @classmethod
     def describe_methods(cls) -> Dict[str, str]:
-        return {name: spec.description for name, spec in _REGISTRY.items()}
+        return {
+            name: spec.description
+            for name, spec in _build_available_registry().items()
+        }
 
     @classmethod
     def methods_by_category(cls) -> Dict[str, Tuple[str, ...]]:
         out: Dict[str, list[str]] = {}
-        for name, spec in _REGISTRY.items():
+        for name, spec in _build_available_registry().items():
             out.setdefault(spec.category, []).append(name)
         return {k: tuple(sorted(v)) for k, v in out.items()}
 

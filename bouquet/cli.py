@@ -274,6 +274,19 @@ def main():
     )
     args = parser.parse_args()
 
+    # Multiplicity (2S+1) must be a positive integer; anything <= 0 yields an
+    # invalid unpaired-electron count (uhf = multiplicity - 1) when stamped onto
+    # the atoms in apply_charge_spin. Reject it before touching any structure.
+    if args.spin is not None and args.spin < 1:
+        parser.error(f"--spin/--multiplicity must be a positive integer, got {args.spin}")
+
+    # Gradient window is a count of points to keep gradients for (0 = all); a
+    # negative value is meaningless and would corrupt the GP windowing logic.
+    if args.gradient_window < 0:
+        parser.error(
+            f"--gradient-window must be >= 0 (0 = all), got {args.gradient_window}"
+        )
+
     # Create configuration from parsed arguments
     config = Configuration(
         smiles=args.smiles,
