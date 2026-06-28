@@ -10,7 +10,7 @@ from typing import Optional
 # CalculatorFactory.available_methods() (the installed subset).
 from bouquet.calculator import MethodType
 
-__all__ = ["MethodType", "Configuration"]
+__all__ = ["Configuration", "MethodType"]
 
 
 # Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation

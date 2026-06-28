@@ -346,12 +346,15 @@ def dihedral_count(smiles: str) -> Optional[int]:
     rdkit import.
     """
     try:
-        from bouquet.setup import detect_dihedrals, get_initial_structure
-
-        _, mol = get_initial_structure(smiles)
-        return len(detect_dihedrals(mol))
-    except Exception:
+        from rdkit import Chem
+        from bouquet.setup import detect_dihedrals
+    except ImportError:
         return None
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    return len(detect_dihedrals(Chem.AddHs(mol)))
 
 
 def max_dihedral_skip(max_dihedrals: Optional[int]):
@@ -364,6 +367,8 @@ def max_dihedral_skip(max_dihedrals: Optional[int]):
     """
     if max_dihedrals is None:
         return None
+    if max_dihedrals < 0:
+        raise ValueError("max_dihedrals must be >= 0")
 
     def skip(smiles: str, name: str) -> bool:
         d = dihedral_count(smiles)

@@ -264,7 +264,7 @@ class CalculatorFactory:
             available = ", ".join(sorted(_REGISTRY))
             raise ValueError(
                 f"Method '{method}' is not available. Available methods: {available}"
-            )
+            ) from None
 
         return spec.builder(mol, num_threads, charge, multiplicity)
 

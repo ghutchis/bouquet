@@ -156,10 +156,22 @@ def merge_traj(
                 f"Missing trajectory sibling for {path.name}: expected {sib.name}. "
                 "Pass --no-traj to merge summaries only."
             )
-        for row in read_checked(sib, TRAJ_FIELDNAMES):
-            key = (row["config"], row["name"], str(row["seed"]))
-            if key in keep_keys:
-                merged.append(row)
+@@ merge_summary
+) -> Tuple[int, dict]:
+@@
+    return len(merged), seen_keys
+
+@@ merge_traj
+-def merge_traj(
+-    summary_paths: List[Path], out_path: Path, keep_keys: set
+def merge_traj(
+    summary_paths: List[Path], out_path: Path, keep_keys: dict
+) -> int:
+@@
+         for row in read_checked(sib, TRAJ_FIELDNAMES):
+             key = (row["config"], row["name"], str(row["seed"]))
+            if keep_keys.get(key) == path:
+                 merged.append(row)
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES)
         w.writeheader()

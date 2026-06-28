@@ -72,7 +72,7 @@ def apply_charge_spin(atoms: Atoms, charge: int, multiplicity: int) -> None:
         return
     # Charge: keep the per-atom formal charges from mol_to_ase_atoms when they sum
     # to the requested total; otherwise set a sum-correct array (lumped on atom 0).
-    if round(float(atoms.get_initial_charges().sum())) != int(charge):
+    if abs(float(atoms.get_initial_charges().sum()) - float(charge)) > 1e-6:
         q = [0.0] * n
         q[0] = float(charge)
         atoms.set_initial_charges(q)
