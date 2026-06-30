@@ -63,6 +63,42 @@ def run(args: argparse.Namespace) -> None:
     sc.run_sweep(args, build_configurations())
 
 
+def _concat_to_tmp(paths, drop_traj: bool) -> Path:
+    """Concatenate the per-(seed,arm) CSVs from the SLURM array into one tidy CSV
+    (sweep_common's analyze/traj each read a single file). ``drop_traj`` filters out
+    ``*_traj.csv`` so an ``analyze high_d_s*.csv`` glob that also matched the
+    trajectory files still works."""
+    import tempfile
+    import pandas as pd
+    files = [p for p in paths if not (drop_traj and "_traj" in str(p))]
+    if not files:
+        sys.exit("no input CSVs (after dropping _traj files)")
+    df = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
+    tmp = Path(tempfile.mkstemp(suffix=".csv")[1])
+    df.to_csv(tmp, index=False)
+    return tmp
+
+
+def _accept_many(parser) -> None:
+    """Make the single-file ``input`` positional accept many files, so an
+    ``analyze high_d_s*.csv`` glob over the distributed array's per-(seed,arm) output
+    works (sweep_common adds it as a single Path)."""
+    for action in parser._actions:
+        if action.dest == "input":
+            action.nargs = "+"
+            action.help = "per-(seed,arm) sweep CSV(s) from the array; concatenated"
+
+
+def _multi(handler, drop_traj: bool):
+    """Wrap an analyze/traj handler so its (now multi-valued) ``input`` positional is
+    concatenated to one tidy CSV before the single-file handler runs. ``analyze`` drops
+    any ``*_traj.csv`` a broad glob caught; ``traj`` keeps them."""
+    def wrapped(args):
+        args.input = _concat_to_tmp(args.input, drop_traj=drop_traj)
+        handler(args)
+    return wrapped
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -72,13 +108,15 @@ def main() -> None:
     sc.add_run_args(r, CONFIG_NAMES)
     r.set_defaults(func=run)
 
-    a = sub.add_parser("analyze", help="Summarize a sweep CSV")
+    a = sub.add_parser("analyze", help="Summarize sweep CSV(s)")
     sc.add_analyze_args(a)
-    a.set_defaults(func=lambda a: sc.analyze(a, BASELINE_LABEL))
+    _accept_many(a)  # the SLURM array writes one CSV per (seed, arm)
+    a.set_defaults(func=_multi(lambda a: sc.analyze(a, BASELINE_LABEL), drop_traj=True))
 
     t = sub.add_parser("traj", help="Anytime best-energy-vs-budget curves + plots")
     sc.add_traj_args(t)
-    t.set_defaults(func=lambda a: sc.trajectory(a, BASELINE_LABEL))
+    _accept_many(t)
+    t.set_defaults(func=_multi(lambda a: sc.trajectory(a, BASELINE_LABEL), drop_traj=False))
 
     args = p.parse_args()
     args.func(args)
