@@ -47,7 +47,7 @@ from botorch.optim import optimize_acqf
 from botorch.utils.sampling import draw_sobol_samples
 from gpytorch import kernels as gpykernels
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from gpytorch.priors import NormalPrior
+from gpytorch.priors import LogNormalPrior, NormalPrior
 
 # iRMSD (rotation- and permutation-invariant RMSD) is an optional dependency:
 # it ships binary wheels only for some platforms, so we use it when a real
@@ -187,6 +187,32 @@ class OptimizationState:
     # (0 = all). gradient_keep = recent|best|both. See _restrict_gradient_mask.
     gradient_window: int = 0
     gradient_keep: str = "recent"
+    # Value-only-GP lengthscale prior: "none" (free fit, historical) or
+    # "dim_scaled" (Hvarfner dimensionality-scaled LogNormal). See
+    # _periodic_covar_module.
+    lengthscale_prior: str = "none"
+
+    # Phase 2c hybrid acquisition (collective moves). With probability
+    # collective_prob, an eligible step (>= collective_warmup evaluations) replaces the
+    # global LogEI optimization with a line-restricted search along a collective
+    # (soft/valley) direction through the incumbent -- see _select_collective_move.
+    # 0 disables (pure axis-wise BO). collective_modes is the number of leading
+    # subspace directions to sample from; collective_rng/collective_count are runtime
+    # state (the move-type coin and a tally for the end-of-run log).
+    collective_prob: float = 0.0
+    collective_warmup: int = 100
+    collective_modes: int = 4
+    collective_rng: np.random.Generator | None = None
+    collective_count: int = 0
+    # Use gradient soft modes for a collective move only when the position/gradient
+    # subspace overlap is at least this (else fall back to PCA). 0.0 forces gradient
+    # modes whenever valid (guards only against gradient_modes raising); see
+    # _select_collective_move / LowEnergySubspace.overlap.
+    collective_overlap_min: float = 0.5
+    # Of the collective_count moves, how many used gradient soft modes (vs PCA
+    # fallback), and the overlap values seen (for the end-of-run diagnostic).
+    collective_grad_count: int = 0
+    collective_overlaps: list = field(default_factory=list)
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
@@ -233,18 +259,39 @@ class OptimizationState:
         self.observed_atoms.append(atoms.copy())
 
 
-def _periodic_covar_module(num_dims: int) -> gpykernels.ScaleKernel:
+def _periodic_covar_module(
+    num_dims: int, lengthscale_prior: str = "none"
+) -> gpykernels.ScaleKernel:
     """Build the periodic GP covariance module shared by the acquisition GP and
-    the ensemble-selection GP (a scaled product of per-dihedral periodic kernels)."""
-    return gpykernels.ScaleKernel(
-        gpykernels.ProductStructureKernel(
-            num_dims=num_dims,
-            base_kernel=gpykernels.PeriodicKernel(
-                period_length_prior=NormalPrior(
-                    GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD
-                )
-            ),
+    the ensemble-selection GP (a scaled product of per-dihedral periodic kernels).
+
+    ``lengthscale_prior`` selects the prior on the (shared) periodic lengthscale:
+    - ``"none"`` (default): no lengthscale prior -- the historical behavior, where
+      the lengthscale is a free MLL fit.
+    - ``"dim_scaled"``: the Hvarfner et al. (ICML 2024) dimensionality-scaled
+      LogNormal prior, ``LogNormal(sqrt(2) + 0.5*ln d, sqrt(3))``, biasing the GP
+      toward smoother fits as ``d`` grows. NOTE: those constants were calibrated for
+      an RBF/Matern kernel; this PeriodicKernel uses ``exp(-2 sin^2(.)/l)`` (l at
+      first power over a bounded sin^2 term), so the *location offset* likely needs
+      recalibration -- the smoke test measures whether the canonical constants help
+      or over-smooth. The lengthscale is also initialized at the prior median.
+    """
+    base_kwargs = dict(
+        period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD)
+    )
+    loc = None
+    if lengthscale_prior == "dim_scaled":
+        loc = math.sqrt(2.0) + 0.5 * math.log(num_dims)
+        base_kwargs["lengthscale_prior"] = LogNormalPrior(loc, math.sqrt(3.0))
+    elif lengthscale_prior != "none":
+        raise ValueError(
+            f"lengthscale_prior must be 'none' or 'dim_scaled', got {lengthscale_prior!r}"
         )
+    base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
+    if loc is not None:
+        base_kernel.lengthscale = math.exp(loc)  # start at the prior median
+    return gpykernels.ScaleKernel(
+        gpykernels.ProductStructureKernel(num_dims=num_dims, base_kernel=base_kernel)
     )
 
 
@@ -451,9 +498,18 @@ def _select_next_points_botorch(
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
     gradient_window: int = 0,
     gradient_keep: str = "recent",
+    lengthscale_prior: str = "none",
+    restrict_candidates: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
+
+    If ``restrict_candidates`` (normalized [0, 1] coords, shape ``(M, d)``) is given,
+    the acquisition is *not* globally optimized: it is evaluated on those candidates
+    and the best is returned. This implements the Phase 2c line-restricted search --
+    the candidates are a 1-D line along a collective direction through the incumbent
+    (see ``_select_collective_move``) -- while reusing the exact same GP fit and
+    acquisition function as a standard step.
 
     Parameters:
         train_X (torch.Tensor): Observed dihedral coordinates, shape (n_observations, n_dims), in degrees.
@@ -519,7 +575,9 @@ def _select_next_points_botorch(
             gp = SingleTaskGP(
                 train_x,
                 train_y,
-                covar_module=_periodic_covar_module(train_x.shape[1]),
+                covar_module=_periodic_covar_module(
+                    train_x.shape[1], lengthscale_prior=lengthscale_prior
+                ),
             )
             mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
             fit_gpytorch_mll_torch(
@@ -559,16 +617,26 @@ def _select_next_points_botorch(
         else:
             acqf = base_acqf
 
-        # bounds are [0, 1] for each dihedral since we standardized above
-        bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
-        bounds[1, :] = 1.0
-        candidate, _ = optimize_acqf(
-            acqf,
-            bounds=bounds,
-            q=1,  # q = 1: no batching
-            num_restarts=acq_num_restarts,
-            raw_samples=acq_raw_samples,
-        )
+        if restrict_candidates is not None:
+            # Line-restricted (Phase 2c): evaluate the acquisition on the supplied
+            # candidates and take the best, instead of optimizing globally.
+            cand_t = torch.as_tensor(
+                restrict_candidates, dtype=train_x.dtype, device=train_x.device
+            )
+            with torch.no_grad():
+                acq_vals = acqf(cand_t.unsqueeze(1))  # (M, 1, d) -> (M,)
+            candidate = cand_t[int(torch.argmax(acq_vals))].reshape(1, train_x.shape[1])
+        else:
+            # bounds are [0, 1] for each dihedral since we standardized above
+            bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
+            bounds[1, :] = 1.0
+            candidate, _ = optimize_acqf(
+                acqf,
+                bounds=bounds,
+                q=1,  # q = 1: no batching
+                num_restarts=acq_num_restarts,
+                raw_samples=acq_raw_samples,
+            )
         t_acq = time.perf_counter() - _t_acq0
 
     # Stopping-rule certificate: evaluate the just-fitted GP (and the unwrapped
@@ -937,6 +1005,66 @@ def _log_improvement_geometry(
     append_xyz_frame(state.geom_log_path, atoms, comment)
 
 
+# Phase 2c collective-move line: half-range (radians) and resolution of the 1-D scan
+# along a collective direction through the incumbent. +/- 2*pi lets a unit tangent
+# direction drive large coordinated rotations (the dominant dihedrals swing furthest);
+# wrapping mod 360 folds the line onto the torus, and LogEI picks the best point.
+_COLLECTIVE_ALPHA = 2.0 * math.pi
+_COLLECTIVE_RESOLUTION = 201
+# Minimum elite points before a collective move is meaningful (need a stable subspace).
+_COLLECTIVE_MIN_ELITE = 8
+
+
+def _select_collective_move(
+    state: OptimizationState, k: int, rng: np.random.Generator
+) -> np.ndarray | None:
+    """Build the low-energy subspace and return a line of candidate coordinates
+    (normalized [0, 1], shape ``(M, d)``) along one collective direction through the
+    incumbent, or ``None`` to fall back to a standard step.
+
+    The direction is drawn (uniformly) from the ``k`` leading position-PCA modes
+    (the robust valley-floor directions); when gradients are available and the
+    position/gradient subspaces agree (``overlap``), the softest gradient modes are
+    used instead. Caller feeds the returned candidates to
+    ``_select_next_points_botorch(restrict_candidates=...)`` so the GP fit and
+    acquisition are identical to a standard step -- only the candidate set is the line.
+    """
+    from bouquet.subspace import LowEnergySubspace
+
+    coords = state.observed_coords.detach().cpu().numpy()
+    energies = state.observed_energies.detach().cpu().numpy()
+    grads = (
+        state.observed_gradients.detach().cpu().numpy()
+        if state.observed_gradients is not None
+        else None
+    )
+    ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
+    ss.update(coords, energies, grads)
+    if ss.n_elite < max(_COLLECTIVE_MIN_ELITE, k + 1):
+        return None
+
+    # Prefer gradient soft modes only when they're available, valid, and consistent
+    # with the position PCA (overlap guards the degenerate-floor inversion failure).
+    direction = None
+    if grads is not None and np.isfinite(grads).all(axis=1).sum() >= k + 1:
+        try:
+            ov = ss.overlap(k)
+            state.collective_overlaps.append(ov)
+            if ov >= state.collective_overlap_min:
+                V = ss.gradient_modes(k, soft=True)
+                direction = V[:, rng.integers(k)]
+                state.collective_grad_count += 1
+        except ValueError:
+            direction = None
+    if direction is None:
+        _, V = ss.pca_basis(k)
+        direction = V[:, rng.integers(k)]
+
+    alphas = np.linspace(-_COLLECTIVE_ALPHA, _COLLECTIVE_ALPHA, _COLLECTIVE_RESOLUTION)
+    line_deg = ss.line(direction, alphas)  # (M, d), degrees
+    return line_deg / 360.0
+
+
 def _run_optimization_loop(
     state: OptimizationState,
     n_steps: int,
@@ -1006,6 +1134,22 @@ def _run_optimization_loop(
             state.grad_gp_hypers,
         )
 
+        # Phase 2c: with probability collective_prob (once past the warmup), this step
+        # is a collective move -- the acquisition is restricted to a line along a
+        # soft/valley direction through the incumbent instead of optimized globally.
+        restrict_candidates = None
+        if (
+            state.collective_prob > 0
+            and len(state.observed_energies) >= state.collective_warmup
+            and state.collective_rng is not None
+            and state.collective_rng.random() < state.collective_prob
+        ):
+            restrict_candidates = _select_collective_move(
+                state, state.collective_modes, state.collective_rng
+            )
+            if restrict_candidates is not None:
+                state.collective_count += 1
+
         cert_out = {} if state.cert_log is not None else None
         # Time the two cost centers separately: GP fit/condition + acquisition
         # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
@@ -1024,6 +1168,8 @@ def _run_optimization_loop(
             acq_raw_samples=state.acq_raw_samples,
             gradient_window=state.gradient_window,
             gradient_keep=state.gradient_keep,
+            lengthscale_prior=state.lengthscale_prior,
+            restrict_candidates=restrict_candidates,
         )
         t_select = time.perf_counter() - _t0
         if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
@@ -1077,6 +1223,20 @@ def _run_optimization_loop(
         # Decay prior exponent
         if state.prior_module is not None:
             state.prior_exponent *= state.prior_decay
+
+    if state.collective_prob > 0:
+        ov = state.collective_overlaps
+        ov_str = (
+            f"; pos/grad overlap min/mean/max "
+            f"{min(ov):.2f}/{sum(ov)/len(ov):.2f}/{max(ov):.2f}"
+            if ov else ""
+        )
+        logger.info(
+            f"Phase 2c: {state.collective_count} collective (line-restricted) move(s) "
+            f"of {n_steps} BO steps "
+            f"({state.collective_grad_count} via gradient soft modes, rest via PCA)"
+            f"{ov_str}."
+        )
 
 
 def _perform_final_relaxation(
@@ -1376,6 +1536,11 @@ def run_optimization(
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
     gradient_window: int = 0,
     gradient_keep: str = "recent",
+    lengthscale_prior: str = "none",
+    collective_prob: float = 0.0,
+    collective_warmup: int = 100,
+    collective_modes: int = 4,
+    collective_overlap_min: float = 0.5,
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     geom_log_path: Path | None = None,
@@ -1467,6 +1632,16 @@ def run_optimization(
     state.acq_raw_samples = acq_raw_samples
     state.gradient_window = gradient_window
     state.gradient_keep = gradient_keep
+    state.lengthscale_prior = lengthscale_prior
+    state.collective_prob = collective_prob
+    state.collective_warmup = collective_warmup
+    state.collective_modes = collective_modes
+    state.collective_overlap_min = collective_overlap_min
+    # Dedicated RNG for the collective-move coin/direction, offset from the global
+    # seed so it doesn't co-vary with the torch/numpy streams but stays reproducible
+    # (paired comparisons across arms at a fixed seed).
+    if collective_prob > 0:
+        state.collective_rng = np.random.default_rng(seed + 99991)
 
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
     # reference every later evaluation must preserve. The start is computed inside

@@ -1,5 +1,5 @@
 import logging
-from argparse import ArgumentParser
+from argparse import SUPPRESS, ArgumentParser
 from datetime import datetime
 from pathlib import Path
 
@@ -189,33 +189,39 @@ def main():
         type=str,
         help="JSON file with dihedral prior definitions",
     )
+    # Initial prior exponent for PiBO (0 to disable, default is 0.5)
     parser.add_argument(
         "--prior-exponent",
         type=float,
         default=DEFAULT_PRIOR_EXPONENT,
-        help="Initial prior exponent for PiBO (0 to disable)",
+        help=SUPPRESS,
     )
+    # Prior exponent decay rate per iteration, default is 0.5
     parser.add_argument(
         "--prior-decay",
         type=float,
         default=DEFAULT_PRIOR_DECAY,
-        help="Prior exponent decay rate per iteration",
+        help=SUPPRESS,
     )
+    # Cap on fitted von Mises concentration (kappa) used as a search prior.
+    # Raw histogram fits might be near-delta (kappa ~1e4); capping keeps the prior
+    # smooth enough for the acquisition optimizer to follow (<=0 disables the cap).
+    # default is 50.0
     parser.add_argument(
         "--prior-max-concentration",
         type=float,
         default=DEFAULT_PRIOR_MAX_CONCENTRATION,
-        help="Cap on fitted von Mises concentration (kappa) used as a search prior. "
-        "Raw histogram fits can be near-delta (kappa ~1e4); capping keeps the prior "
-        "smooth enough for the acquisition optimizer to follow (<=0 disables the cap).",
+        help=SUPPRESS,
     )
+    # Weight in [0,1) of a uniform background mixed into each univariate
+    # prior: (1-w)*vonMises + w*uniform. Bounds how strongly any single mode can "
+    # dominate the acquisition and gives a smooth floor. 0 disables it. Try 0.05-0.2."
+    # default is 0.05
     parser.add_argument(
         "--prior-background-weight",
         type=float,
         default=DEFAULT_PRIOR_BACKGROUND_WEIGHT,
-        help="Weight in [0,1) of a uniform background mixed into each univariate "
-        "prior: (1-w)*vonMises + w*uniform. Bounds how strongly any single mode can "
-        "dominate the acquisition and gives a smooth floor. 0 disables it. Try 0.05-0.2.",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--ensemble",
@@ -229,41 +235,47 @@ def main():
         default=None,
         help="Path to write a per-BO-step stopping-rule certificate CSV "
         "(mu_min/lb/alpha_max + e_eval/e_best/n_calls/wall_s). Used by the "
-        "stopping-rule calibration benchmark; off by default.",
+        "various benchmarks; off by default.",
     )
+    # Comma-separated confidence multipliers for the certificate lower
+    # bound (mu - beta*sigma); one lb_b<beta> column is logged per value so the
+    # offline replay can calibrate beta. Only used with --certificate-log.
     parser.add_argument(
         "--certificate-betas",
         type=str,
         default=format_certificate_betas(DEFAULT_CERTIFICATE_BETAS),
-        help="Comma-separated confidence multipliers for the certificate lower "
-        "bound (mu - beta*sigma); one lb_b<beta> column is logged per value so the "
-        "offline replay can calibrate beta. Only used with --certificate-log.",
+        help=SUPPRESS,
     )
+    # Path to write a multi-frame XYZ of the geometry at each best-so-far
+    # improvement (plus the final relaxed best), for the benchmark's
+    # RMSD-identity / distinct-conformer analysis. Off by default.
     parser.add_argument(
         "--geometry-log",
         type=str,
         default=None,
-        help="Path to write a multi-frame XYZ of the geometry at each best-so-far "
-        "improvement (plus the final relaxed best), for the benchmark's "
-        "RMSD-identity / distinct-conformer analysis. Off by default.",
+        help=SUPPRESS,
     )
+    # Hidden (SUPPRESS): acq24 (24 restarts / 24 raw samples) is the validated
+    # default -- a paired sweep vs the old 64/64 showed no quality change at ~2x
+    # speed (see scripts/acq_sweep.py) -- so it is not a knob worth exposing. Kept
+    # functional, though, so scripts/acq_sweep.py can still vary it across arms via
+    # the subprocess CLI.
     parser.add_argument(
         "--acq-num-restarts",
         type=int,
         default=ACQ_NUM_RESTARTS,
-        help=f"optimize_acqf L-BFGS restarts (default {ACQ_NUM_RESTARTS}). The main "
-        "BO speed lever -- lowering trades acquisition quality for speed.",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--acq-raw-samples",
         type=int,
         default=ACQ_RAW_SAMPLES,
-        help=f"optimize_acqf raw initialization samples (default {ACQ_RAW_SAMPLES}).",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--gradient-window",
         type=int,
-        default=0,
+        default=150,  # 0 = no window, default for now
         help="Gradient GP: keep gradients for only this many high-leverage points "
         "(0 = all). Shrinks the augmented GP to n + window*d -- a high-d speedup "
         "that keeps gradients in the active region (unlike value-only-late).",
@@ -272,8 +284,7 @@ def main():
         "--gradient-keep",
         choices=["recent", "best", "both"],
         default="recent",
-        help="Which points keep gradients under --gradient-window: recent (search "
-        "frontier), best (lowest-energy basin), or both (half each). Default recent.",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--retain-bonds",
