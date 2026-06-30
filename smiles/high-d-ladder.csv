@@ -1,0 +1,9 @@
+smiles,name,d,chemistry
+CC(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)NC,polyala_n2,11,peptide
+CC(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)NC,polyala_n3,15,peptide
+C1[C@@H](N(C(=O)N1c1ncnc(N2[C@H](CN(C2=O)c2cc(ncn2)N2C(=O)N(C[C@@H]2C(C)C)c2ccccc2)C(C)C)c1)c1ncnc(N2C[C@H](NC2=O)C(C)C)c1)C(C)C,fold4,19,triazine-urea
+CC(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)NC,polyala_n4,19,peptide
+CC(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)N[C@@H](C)C(=O)NC,polyala_n5,23,peptide
+c1(cc(nc2c1cccc2N(=O)=O)C(=O)Nc1ccc2c(cc(nc2c1)C(=O)Nc1ccc2c(cc(nc2c1)C(=O)Nc1ccc2c(cc(nc2c1)C(=O)Nc1ccc2c(cc(nc2c1)C(=O)N)OC)OC)OC)OC)OC,napth,25,quinoline-amide
+N=Cc1nc2c3nc(ccc3ccc2cc1)/C=N/NC(=O)c1nc2c(c(OC)c1)cc1c(OC)cc(nc1c2C)C(=O)N/N=C/c1nc2c3nc(ccc3ccc2cc1)/C=N/NC(=O)c1nc2c(c(OC)c1)cc1c(OC)cc(nc1c2C)C(=O)N,fold1,25,aromatic-hydrazone
+O(C)C(=O)c1ccccc1NC(=O)c1ccccc1NC(=O)c1cccc(n1)C(=O)Nc1ccccc1C(=O)Nc1c(OC)cc(OC)c(NC(=O)c2ccccc2NC(=O)c2cccc(n2)C(=O)Nc2ccccc2C(=O)Nc2ccccc2C(=O)OC)c1,NOVXAX,34,anthranilamide

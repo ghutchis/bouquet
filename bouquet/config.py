@@ -191,6 +191,9 @@ class Configuration:
     # step (the slow reference).
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
+    # Value-only-GP lengthscale prior: "none" (free fit, historical) or "dim_scaled"
+    # (Hvarfner dimensionality-scaled LogNormal). See solver._periodic_covar_module.
+    lengthscale_prior: str = "none"
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings

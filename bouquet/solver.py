@@ -214,6 +214,16 @@ class OptimizationState:
     collective_grad_count: int = 0
     collective_overlaps: list = field(default_factory=list)
 
+    # Phase 2.5 low-mode / basin-hopping move. With probability lowmode_prob an eligible
+    # step (>= lowmode_warmup evaluations) is replaced by a committed kick along a soft
+    # mode + UNCONSTRAINED relaxation (see _low_mode_move) -- the move designed for the
+    # curved fold valley. lowmode_kick_deg is the per-dihedral RMS kick amplitude. Reuses
+    # collective_rng / collective_modes. 0 disables.
+    lowmode_prob: float = 0.0
+    lowmode_warmup: int = 100
+    lowmode_kick_deg: float = 60.0
+    lowmode_count: int = 0
+
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
     prior_exponent: float = 2.0
@@ -1065,6 +1075,77 @@ def _select_collective_move(
     return line_deg / 360.0
 
 
+# Phase 2.5 low-mode move relaxation budgets. The constrained pre-relax removes the
+# worst clashes at the kicked dihedrals; the UNCONSTRAINED relax then lets every DOF
+# (dihedrals included) slide to the nearest local minimum -- the step that bends a
+# straight kick onto the curved fold valley (the straight-line dihedral path is
+# clash-barrier-blocked; see the Phase 2.4 diagnostics in bouquet_hdbo_plan.md).
+_LOWMODE_CONSTRAINED_STEPS = 20
+_LOWMODE_FREE_STEPS = 100
+
+
+def _low_mode_move(
+    state: OptimizationState,
+    dihedrals: list[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, Atoms, float] | None:
+    """One low-mode / basin-hopping move: kick the incumbent along a soft (position-PCA)
+    direction, then relax UNCONSTRAINED, returning (relaxed dihedrals [deg], relaxed
+    atoms, energy [eV]).
+
+    Unlike a standard BO step -- which relaxes only the non-dihedral DOF with the
+    dihedrals pinned -- the unconstrained relaxation lets the dihedrals move, so the
+    geometry can slide along the curved fold valley instead of stalling on the
+    straight-line clash ridge (Kolossvary-Guida low-mode search). Returns ``None`` to
+    fall back to a standard step (too few elite points, or a move that broke bonds)."""
+    from bouquet.subspace import LowEnergySubspace
+
+    coords = state.observed_coords.detach().cpu().numpy()
+    energies = state.observed_energies.detach().cpu().numpy()
+    k = state.collective_modes
+    ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
+    ss.update(coords, energies)
+    if ss.n_elite < k + 1:
+        return None
+
+    # Kick the incumbent along a random one of the top-k soft (position-PCA) directions,
+    # random sign, amplitude ~ lowmode_kick_deg RMS per dihedral.
+    _, V = ss.pca_basis(k)                       # (d, k) tangent (radian) directions
+    direction = V[:, rng.integers(k)]
+    direction = direction / np.linalg.norm(direction)
+    if rng.random() < 0.5:
+        direction = -direction
+    amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
+    target_deg = np.rad2deg(ss._incumbent + amp * direction) % 360.0
+
+    # Anchor = the incumbent's actual 3D structure (lowest-energy observation).
+    best_idx = int(state.observed_energies.argmin().item())
+    anchor = state.observed_atoms[best_idx]
+
+    # Stage 1: set the kicked dihedrals and short *constrained* relax (clash cleanup).
+    _, atoms = evaluate_energy(
+        target_deg, anchor, dihedrals, calc, relaxCalc,
+        relax=True, steps=_LOWMODE_CONSTRAINED_STEPS,
+    )
+    # Stage 2: release the dihedral constraint and relax UNCONSTRAINED to a local min.
+    atoms.set_constraint()
+    energy, atoms = relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
+
+    # --retain-bonds: reject a move whose relaxation changed connectivity.
+    if (
+        state.required_bonds is not None
+        and energy < RELAX_FAILURE_ENERGY_EV
+        and bonds_broken(atoms, state.required_bonds)
+    ):
+        state.n_bond_breaks += 1
+        return None
+
+    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
+    return new_coords, atoms, energy
+
+
 def _run_optimization_loop(
     state: OptimizationState,
     n_steps: int,
@@ -1134,56 +1215,80 @@ def _run_optimization_loop(
             state.grad_gp_hypers,
         )
 
-        # Phase 2c: with probability collective_prob (once past the warmup), this step
-        # is a collective move -- the acquisition is restricted to a line along a
-        # soft/valley direction through the incumbent instead of optimized globally.
-        restrict_candidates = None
+        # Phase 2.5: with probability lowmode_prob (past the warmup), this step is a
+        # low-mode / basin-hopping move -- a committed kick + UNCONSTRAINED relax that
+        # combines selection and evaluation, so it short-circuits the standard step.
+        lowmode_result = None
         if (
-            state.collective_prob > 0
-            and len(state.observed_energies) >= state.collective_warmup
+            state.lowmode_prob > 0
+            and len(state.observed_energies) >= state.lowmode_warmup
             and state.collective_rng is not None
-            and state.collective_rng.random() < state.collective_prob
+            and state.collective_rng.random() < state.lowmode_prob
         ):
-            restrict_candidates = _select_collective_move(
-                state, state.collective_modes, state.collective_rng
+            _t0 = time.perf_counter()
+            lowmode_result = _low_mode_move(
+                state, dihedrals, calc, relaxCalc, state.collective_rng
             )
-            if restrict_candidates is not None:
-                state.collective_count += 1
+            t_lowmode = time.perf_counter() - _t0
 
-        cert_out = {} if state.cert_log is not None else None
-        # Time the two cost centers separately: GP fit/condition + acquisition
-        # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
-        _t0 = time.perf_counter()
-        next_coords = _select_next_points_botorch(
-            state.observed_coords, state.observed_energies,
-            prior_module=state.prior_module,
-            prior_exponent=state.prior_exponent,
-            observed_gradients=state.observed_gradients,
-            use_gradients=step_uses_gradients,
-            gp_frozen_hypers=frozen_hypers,
-            gp_hyper_out=hyper_out,
-            cert_out=cert_out,
-            cert_betas=state.cert_betas,
-            acq_num_restarts=state.acq_num_restarts,
-            acq_raw_samples=state.acq_raw_samples,
-            gradient_window=state.gradient_window,
-            gradient_keep=state.gradient_keep,
-            lengthscale_prior=state.lengthscale_prior,
-            restrict_candidates=restrict_candidates,
-        )
-        t_select = time.perf_counter() - _t0
-        if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
-            state.grad_gp_hypers = hyper_out["hypers"]
-        # logger.info(f'Selected next point: {next_coords}')
+        if lowmode_result is not None:
+            next_coords, cur_atoms, energy = lowmode_result
+            gradient = None
+            cert_out = None
+            t_select, t_eval = 0.0, t_lowmode
+            state.lowmode_count += 1
+        else:
+            # ---- standard BO step (optionally a Phase 2c collective line move) ----
+            # Phase 2c: with probability collective_prob (once past the warmup), this
+            # step is a collective move -- the acquisition is restricted to a line along
+            # a soft/valley direction through the incumbent instead of optimized globally.
+            restrict_candidates = None
+            if (
+                state.collective_prob > 0
+                and len(state.observed_energies) >= state.collective_warmup
+                and state.collective_rng is not None
+                and state.collective_rng.random() < state.collective_prob
+            ):
+                restrict_candidates = _select_collective_move(
+                    state, state.collective_modes, state.collective_rng
+                )
+                if restrict_candidates is not None:
+                    state.collective_count += 1
 
-        _t0 = time.perf_counter()
-        energy, cur_atoms, gradient = _evaluate_point(
-            state, next_coords, dihedrals, calc, relaxCalc, relax
-        )
-        t_eval = time.perf_counter() - _t0
-        if cert_out is not None:
-            cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
-            cert_out["t_eval"] = t_eval      # xTB energy + relaxation
+            cert_out = {} if state.cert_log is not None else None
+            # Time the two cost centers separately: GP fit/condition + acquisition
+            # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
+            _t0 = time.perf_counter()
+            next_coords = _select_next_points_botorch(
+                state.observed_coords, state.observed_energies,
+                prior_module=state.prior_module,
+                prior_exponent=state.prior_exponent,
+                observed_gradients=state.observed_gradients,
+                use_gradients=step_uses_gradients,
+                gp_frozen_hypers=frozen_hypers,
+                gp_hyper_out=hyper_out,
+                cert_out=cert_out,
+                cert_betas=state.cert_betas,
+                acq_num_restarts=state.acq_num_restarts,
+                acq_raw_samples=state.acq_raw_samples,
+                gradient_window=state.gradient_window,
+                gradient_keep=state.gradient_keep,
+                lengthscale_prior=state.lengthscale_prior,
+                restrict_candidates=restrict_candidates,
+            )
+            t_select = time.perf_counter() - _t0
+            if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
+                state.grad_gp_hypers = hyper_out["hypers"]
+            # logger.info(f'Selected next point: {next_coords}')
+
+            _t0 = time.perf_counter()
+            energy, cur_atoms, gradient = _evaluate_point(
+                state, next_coords, dihedrals, calc, relaxCalc, relax
+            )
+            t_eval = time.perf_counter() - _t0
+            if cert_out is not None:
+                cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
+                cert_out["t_eval"] = t_eval      # xTB energy + relaxation
         rel_energy = energy - state.start_energy
         logger.info(
             f"Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}"
@@ -1210,7 +1315,7 @@ def _run_optimization_loop(
         # with this step's realized outcome. n_calls counts cumulative energy
         # evaluations (start + initial guesses + BO steps so far) -- the real cost
         # axis -- which equals the post-append observation count.
-        if state.cert_log is not None:
+        if state.cert_log is not None and cert_out is not None:
             state.cert_log(
                 step,
                 rel_energy,
@@ -1236,6 +1341,11 @@ def _run_optimization_loop(
             f"of {n_steps} BO steps "
             f"({state.collective_grad_count} via gradient soft modes, rest via PCA)"
             f"{ov_str}."
+        )
+    if state.lowmode_prob > 0:
+        logger.info(
+            f"Phase 2.5: {state.lowmode_count} low-mode (kick + unconstrained-relax) "
+            f"move(s) of {n_steps} BO steps."
         )
 
 
@@ -1541,6 +1651,9 @@ def run_optimization(
     collective_warmup: int = 100,
     collective_modes: int = 4,
     collective_overlap_min: float = 0.5,
+    lowmode_prob: float = 0.0,
+    lowmode_warmup: int = 100,
+    lowmode_kick_deg: float = 60.0,
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     geom_log_path: Path | None = None,
@@ -1637,10 +1750,14 @@ def run_optimization(
     state.collective_warmup = collective_warmup
     state.collective_modes = collective_modes
     state.collective_overlap_min = collective_overlap_min
-    # Dedicated RNG for the collective-move coin/direction, offset from the global
-    # seed so it doesn't co-vary with the torch/numpy streams but stays reproducible
-    # (paired comparisons across arms at a fixed seed).
-    if collective_prob > 0:
+    state.lowmode_prob = lowmode_prob
+    state.lowmode_warmup = lowmode_warmup
+    state.lowmode_kick_deg = lowmode_kick_deg
+    # Dedicated RNG for the collective-/low-mode-move coin/direction, offset from the
+    # global seed so it doesn't co-vary with the torch/numpy streams but stays
+    # reproducible (paired comparisons across arms at a fixed seed). Shared by both
+    # move types.
+    if collective_prob > 0 or lowmode_prob > 0:
         state.collective_rng = np.random.default_rng(seed + 99991)
 
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the

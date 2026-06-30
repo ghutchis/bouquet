@@ -185,6 +185,15 @@ def main():
         "degrades the search). 0 (default); with no dense phase, fits every step.",
     )
     parser.add_argument(
+        "--lengthscale-prior",
+        choices=["none", "dim_scaled"],
+        default="none",
+        help="Prior on the value-only GP's periodic lengthscale. 'none' (default): "
+        "free MLL fit (historical). 'dim_scaled': Hvarfner et al. (ICML 2024) "
+        "dimensionality-scaled LogNormal prior, biasing the GP toward smoother fits "
+        "as the dihedral count grows -- helps high-d search.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -329,6 +338,7 @@ def main():
         gradient_steps=args.gradient_steps,
         grad_refit_dense_until=args.grad_refit_dense_until,
         grad_refit_every=args.grad_refit_every,
+        lengthscale_prior=args.lengthscale_prior,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -543,6 +553,7 @@ def main():
         gradient_steps=config.gradient_steps,
         grad_refit_dense_until=config.grad_refit_dense_until,
         grad_refit_every=config.grad_refit_every,
+        lengthscale_prior=config.lengthscale_prior,
         acq_num_restarts=config.acq_num_restarts,
         acq_raw_samples=config.acq_raw_samples,
         gradient_window=config.gradient_window,
