@@ -292,7 +292,7 @@ def main():
     parser.add_argument(
         "--gradient-keep",
         choices=["recent", "best", "both"],
-        default="recent",
+        default="both",
         help=SUPPRESS,
     )
     parser.add_argument(

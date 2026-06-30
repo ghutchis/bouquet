@@ -1048,6 +1048,10 @@ def _select_collective_move(
         if state.observed_gradients is not None
         else None
     )
+    # The basis has at most `d` columns (eigenvectors of the (d, d) covariance), so
+    # asking for more modes than torsions would let `rng.integers(k)` index past the
+    # available columns. Clamp k to the torsion count.
+    k = min(k, coords.shape[1])
     ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
     ss.update(coords, energies, grads)
     if ss.n_elite < max(_COLLECTIVE_MIN_ELITE, k + 1):
@@ -1104,7 +1108,9 @@ def _low_mode_move(
 
     coords = state.observed_coords.detach().cpu().numpy()
     energies = state.observed_energies.detach().cpu().numpy()
-    k = state.collective_modes
+    # Clamp to the torsion count: the PCA basis has at most `d` columns, so a larger
+    # k would let the `rng.integers(k)` mode pick index past the available columns.
+    k = min(state.collective_modes, coords.shape[1])
     ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
     ss.update(coords, energies)
     if ss.n_elite < k + 1:
@@ -1723,6 +1729,13 @@ def run_optimization(
     if gradient_window < 0:
         raise ValueError(
             f"gradient_window must be a non-negative integer (0 = all), got {gradient_window}"
+        )
+    # A low-mode move is a kick followed by a constrained + UNCONSTRAINED relaxation
+    # (see _low_mode_move); it is meaningless without relaxation and would silently
+    # relax structures in a run that asked not to. Reject the combination up front.
+    if lowmode_prob > 0 and not relax:
+        raise ValueError(
+            "lowmode_prob > 0 requires relax=True: low-mode moves are kick + relax steps"
         )
 
     # Seed every RNG the run touches from `seed`, so a run is reproducible and the
