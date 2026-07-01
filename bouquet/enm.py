@@ -21,11 +21,15 @@ import torch
 
 
 def _dihedral_rad(p: torch.Tensor) -> torch.Tensor:
-    """Dihedral angle (radians) of 4 points ``p`` (4, 3), standard i-j-k-l convention."""
+    """Dihedral angle (radians) of 4 points ``p`` (4, 3), standard i-j-k-l convention.
+
+    ``b2.norm()`` is floored so coincident central-bond atoms don't divide by zero;
+    a genuinely degenerate (near-collinear) dihedral still yields a NaN autograd
+    gradient, which ``dihedral_bmatrix`` zeroes out."""
     b1, b2, b3 = p[1] - p[0], p[2] - p[1], p[3] - p[2]
     n1 = torch.linalg.cross(b1, b2)
     n2 = torch.linalg.cross(b2, b3)
-    m1 = torch.linalg.cross(n1, b2 / b2.norm())
+    m1 = torch.linalg.cross(n1, b2 / b2.norm().clamp_min(1e-12))
     return torch.atan2((m1 * n2).sum(), (n1 * n2).sum())
 
 
@@ -41,6 +45,11 @@ def dihedral_bmatrix(positions: np.ndarray, chains) -> np.ndarray:
         p = torch.tensor(positions[idx], dtype=torch.float64, requires_grad=True)
         _dihedral_rad(p).backward()
         g = p.grad.numpy()  # (4, 3)
+        # A degenerate (near-collinear) dihedral gives a NaN/Inf autograd gradient
+        # (atan2's 0/0 gradient); leave that row zero so it can't poison the ANM
+        # projection -- the mode simply doesn't drive that torsion.
+        if not np.isfinite(g).all():
+            continue
         for j, at in enumerate(idx):
             B[i, 3 * at:3 * at + 3] = g[j]
     return B
