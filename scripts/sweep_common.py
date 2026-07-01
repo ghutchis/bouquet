@@ -1293,11 +1293,13 @@ def concat_sweep_csvs(paths, drop_traj: bool = True) -> Path:
 
     import pandas as pd
 
-    files = [p for p in paths if not (drop_traj and "_traj" in str(p))]
+    files = [p for p in paths if not (drop_traj and str(p).endswith("_traj.csv"))]
     if not files:
         sys.exit("no input CSVs (after dropping _traj files)")
     df = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
-    tmp = Path(tempfile.mkstemp(suffix=".csv")[1])
+    fd, tmp_name = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    tmp = Path(tmp_name)
     df.to_csv(tmp, index=False)
     return tmp
 
