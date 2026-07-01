@@ -194,6 +194,39 @@ def main():
         "as the dihedral count grows -- helps high-d search.",
     )
     parser.add_argument(
+        "--lowmode-prob",
+        type=float,
+        default=0.0,
+        help="Phase 2.5 low-mode search: probability that an eligible BO step (past "
+        "--lowmode-warmup evaluations) is replaced by a committed kick along a soft "
+        "mode followed by an UNCONSTRAINED relaxation (letting the dihedrals move, so "
+        "the geometry can slide along a curved fold valley the line-restricted BO step "
+        "cannot cross). 0 (default) disables.",
+    )
+    parser.add_argument(
+        "--lowmode-warmup",
+        type=int,
+        default=100,
+        help="With --lowmode-prob, only start low-mode moves after this many "
+        "evaluations (default 100); align it past the gradient Phase A.",
+    )
+    parser.add_argument(
+        "--lowmode-kick-deg",
+        type=float,
+        default=60.0,
+        help="With --lowmode-prob, per-dihedral RMS kick amplitude (degrees, "
+        "default 60) along the chosen soft mode.",
+    )
+    parser.add_argument(
+        "--lowmode-kick-dir",
+        choices=["pca", "enm"],
+        default="pca",
+        help="Kick-direction source for low-mode moves: 'pca' (data-derived position "
+        "PCA of the low-energy set) or 'enm' (data-independent elastic-network soft "
+        "modes -- global bend/compaction = folding, projected to torsion space). "
+        "Default 'pca'.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -339,6 +372,10 @@ def main():
         grad_refit_dense_until=args.grad_refit_dense_until,
         grad_refit_every=args.grad_refit_every,
         lengthscale_prior=args.lengthscale_prior,
+        lowmode_prob=args.lowmode_prob,
+        lowmode_warmup=args.lowmode_warmup,
+        lowmode_kick_deg=args.lowmode_kick_deg,
+        lowmode_kick_dir=args.lowmode_kick_dir,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -554,6 +591,10 @@ def main():
         grad_refit_dense_until=config.grad_refit_dense_until,
         grad_refit_every=config.grad_refit_every,
         lengthscale_prior=config.lengthscale_prior,
+        lowmode_prob=config.lowmode_prob,
+        lowmode_warmup=config.lowmode_warmup,
+        lowmode_kick_deg=config.lowmode_kick_deg,
+        lowmode_kick_dir=config.lowmode_kick_dir,
         acq_num_restarts=config.acq_num_restarts,
         acq_raw_samples=config.acq_raw_samples,
         gradient_window=config.gradient_window,

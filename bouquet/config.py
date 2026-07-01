@@ -194,6 +194,13 @@ class Configuration:
     # Value-only-GP lengthscale prior: "none" (free fit, historical) or "dim_scaled"
     # (Hvarfner dimensionality-scaled LogNormal). See solver._periodic_covar_module.
     lengthscale_prior: str = "none"
+    # Phase 2.5 low-mode / basin-hopping moves (see solver._low_mode_move). 0 disables;
+    # with prob lowmode_prob (past lowmode_warmup evals) a step is a committed kick +
+    # UNCONSTRAINED relax along a soft mode. lowmode_kick_dir = "pca" | "enm".
+    lowmode_prob: float = 0.0
+    lowmode_warmup: int = 100
+    lowmode_kick_deg: float = 60.0
+    lowmode_kick_dir: str = "pca"
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings

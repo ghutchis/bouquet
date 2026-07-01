@@ -1273,6 +1273,35 @@ def add_run_args(parser, config_names, priors_default=PRIORS_FILE_DEFAULT,
                         help="Print the plan and trial count, then exit")
 
 
+def accept_multi_input(parser) -> None:
+    """Let the single-file ``input`` positional added by ``add_analyze_args`` /
+    ``add_traj_args`` accept many files, so an ``analyze <stem>_s*.csv`` glob over a
+    distributed SLURM array's per-(seed, arm) output works. Pair with
+    ``concat_sweep_csvs`` in the subcommand handler."""
+    for action in parser._actions:
+        if action.dest == "input":
+            action.nargs = "+"
+            action.help = "per-(seed, arm) sweep CSV(s); concatenated"
+
+
+def concat_sweep_csvs(paths, drop_traj: bool = True) -> Path:
+    """Concatenate the per-(seed, arm) CSVs a distributed array writes into one tidy CSV
+    (``analyze``/``trajectory`` each read a single file). ``drop_traj`` filters out
+    ``*_traj.csv`` so an ``analyze <stem>_s*.csv`` glob that also matched the trajectory
+    files still works."""
+    import tempfile
+
+    import pandas as pd
+
+    files = [p for p in paths if not (drop_traj and "_traj" in str(p))]
+    if not files:
+        sys.exit("no input CSVs (after dropping _traj files)")
+    df = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
+    tmp = Path(tempfile.mkstemp(suffix=".csv")[1])
+    df.to_csv(tmp, index=False)
+    return tmp
+
+
 def add_analyze_args(parser) -> None:
     parser.add_argument("input", type=Path, help="Tidy sweep CSV from 'run'")
     parser.add_argument("--tol", type=float, default=1e-3,

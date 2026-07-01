@@ -222,6 +222,9 @@ class OptimizationState:
     lowmode_prob: float = 0.0
     lowmode_warmup: int = 100
     lowmode_kick_deg: float = 60.0
+    # Kick-direction source for low-mode moves: "pca" (data-derived position-PCA) or
+    # "enm" (data-independent elastic-network soft modes). See _low_mode_move.
+    lowmode_kick_dir: str = "pca"
     lowmode_count: int = 0
 
     # PiBO fields
@@ -1116,19 +1119,35 @@ def _low_mode_move(
     if ss.n_elite < k + 1:
         return None
 
-    # Kick the incumbent along a random one of the top-k soft (position-PCA) directions,
-    # random sign, amplitude ~ lowmode_kick_deg RMS per dihedral.
-    _, V = ss.pca_basis(k)                       # (d, k) tangent (radian) directions
-    direction = V[:, rng.integers(k)]
-    direction = direction / np.linalg.norm(direction)
-    if rng.random() < 0.5:
-        direction = -direction
-    amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
-    target_deg = np.rad2deg(ss._incumbent + amp * direction) % 360.0
-
     # Anchor = the incumbent's actual 3D structure (lowest-energy observation).
     best_idx = int(state.observed_energies.argmin().item())
     anchor = state.observed_atoms[best_idx]
+
+    # Kick direction: a soft mode from one of two sources.
+    #  "pca"  -- top-k position-PCA of the low-energy set (data-derived; the fold
+    #            diagnostics found these MISS the fold direction once the search is
+    #            stuck, since the fold basin was never sampled).
+    #  "enm"  -- the softest non-trivial Anisotropic Network Model modes projected
+    #            into torsion space (bouquet.enm): the global bend/compaction motions
+    #            read off the geometry+connectivity alone, so they are
+    #            DATA-INDEPENDENT and keep pointing along the fold even when stuck.
+    # A random one of the k modes (random sign), amplitude ~ lowmode_kick_deg RMS/dih.
+    V = None
+    if getattr(state, "lowmode_kick_dir", "pca") == "enm":
+        from bouquet.enm import enm_dihedral_modes
+        chains = [tuple(di.chain) for di in dihedrals]
+        V = enm_dihedral_modes(anchor.get_positions(), chains, k)
+        if V.shape[1] == 0:                      # no usable ENM mode
+            V = None
+    if V is None:                                # PCA (default, or ENM fallback)
+        _, V = ss.pca_basis(k)                   # (d, k) tangent (radian) directions
+    direction = V[:, rng.integers(V.shape[1])]
+    direction = direction / np.linalg.norm(direction)
+    if rng.random() < 0.5:
+        direction = -direction
+    # incumbent + amp*direction, wrapped to torsion degrees (reuse LowEnergySubspace.line).
+    amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
+    target_deg = ss.line(direction, np.array([amp]))[0]
 
     # Stage 1: set the kicked dihedrals and short *constrained* relax (clash cleanup).
     _, atoms = evaluate_energy(
@@ -1660,6 +1679,7 @@ def run_optimization(
     lowmode_prob: float = 0.0,
     lowmode_warmup: int = 100,
     lowmode_kick_deg: float = 60.0,
+    lowmode_kick_dir: str = "pca",
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     geom_log_path: Path | None = None,
@@ -1766,6 +1786,7 @@ def run_optimization(
     state.lowmode_prob = lowmode_prob
     state.lowmode_warmup = lowmode_warmup
     state.lowmode_kick_deg = lowmode_kick_deg
+    state.lowmode_kick_dir = lowmode_kick_dir
     # Dedicated RNG for the collective-/low-mode-move coin/direction, offset from the
     # global seed so it doesn't co-vary with the torch/numpy streams but stays
     # reproducible (paired comparisons across arms at a fixed seed). Shared by both
