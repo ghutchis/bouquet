@@ -80,6 +80,7 @@ from bouquet.config import (
     FAILURE_ENERGY_EV,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
+    HIGH_D_DIHEDRAL_THRESHOLD,
     INITIAL_GUESS_STD,
     KB_EV_PER_K,
     KCAL_TO_EV,
@@ -192,39 +193,21 @@ class OptimizationState:
     # _periodic_covar_module.
     lengthscale_prior: str = "none"
 
-    # Phase 2c hybrid acquisition (collective moves). With probability
-    # collective_prob, an eligible step (>= collective_warmup evaluations) replaces the
-    # global LogEI optimization with a line-restricted search along a collective
-    # (soft/valley) direction through the incumbent -- see _select_collective_move.
-    # 0 disables (pure axis-wise BO). collective_modes is the number of leading
-    # subspace directions to sample from; collective_rng/collective_count are runtime
-    # state (the move-type coin and a tally for the end-of-run log).
-    collective_prob: float = 0.0
-    collective_warmup: int = 100
-    collective_modes: int = 4
-    collective_rng: np.random.Generator | None = None
-    collective_count: int = 0
-    # Use gradient soft modes for a collective move only when the position/gradient
-    # subspace overlap is at least this (else fall back to PCA). 0.0 forces gradient
-    # modes whenever valid (guards only against gradient_modes raising); see
-    # _select_collective_move / LowEnergySubspace.overlap.
-    collective_overlap_min: float = 0.5
-    # Of the collective_count moves, how many used gradient soft modes (vs PCA
-    # fallback), and the overlap values seen (for the end-of-run diagnostic).
-    collective_grad_count: int = 0
-    collective_overlaps: list = field(default_factory=list)
-
     # Phase 2.5 low-mode / basin-hopping move. With probability lowmode_prob an eligible
     # step (>= lowmode_warmup evaluations) is replaced by a committed kick along a soft
     # mode + UNCONSTRAINED relaxation (see _low_mode_move) -- the move designed for the
-    # curved fold valley. lowmode_kick_deg is the per-dihedral RMS kick amplitude. Reuses
-    # collective_rng / collective_modes. 0 disables.
+    # curved fold valley. lowmode_kick_deg is the per-dihedral RMS kick amplitude;
+    # lowmode_modes is how many leading soft modes to draw a kick from. lowmode_rng is the
+    # runtime move-type coin / direction RNG, lowmode_count a tally for the end-of-run log.
     lowmode_prob: float = 0.0
     lowmode_warmup: int = 100
     lowmode_kick_deg: float = 60.0
-    # Kick-direction source for low-mode moves: "pca" (data-derived position-PCA) or
-    # "enm" (data-independent elastic-network soft modes). See _low_mode_move.
+    lowmode_modes: int = 4
+    # Kick-direction source: "pca" (data-derived position-PCA; the default and benchmark
+    # winner) or "enm" (data-independent elastic-network soft modes; dormant, lost to PCA
+    # -- see bouquet.enm). See _low_mode_move.
     lowmode_kick_dir: str = "pca"
+    lowmode_rng: np.random.Generator | None = None
     lowmode_count: int = 0
 
     # PiBO fields
@@ -512,17 +495,9 @@ def _select_next_points_botorch(
     gradient_window: int = 0,
     gradient_keep: str = "recent",
     lengthscale_prior: str = "none",
-    restrict_candidates: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
-
-    If ``restrict_candidates`` (normalized [0, 1] coords, shape ``(M, d)``) is given,
-    the acquisition is *not* globally optimized: it is evaluated on those candidates
-    and the best is returned. This implements the Phase 2c line-restricted search --
-    the candidates are a 1-D line along a collective direction through the incumbent
-    (see ``_select_collective_move``) -- while reusing the exact same GP fit and
-    acquisition function as a standard step.
 
     Parameters:
         train_X (torch.Tensor): Observed dihedral coordinates, shape (n_observations, n_dims), in degrees.
@@ -630,26 +605,16 @@ def _select_next_points_botorch(
         else:
             acqf = base_acqf
 
-        if restrict_candidates is not None:
-            # Line-restricted (Phase 2c): evaluate the acquisition on the supplied
-            # candidates and take the best, instead of optimizing globally.
-            cand_t = torch.as_tensor(
-                restrict_candidates, dtype=train_x.dtype, device=train_x.device
-            )
-            with torch.no_grad():
-                acq_vals = acqf(cand_t.unsqueeze(1))  # (M, 1, d) -> (M,)
-            candidate = cand_t[int(torch.argmax(acq_vals))].reshape(1, train_x.shape[1])
-        else:
-            # bounds are [0, 1] for each dihedral since we standardized above
-            bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
-            bounds[1, :] = 1.0
-            candidate, _ = optimize_acqf(
-                acqf,
-                bounds=bounds,
-                q=1,  # q = 1: no batching
-                num_restarts=acq_num_restarts,
-                raw_samples=acq_raw_samples,
-            )
+        # bounds are [0, 1] for each dihedral since we standardized above
+        bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
+        bounds[1, :] = 1.0
+        candidate, _ = optimize_acqf(
+            acqf,
+            bounds=bounds,
+            q=1,  # q = 1: no batching
+            num_restarts=acq_num_restarts,
+            raw_samples=acq_raw_samples,
+        )
         t_acq = time.perf_counter() - _t_acq0
 
     # Stopping-rule certificate: evaluate the just-fitted GP (and the unwrapped
@@ -1018,70 +983,6 @@ def _log_improvement_geometry(
     append_xyz_frame(state.geom_log_path, atoms, comment)
 
 
-# Phase 2c collective-move line: half-range (radians) and resolution of the 1-D scan
-# along a collective direction through the incumbent. +/- 2*pi lets a unit tangent
-# direction drive large coordinated rotations (the dominant dihedrals swing furthest);
-# wrapping mod 360 folds the line onto the torus, and LogEI picks the best point.
-_COLLECTIVE_ALPHA = 2.0 * math.pi
-_COLLECTIVE_RESOLUTION = 201
-# Minimum elite points before a collective move is meaningful (need a stable subspace).
-_COLLECTIVE_MIN_ELITE = 8
-
-
-def _select_collective_move(
-    state: OptimizationState, k: int, rng: np.random.Generator
-) -> np.ndarray | None:
-    """Build the low-energy subspace and return a line of candidate coordinates
-    (normalized [0, 1], shape ``(M, d)``) along one collective direction through the
-    incumbent, or ``None`` to fall back to a standard step.
-
-    The direction is drawn (uniformly) from the ``k`` leading position-PCA modes
-    (the robust valley-floor directions); when gradients are available and the
-    position/gradient subspaces agree (``overlap``), the softest gradient modes are
-    used instead. Caller feeds the returned candidates to
-    ``_select_next_points_botorch(restrict_candidates=...)`` so the GP fit and
-    acquisition are identical to a standard step -- only the candidate set is the line.
-    """
-    from bouquet.subspace import LowEnergySubspace
-
-    coords = state.observed_coords.detach().cpu().numpy()
-    energies = state.observed_energies.detach().cpu().numpy()
-    grads = (
-        state.observed_gradients.detach().cpu().numpy()
-        if state.observed_gradients is not None
-        else None
-    )
-    # The basis has at most `d` columns (eigenvectors of the (d, d) covariance), so
-    # asking for more modes than torsions would let `rng.integers(k)` index past the
-    # available columns. Clamp k to the torsion count.
-    k = min(k, coords.shape[1])
-    ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
-    ss.update(coords, energies, grads)
-    if ss.n_elite < max(_COLLECTIVE_MIN_ELITE, k + 1):
-        return None
-
-    # Prefer gradient soft modes only when they're available, valid, and consistent
-    # with the position PCA (overlap guards the degenerate-floor inversion failure).
-    direction = None
-    if grads is not None and np.isfinite(grads).all(axis=1).sum() >= k + 1:
-        try:
-            ov = ss.overlap(k)
-            state.collective_overlaps.append(ov)
-            if ov >= state.collective_overlap_min:
-                V = ss.gradient_modes(k, soft=True)
-                direction = V[:, rng.integers(k)]
-                state.collective_grad_count += 1
-        except ValueError:
-            direction = None
-    if direction is None:
-        _, V = ss.pca_basis(k)
-        direction = V[:, rng.integers(k)]
-
-    alphas = np.linspace(-_COLLECTIVE_ALPHA, _COLLECTIVE_ALPHA, _COLLECTIVE_RESOLUTION)
-    line_deg = ss.line(direction, alphas)  # (M, d), degrees
-    return line_deg / 360.0
-
-
 # Phase 2.5 low-mode move relaxation budgets. The constrained pre-relax removes the
 # worst clashes at the kicked dihedrals; the UNCONSTRAINED relax then lets every DOF
 # (dihedrals included) slide to the nearest local minimum -- the step that bends a
@@ -1113,7 +1014,7 @@ def _low_mode_move(
     energies = state.observed_energies.detach().cpu().numpy()
     # Clamp to the torsion count: the PCA basis has at most `d` columns, so a larger
     # k would let the `rng.integers(k)` mode pick index past the available columns.
-    k = min(state.collective_modes, coords.shape[1])
+    k = min(state.lowmode_modes, coords.shape[1])
     ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
     ss.update(coords, energies)
     if ss.n_elite < k + 1:
@@ -1123,17 +1024,14 @@ def _low_mode_move(
     best_idx = int(state.observed_energies.argmin().item())
     anchor = state.observed_atoms[best_idx]
 
-    # Kick direction: a soft mode from one of two sources.
-    #  "pca"  -- top-k position-PCA of the low-energy set (data-derived; the fold
-    #            diagnostics found these MISS the fold direction once the search is
-    #            stuck, since the fold basin was never sampled).
-    #  "enm"  -- the softest non-trivial Anisotropic Network Model modes projected
-    #            into torsion space (bouquet.enm): the global bend/compaction motions
-    #            read off the geometry+connectivity alone, so they are
-    #            DATA-INDEPENDENT and keep pointing along the fold even when stuck.
-    # A random one of the k modes (random sign), amplitude ~ lowmode_kick_deg RMS/dih.
+    # Kick direction: a random one of the k soft modes (random sign), amplitude
+    # ~ lowmode_kick_deg RMS/dih.
+    #  "pca" -- top-k position-PCA of the low-energy set (the default and benchmark
+    #           winner: adaptive directions that re-aim as relaxation walks the incumbent).
+    #  "enm" -- softest elastic-network modes projected into torsion space (bouquet.enm);
+    #           DORMANT: data-independent, lost to PCA in the Phase-C benchmark.
     V = None
-    if getattr(state, "lowmode_kick_dir", "pca") == "enm":
+    if state.lowmode_kick_dir == "enm":
         from bouquet.enm import enm_dihedral_modes
         chains = [tuple(di.chain) for di in dihedrals]
         V = enm_dihedral_modes(anchor.get_positions(), chains, k)
@@ -1247,12 +1145,12 @@ def _run_optimization_loop(
         if (
             state.lowmode_prob > 0
             and len(state.observed_energies) >= state.lowmode_warmup
-            and state.collective_rng is not None
-            and state.collective_rng.random() < state.lowmode_prob
+            and state.lowmode_rng is not None
+            and state.lowmode_rng.random() < state.lowmode_prob
         ):
             _t0 = time.perf_counter()
             lowmode_result = _low_mode_move(
-                state, dihedrals, calc, relaxCalc, state.collective_rng
+                state, dihedrals, calc, relaxCalc, state.lowmode_rng
             )
             t_lowmode = time.perf_counter() - _t0
 
@@ -1263,23 +1161,7 @@ def _run_optimization_loop(
             t_select, t_eval = 0.0, t_lowmode
             state.lowmode_count += 1
         else:
-            # ---- standard BO step (optionally a Phase 2c collective line move) ----
-            # Phase 2c: with probability collective_prob (once past the warmup), this
-            # step is a collective move -- the acquisition is restricted to a line along
-            # a soft/valley direction through the incumbent instead of optimized globally.
-            restrict_candidates = None
-            if (
-                state.collective_prob > 0
-                and len(state.observed_energies) >= state.collective_warmup
-                and state.collective_rng is not None
-                and state.collective_rng.random() < state.collective_prob
-            ):
-                restrict_candidates = _select_collective_move(
-                    state, state.collective_modes, state.collective_rng
-                )
-                if restrict_candidates is not None:
-                    state.collective_count += 1
-
+            # ---- standard BO step: fit the GP and optimize the acquisition ----
             cert_out = {} if state.cert_log is not None else None
             # Time the two cost centers separately: GP fit/condition + acquisition
             # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
@@ -1299,7 +1181,6 @@ def _run_optimization_loop(
                 gradient_window=state.gradient_window,
                 gradient_keep=state.gradient_keep,
                 lengthscale_prior=state.lengthscale_prior,
-                restrict_candidates=restrict_candidates,
             )
             t_select = time.perf_counter() - _t0
             if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
@@ -1354,19 +1235,6 @@ def _run_optimization_loop(
         if state.prior_module is not None:
             state.prior_exponent *= state.prior_decay
 
-    if state.collective_prob > 0:
-        ov = state.collective_overlaps
-        ov_str = (
-            f"; pos/grad overlap min/mean/max "
-            f"{min(ov):.2f}/{sum(ov)/len(ov):.2f}/{max(ov):.2f}"
-            if ov else ""
-        )
-        logger.info(
-            f"Phase 2c: {state.collective_count} collective (line-restricted) move(s) "
-            f"of {n_steps} BO steps "
-            f"({state.collective_grad_count} via gradient soft modes, rest via PCA)"
-            f"{ov_str}."
-        )
     if state.lowmode_prob > 0:
         logger.info(
             f"Phase 2.5: {state.lowmode_count} low-mode (kick + unconstrained-relax) "
@@ -1671,14 +1539,11 @@ def run_optimization(
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
     gradient_window: int = 0,
     gradient_keep: str = "recent",
-    lengthscale_prior: str = "none",
-    collective_prob: float = 0.0,
-    collective_warmup: int = 100,
-    collective_modes: int = 4,
-    collective_overlap_min: float = 0.5,
-    lowmode_prob: float = 0.0,
+    lengthscale_prior: str = "auto",
+    lowmode_prob: float | None = None,
     lowmode_warmup: int = 100,
     lowmode_kick_deg: float = 60.0,
+    lowmode_modes: int = 4,
     lowmode_kick_dir: str = "pca",
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
@@ -1750,6 +1615,19 @@ def run_optimization(
         raise ValueError(
             f"gradient_window must be a non-negative integer (0 = all), got {gradient_window}"
         )
+
+    # High-d auto defaults: unless explicitly overridden, turn on the dimensionality-
+    # scaled lengthscale prior and low-mode search once the dihedral count crosses the
+    # high-d threshold -- both help there (see the HDBO benchmarks) and are off at low d.
+    # An explicit prior name, or a concrete lowmode_prob, always wins over "auto"/None.
+    n_dihedrals = len(dihedrals)
+    if lengthscale_prior == "auto":
+        lengthscale_prior = (
+            "dim_scaled" if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else "none"
+        )
+    if lowmode_prob is None:
+        lowmode_prob = 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
+
     # A low-mode move is a kick followed by a constrained + UNCONSTRAINED relaxation
     # (see _low_mode_move); it is meaningless without relaxation and would silently
     # relax structures in a run that asked not to. Reject the combination up front.
@@ -1779,20 +1657,16 @@ def run_optimization(
     state.gradient_window = gradient_window
     state.gradient_keep = gradient_keep
     state.lengthscale_prior = lengthscale_prior
-    state.collective_prob = collective_prob
-    state.collective_warmup = collective_warmup
-    state.collective_modes = collective_modes
-    state.collective_overlap_min = collective_overlap_min
     state.lowmode_prob = lowmode_prob
     state.lowmode_warmup = lowmode_warmup
     state.lowmode_kick_deg = lowmode_kick_deg
+    state.lowmode_modes = lowmode_modes
     state.lowmode_kick_dir = lowmode_kick_dir
-    # Dedicated RNG for the collective-/low-mode-move coin/direction, offset from the
-    # global seed so it doesn't co-vary with the torch/numpy streams but stays
-    # reproducible (paired comparisons across arms at a fixed seed). Shared by both
-    # move types.
-    if collective_prob > 0 or lowmode_prob > 0:
-        state.collective_rng = np.random.default_rng(seed + 99991)
+    # Dedicated RNG for the low-mode-move coin/direction, offset from the global seed so
+    # it doesn't co-vary with the torch/numpy streams but stays reproducible (paired
+    # comparisons across arms at a fixed seed).
+    if lowmode_prob > 0:
+        state.lowmode_rng = np.random.default_rng(seed + 99991)
 
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
     # reference every later evaluation must preserve. The start is computed inside

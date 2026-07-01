@@ -55,6 +55,16 @@ def parse_certificate_betas(s: str) -> tuple:
 # refinement. Targets small molecules where grid size >= the auto total.
 DEFAULT_MIN_AUTO_BO_STEPS = 10
 
+# Dihedral count at/above which "auto" defaults switch on the high-d machinery
+# (dimensionality-scaled lengthscale prior + low-mode search). Below it those default
+# off. See solver.run_optimization.
+# Set from the crossover benchmark (scripts/threshold_bench.py on stopbench d=6-20): the
+# gated combo (dim_scaled prior + low-mode) significantly HURTS at d<=11 (the prior over-
+# smooths the GP -> trapping), then WINS from d=12 up with the gain growing monotonically
+# with d (paired median gain +0.027 @ 12-14 -> +0.094 @ >=18; Spearman rho +0.39, p<1e-4).
+# Low-mode also slashes step-1 trapping (26.8%/43.2% -> 6.2%). 12 is exactly the crossover.
+HIGH_D_DIHEDRAL_THRESHOLD = 12
+
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
@@ -191,13 +201,15 @@ class Configuration:
     # step (the slow reference).
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
-    # Value-only-GP lengthscale prior: "none" (free fit, historical) or "dim_scaled"
-    # (Hvarfner dimensionality-scaled LogNormal). See solver._periodic_covar_module.
-    lengthscale_prior: str = "none"
-    # Phase 2.5 low-mode / basin-hopping moves (see solver._low_mode_move). 0 disables;
-    # with prob lowmode_prob (past lowmode_warmup evals) a step is a committed kick +
-    # UNCONSTRAINED relax along a soft mode. lowmode_kick_dir = "pca" | "enm".
-    lowmode_prob: float = 0.0
+    # Value-only-GP lengthscale prior: "auto" (dim_scaled once d >= the high-d
+    # threshold, else none), "none" (free fit, historical), or "dim_scaled" (Hvarfner
+    # dimensionality-scaled LogNormal). See solver._periodic_covar_module / run_optimization.
+    lengthscale_prior: str = "auto"
+    # Phase 2.5 low-mode / basin-hopping moves (see solver._low_mode_move). None = auto
+    # (0.5 once d >= the high-d threshold, else 0); a float sets it explicitly (0 disables).
+    # With prob lowmode_prob (past lowmode_warmup evals) a step is a committed kick +
+    # UNCONSTRAINED relax along a soft mode. lowmode_kick_dir = "pca" (default) | "enm".
+    lowmode_prob: Optional[float] = None
     lowmode_warmup: int = 100
     lowmode_kick_deg: float = 60.0
     lowmode_kick_dir: str = "pca"

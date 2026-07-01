@@ -186,22 +186,24 @@ def main():
     )
     parser.add_argument(
         "--lengthscale-prior",
-        choices=["none", "dim_scaled"],
-        default="none",
-        help="Prior on the value-only GP's periodic lengthscale. 'none' (default): "
-        "free MLL fit (historical). 'dim_scaled': Hvarfner et al. (ICML 2024) "
+        choices=["auto", "none", "dim_scaled"],
+        default="auto",
+        help="Prior on the value-only GP's periodic lengthscale. 'auto' (default): "
+        "'dim_scaled' once the dihedral count reaches the high-d threshold, else 'none'. "
+        "'none': free MLL fit (historical). 'dim_scaled': Hvarfner et al. (ICML 2024) "
         "dimensionality-scaled LogNormal prior, biasing the GP toward smoother fits "
         "as the dihedral count grows -- helps high-d search.",
     )
     parser.add_argument(
         "--lowmode-prob",
         type=float,
-        default=0.0,
+        default=None,
         help="Phase 2.5 low-mode search: probability that an eligible BO step (past "
         "--lowmode-warmup evaluations) is replaced by a committed kick along a soft "
         "mode followed by an UNCONSTRAINED relaxation (letting the dihedrals move, so "
-        "the geometry can slide along a curved fold valley the line-restricted BO step "
-        "cannot cross). 0 (default) disables.",
+        "the geometry can slide along a curved fold valley a standard BO step cannot "
+        "cross). Default: auto (0.5 once the dihedral count reaches the high-d "
+        "threshold, else 0). Set 0 to disable, or a probability in (0, 1].",
     )
     parser.add_argument(
         "--lowmode-warmup",

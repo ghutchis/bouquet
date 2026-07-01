@@ -39,7 +39,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # Reuse the log parser from batch.py (same directory).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1331,3 +1331,59 @@ def add_traj_args(parser) -> None:
                         "per_molecule/traj_<name>.pdf (default '.')")
     parser.add_argument("--no-plot", action="store_true",
                         help="Skip the PDFs; print the checkpoint table only")
+
+
+def run_sweep_cli(
+    config_names: List[str],
+    build_configurations: Callable[[], Dict[str, List[str]]],
+    baseline_label: str,
+    description: Optional[str] = None,
+    single_surface: bool = False,
+) -> None:
+    """Full run/analyze/traj command-line front-end for a sweep script.
+
+    The run/analyze/traj subcommand wiring is identical across the sweep scripts, so it
+    lives here: a script collapses to just its ``CONFIG_NAMES``, ``build_configurations``
+    (arm -> extra CLI args), and baseline label. ``single_surface=True`` runs the
+    energy==optimizer check before the sweep (needed by gradient arms). The distributed
+    SLURM array writes one CSV per (seed, arm); ``analyze``/``traj`` accept the glob and
+    concatenate (dropping ``*_traj.csv`` for ``analyze``). Usage::
+
+        if __name__ == "__main__":
+            run_sweep_cli(CONFIG_NAMES, build_configurations, BASELINE_LABEL,
+                          description=__doc__, single_surface=True)
+    """
+    def _run(args: argparse.Namespace) -> None:
+        if single_surface:
+            require_single_surface(args.energy, args.optimizer)
+        run_sweep(args, build_configurations())
+
+    def _analyze(args: argparse.Namespace) -> None:
+        args.input = concat_sweep_csvs(args.input, drop_traj=True)
+        analyze(args, baseline_label)
+
+    def _traj(args: argparse.Namespace) -> None:
+        args.input = concat_sweep_csvs(args.input, drop_traj=False)
+        trajectory(args, baseline_label)
+
+    p = argparse.ArgumentParser(
+        description=description, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    r = sub.add_parser("run", help="Run the sweep")
+    add_run_args(r, config_names)
+    r.set_defaults(func=_run)
+
+    a = sub.add_parser("analyze", help="Summarize sweep CSV(s) from the array")
+    add_analyze_args(a)
+    accept_multi_input(a)
+    a.set_defaults(func=_analyze)
+
+    t = sub.add_parser("traj", help="Anytime best-energy-vs-budget curves + plots")
+    add_traj_args(t)
+    accept_multi_input(t)
+    t.set_defaults(func=_traj)
+
+    args = p.parse_args()
+    args.func(args)

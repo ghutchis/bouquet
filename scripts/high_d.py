@@ -34,7 +34,6 @@ Phases (shared machinery in sweep_common.py):
   python scripts/high_d.py traj high_d_traj.csv
 """
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -58,43 +57,7 @@ def build_configurations() -> dict:
     return cfg
 
 
-def run(args: argparse.Namespace) -> None:
-    sc.require_single_surface(args.energy, args.optimizer)
-    sc.run_sweep(args, build_configurations())
-
-
-def _analyze(args: argparse.Namespace) -> None:
-    args.input = sc.concat_sweep_csvs(args.input, drop_traj=True)
-    sc.analyze(args, BASELINE_LABEL)
-
-
-def _traj(args: argparse.Namespace) -> None:
-    args.input = sc.concat_sweep_csvs(args.input, drop_traj=False)
-    sc.trajectory(args, BASELINE_LABEL)
-
-
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = p.add_subparsers(dest="command", required=True)
-
-    r = sub.add_parser("run", help="Run the sweep")
-    sc.add_run_args(r, CONFIG_NAMES)
-    r.set_defaults(func=run)
-
-    a = sub.add_parser("analyze", help="Summarize sweep CSV(s)")
-    sc.add_analyze_args(a)
-    sc.accept_multi_input(a)  # the SLURM array writes one CSV per (seed, arm)
-    a.set_defaults(func=_analyze)
-
-    t = sub.add_parser("traj", help="Anytime best-energy-vs-budget curves + plots")
-    sc.add_traj_args(t)
-    sc.accept_multi_input(t)
-    t.set_defaults(func=_traj)
-
-    args = p.parse_args()
-    args.func(args)
-
-
 if __name__ == "__main__":
-    main()
+    # Gradient arms need energy == optimizer under --relax (single_surface).
+    sc.run_sweep_cli(CONFIG_NAMES, build_configurations, BASELINE_LABEL,
+                     description=__doc__, single_surface=True)
