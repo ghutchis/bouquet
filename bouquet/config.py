@@ -55,6 +55,16 @@ def parse_certificate_betas(s: str) -> tuple:
 # refinement. Targets small molecules where grid size >= the auto total.
 DEFAULT_MIN_AUTO_BO_STEPS = 10
 
+# Dihedral count at/above which "auto" defaults switch on the high-d machinery
+# (dimensionality-scaled lengthscale prior + low-mode search). Below it those default
+# off. See solver.run_optimization.
+# Set from the crossover benchmark (scripts/threshold_bench.py on stopbench d=6-20): the
+# gated combo (dim_scaled prior + low-mode) significantly HURTS at d<=11 (the prior over-
+# smooths the GP -> trapping), then WINS from d=12 up with the gain growing monotonically
+# with d (paired median gain +0.027 @ 12-14 -> +0.094 @ >=18; Spearman rho +0.39, p<1e-4).
+# Low-mode also slashes step-1 trapping (26.8%/43.2% -> 6.2%). 12 is exactly the crossover.
+HIGH_D_DIHEDRAL_THRESHOLD = 12
+
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
@@ -67,9 +77,13 @@ ENERGY_CLIP_OFFSET = 2.0
 GP_PERIOD_LENGTH_MEAN = 1.0
 GP_PERIOD_LENGTH_STD = 0.1
 
-# Acquisition function optimization
-ACQ_NUM_RESTARTS = 64
-ACQ_RAW_SAMPLES = 64
+# Acquisition function optimization. acq24 (24 restarts / 24 raw samples) is the
+# validated default: a paired sweep vs the old 64/64 showed no quality change at
+# ~2x speed, while smaller (acq8) regressed. num_restarts is the real speed lever
+# (each is an L-BFGS multi-start); raw_samples is matched to it for fidelity to the
+# measured config. See scripts/acq_sweep.py (analyze + paired).
+ACQ_NUM_RESTARTS = 24
+ACQ_RAW_SAMPLES = 24
 
 # Initial guess sampling
 INITIAL_GUESS_STD = 90
@@ -94,14 +108,14 @@ DEFAULT_INIT_CONFORMER_CAP = 16
 # while >= 0.5 over-steers and hurts (worse on larger molecules); 0.25 keeps the
 # most early guidance without degrading. (Was 2.0, calibrated for the old summed
 # prior, which froze the search after the mean change.)
-DEFAULT_PRIOR_EXPONENT = 0.25
-DEFAULT_PRIOR_DECAY = 0.9
+DEFAULT_PRIOR_EXPONENT = 0.5
+DEFAULT_PRIOR_DECAY = 0.7
 # Cap on von Mises concentration when fitted priors are used for search; see
 # bouquet.priors.DEFAULT_MAX_CONCENTRATION.
 DEFAULT_PRIOR_MAX_CONCENTRATION = 50.0
 # Uniform background weight mixed into each univariate prior; see
 # bouquet.priors.DEFAULT_BACKGROUND_WEIGHT. 0.0 disables it.
-DEFAULT_PRIOR_BACKGROUND_WEIGHT = 0.0
+DEFAULT_PRIOR_BACKGROUND_WEIGHT = 0.05
 
 KCAL_TO_EV = 1.0 / 23.0605
 
@@ -169,7 +183,7 @@ class Configuration:
     # region. gradient_keep selects which: recent | best | both. See
     # solver._restrict_gradient_mask.
     gradient_window: int = 0
-    gradient_keep: str = "recent"
+    gradient_keep: str = "both"
     # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
     # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
     use_gradients: bool = False
@@ -187,6 +201,18 @@ class Configuration:
     # step (the slow reference).
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
+    # Value-only-GP lengthscale prior: "auto" (dim_scaled once d >= the high-d
+    # threshold, else none), "none" (free fit, historical), or "dim_scaled" (Hvarfner
+    # dimensionality-scaled LogNormal). See solver._periodic_covar_module / run_optimization.
+    lengthscale_prior: str = "auto"
+    # Phase 2.5 low-mode / basin-hopping moves (see solver._low_mode_move). None = auto
+    # (0.5 once d >= the high-d threshold, else 0); a float sets it explicitly (0 disables).
+    # With prob lowmode_prob (past lowmode_warmup evals) a step is a committed kick +
+    # UNCONSTRAINED relax along a soft mode. lowmode_kick_dir = "pca" (default) | "enm".
+    lowmode_prob: Optional[float] = None
+    lowmode_warmup: int = 100
+    lowmode_kick_deg: float = 60.0
+    lowmode_kick_dir: str = "pca"
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings
