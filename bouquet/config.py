@@ -257,6 +257,12 @@ class Configuration:
     charge: int = 0
     multiplicity: int = 1
 
+    # Implicit solvent model. xtb methods pass this straight through as their
+    # native GBSA/ALPB "solvent" keyword; psi4 methods use it to turn on DDX
+    # continuum solvation (see calculator._psi4_calculator). None = gas phase.
+    # Not supported by ml/forcefield methods (ani, aimnet2, mmff, uff).
+    solvent: Optional[str] = None
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.smiles is None and self.input_file is None:

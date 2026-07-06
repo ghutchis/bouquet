@@ -24,7 +24,7 @@ _DEFAULT_NUM_THREADS = 4
 
 @dataclass(frozen=True)
 class MethodSpec:
-    builder: Callable[[Optional["Chem.Mol"], int, int, int], "Calculator"]
+    builder: Callable[[Optional["Chem.Mol"], int, int, int, Optional[str]], "Calculator"]
     category: str
     requires: Tuple[str, ...] = ()       # importable Python modules
     executables: Tuple[str, ...] = ()    # CLI tools that must be on PATH (e.g. gcp)
@@ -65,6 +65,7 @@ def _psi4_calculator(
     num_threads: int,
     charge: int,
     multiplicity: int,
+    solvent: Optional[str] = None,
 ) -> "Calculator":
     try:
         from ase.calculators.psi4 import Psi4
@@ -81,18 +82,47 @@ def _psi4_calculator(
     if basis is not None:
         kwargs["basis"] = basis
 
-    return Psi4(**kwargs)
+    if solvent is None:
+        return Psi4(**kwargs)
+
+    # ASE's Psi4 calculator only forwards a fixed set of parameter names
+    # (method/basis/reference/memory/num_threads/symmetry/charge/multiplicity)
+    # into the actual psi4 calls -- any other kwarg (e.g. a "solvent" kwarg)
+    # is stored but silently never used. So implicit solvation is wired in by
+    # subclassing and setting psi4's DDX continuum-solvation options directly
+    # before each calculate() call.
+    from ase.calculators.calculator import all_changes
+
+    class _SolvatedPsi4(Psi4):
+        def calculate(
+            self, atoms=None, properties=('energy',),
+            system_changes=all_changes, symmetry='c1',
+        ):
+            self.psi4.set_options({"ddx": True, "ddx_solvent": solvent})
+            super().calculate(
+                atoms=atoms, properties=properties,
+                system_changes=system_changes, symmetry=symmetry,
+            )
+
+    return _SolvatedPsi4(**kwargs)
 
 
 # ---- Builders ---------------------------------------------------------------
 
 
-def _ani(*_):
+def _no_solvent(method_name: str, solvent: Optional[str]) -> None:
+    if solvent is not None:
+        raise ValueError(f"{method_name} does not support implicit solvent models")
+
+
+def _ani(mol, num_threads, charge, multiplicity, solvent):
+    _no_solvent("ANI-2x", solvent)
     import torchani
     return torchani.models.ANI2x().ase()
 
 
-def _aimnet2(mol, num_threads, charge, multiplicity):
+def _aimnet2(mol, num_threads, charge, multiplicity, solvent):
+    _no_solvent("AIMNet2", solvent)
     # AIMNet2's ASE calculator takes the total charge in its constructor (it is a
     # charge-aware potential). Spin/multiplicity is not part of the documented
     # AIMNet2ASE API, so only charge is passed; the charge stamped on the Atoms by
@@ -106,20 +136,25 @@ def _xtb(method: str):
     # reads them from each Atoms it evaluates (sum of initial charges / magnetic
     # moments). So the builder ignores the charge/multiplicity args; those are
     # stamped on the Atoms instead (see setup.apply_charge_spin).
-    def builder(*_):
+    def builder(mol, num_threads, charge, multiplicity, solvent):
         from xtb.ase.calculator import XTB
-        return XTB(method=method)
+        kwargs = {"method": method}
+        if solvent is not None:
+            kwargs["solvent"] = solvent
+        return XTB(**kwargs)
     return builder
 
 
-def _rdkit_mmff(mol, *_):
+def _rdkit_mmff(mol, num_threads, charge, multiplicity, solvent):
+    _no_solvent("MMFF", solvent)
     if mol is None:
         raise ValueError("MMFF requires RDKit molecule")
     from bouquet.calc_rdkit import RDKitMMFFCalculator
     return RDKitMMFFCalculator(mol)
 
 
-def _rdkit_uff(mol, *_):
+def _rdkit_uff(mol, num_threads, charge, multiplicity, solvent):
+    _no_solvent("UFF", solvent)
     if mol is None:
         raise ValueError("UFF requires RDKit molecule")
     from bouquet.calc_rdkit import RDKitUFFCalculator
@@ -167,9 +202,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
 
         # ---- DFT -------------------------------------------------------------
         "b3lyp": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "b3lyp-d4", basis="def2-svp",
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
@@ -177,9 +212,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             description="B3LYP with D4 dispersion",
         ),
         "wb97x": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "wb97x-d3bj", basis="def2-svp",
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
@@ -189,9 +224,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
 
         # ---- Wavefunction ----------------------------------------------------
         "mp2": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "df-mp2", basis="def2-tzvp",
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="wavefunction",
             requires=("ase.calculators.psi4",),
@@ -204,9 +239,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
         # `dftd4`). These are command-line programs, not importable modules, so
         # they are checked via `executables` (shutil.which), not `requires`.
         "hf3c": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "hf3c", basis=None,
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="qm-fast",
             requires=("ase.calculators.psi4",),
@@ -214,9 +249,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             description="HF-3c composite method",
         ),
         "b973c": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "b973c", basis=None,
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="qm-fast",
             requires=("ase.calculators.psi4",),
@@ -224,9 +259,9 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             description="B97-3c composite DFT",
         ),
         "r2scan3c": MethodSpec(
-            builder=lambda m, nt, q, mult: _psi4_calculator(
+            builder=lambda m, nt, q, mult, solv: _psi4_calculator(
                 "r2scan3c", basis=None,
-                num_threads=nt, charge=q, multiplicity=mult
+                num_threads=nt, charge=q, multiplicity=mult, solvent=solv
             ),
             category="qm-fast",
             requires=("ase.calculators.psi4",),
@@ -284,6 +319,7 @@ class CalculatorFactory:
         num_threads: int = _DEFAULT_NUM_THREADS,
         charge: int = 0,
         multiplicity: int = 1,
+        solvent: Optional[str] = None,
     ) -> "Calculator":
         registry = _build_available_registry()
         try:
@@ -294,7 +330,7 @@ class CalculatorFactory:
                 f"Method '{method}' is not available. Available methods: {available}"
             ) from None
 
-        return spec.builder(mol, num_threads, charge, multiplicity)
+        return spec.builder(mol, num_threads, charge, multiplicity, solvent)
 
     @classmethod
     def available_methods(cls) -> Tuple[str, ...]:
@@ -328,4 +364,5 @@ class CalculatorFactory:
             num_threads=config.num_threads,
             charge=config.charge,
             multiplicity=config.multiplicity,
+            solvent=config.solvent,
         )

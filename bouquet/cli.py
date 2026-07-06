@@ -147,6 +147,15 @@ def main():
         help="Relax the non-dihedral degrees of freedom before computing energy",
     )
     parser.add_argument(
+        "--solvent",
+        type=str,
+        default=None,
+        help="Implicit solvent model (e.g. 'water'). Default: gas phase (no "
+        "solvent). Supported by xtb methods (gfn2/gfn0/gfnff, via their native "
+        "GBSA/ALPB solvent keyword) and psi4 methods (via DDX continuum "
+        "solvation); not supported by ani, aimnet2, mmff, or uff.",
+    )
+    parser.add_argument(
         "--use-gradients",
         action="store_true",
         help="Use the gradient-enhanced GP surrogate: project the calculator's "
@@ -369,6 +378,7 @@ def main():
         init_conformer_cap=args.init_conformers,
         auto_steps=args.auto,
         relax=args.relax,
+        solvent=args.solvent,
         use_gradients=args.use_gradients,
         gradient_steps=args.gradient_steps,
         grad_refit_dense_until=args.grad_refit_dense_until,
