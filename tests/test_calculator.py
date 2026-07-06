@@ -65,6 +65,17 @@ class TestCalculatorFactory:
             assert calc is not None
             mock_xtb_class.assert_called_once_with(method="GFN2xTB", solvent="water")
 
+    def test_create_gfn0_calculator_with_solvent_raises(self):
+        """GFN0-xTB has no fitted GBSA parameters; requesting a solvent should
+        raise a clear error here rather than reach xtb's opaque
+        'Cannot construct calculator for xtb' InputError."""
+        mock_module = MagicMock()
+        mock_module.XTB = MagicMock()
+
+        with patch.dict("sys.modules", {"xtb.ase.calculator": mock_module, "xtb": MagicMock()}):
+            with pytest.raises(ValueError, match="does not support implicit solvent"):
+                CalculatorFactory.create("gfn0", solvent="water")
+
     def test_create_ani_with_solvent_raises(self):
         """ANI-2x is gas-phase only; requesting a solvent should raise, not be ignored."""
         with patch.dict("sys.modules", {"torchani": MagicMock()}):
@@ -105,6 +116,30 @@ class TestCalculatorFactory:
             )
 
         assert type(calc).__name__ == "Psi4"
+
+    @pytest.mark.parametrize(
+        "method,expected",
+        [
+            ("b3lyp", True),
+            ("wb97x", True),
+            ("mp2", True),
+            ("hf3c", True),
+            ("b973c", True),
+            ("r2scan3c", True),
+            ("gfn2", False),
+            ("gfn0", False),
+            ("gfnff", False),
+            ("ani", False),
+            ("aimnet2", False),
+            ("mmff", False),
+            ("uff", False),
+            ("not_a_real_method", False),
+        ],
+    )
+    def test_uses_psi4(self, method, expected):
+        """Used by the CLI to reject --solvent + --relax on a psi4 optimizer
+        (DDX solvation gradients under relaxation aren't validated)."""
+        assert CalculatorFactory.uses_psi4(method) is expected
 
     def test_create_aimnet2_passes_charge(self):
         """AIMNet2 is charge-aware: charge must reach the AIMNet2ASE constructor."""

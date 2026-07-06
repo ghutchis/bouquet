@@ -257,10 +257,11 @@ class Configuration:
     charge: int = 0
     multiplicity: int = 1
 
-    # Implicit solvent model. xtb methods pass this straight through as their
+    # Implicit solvent model. gfn2/gfnff pass this straight through as xtb's
     # native GBSA/ALPB "solvent" keyword; psi4 methods use it to turn on DDX
     # continuum solvation (see calculator._psi4_calculator). None = gas phase.
-    # Not supported by ml/forcefield methods (ani, aimnet2, mmff, uff).
+    # Not supported by gfn0 (no fitted GBSA parameters) or by ml/forcefield
+    # methods (ani, aimnet2, mmff, uff).
     solvent: Optional[str] = None
 
     def __post_init__(self):

@@ -131,12 +131,19 @@ def _aimnet2(mol, num_threads, charge, multiplicity, solvent):
     return AIMNet2ASE("aimnet2", charge=charge)
 
 
-def _xtb(method: str):
+def _xtb(method: str, supports_solvent: bool = True):
     # xtb's ASE calculator takes neither charge nor spin in its constructor -- it
     # reads them from each Atoms it evaluates (sum of initial charges / magnetic
     # moments). So the builder ignores the charge/multiplicity args; those are
     # stamped on the Atoms instead (see setup.apply_charge_spin).
+    #
+    # GFN0-xTB has no fitted GBSA/ALPB solvation parameters -- passing a solvent
+    # reaches xtb's Fortran layer and fails there with an opaque
+    # "Cannot construct calculator for xtb" InputError, so it's rejected here
+    # with a clearer message instead (GFN2-xTB and GFN-FF do support it).
     def builder(mol, num_threads, charge, multiplicity, solvent):
+        if not supports_solvent:
+            _no_solvent(method, solvent)
         from xtb.ase.calculator import XTB
         kwargs = {"method": method}
         if solvent is not None:
@@ -188,7 +195,7 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             description="GFN2-xTB tight-binding method",
         ),
         "gfn0": MethodSpec(
-            builder=_xtb("GFN0xTB"),
+            builder=_xtb("GFN0xTB", supports_solvent=False),
             category="semiempirical",
             requires=("xtb.ase.calculator",),
             description="GFN0-xTB very fast tight-binding",
@@ -335,6 +342,12 @@ class CalculatorFactory:
     @classmethod
     def available_methods(cls) -> Tuple[str, ...]:
         return tuple(sorted(_build_available_registry()))
+
+    @classmethod
+    def uses_psi4(cls, method: str) -> bool:
+        """Whether `method` is built on psi4 (b3lyp, wb97x, mp2, hf3c, b973c, r2scan3c)."""
+        spec = _FULL_REGISTRY.get(method)
+        return spec is not None and "ase.calculators.psi4" in spec.requires
 
     @classmethod
     def describe_methods(cls) -> Dict[str, str]:
