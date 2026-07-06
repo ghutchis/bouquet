@@ -77,7 +77,7 @@ def evaluate_energy(
     # (e.g. 1000 eV)
     try:
         energy = calc.get_potential_energy(atoms)
-    except:
+    except Exception:
         energy = RELAX_FAILURE_ENERGY_EV
 
     if not relax or energy >= RELAX_FAILURE_ENERGY_EV:
@@ -133,7 +133,7 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
     # if the energy calculation fails, return a high energy
     try:
         energy = energyCalc.get_potential_energy(atoms)
-    except:
+    except Exception:
         energy = RELAX_FAILURE_ENERGY_EV
 
     return energy, atoms

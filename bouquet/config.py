@@ -103,13 +103,13 @@ DEFAULT_INIT_CONFORMER_CAP = 16
 # Prior (PiBO) defaults. The exponent weights the prior against logEI in the
 # additive PiBO objective. Since priors.DihedralPriorModule.forward now *averages*
 # the per-dihedral log-prior (was a sum), its magnitude is O(1) in dihedral count,
-# so the exponent means the same thing across molecule sizes. Smoke sweeps on
-# straight-chain diols (gfn2) show exponent <= 0.25 matches the no-prior baseline
-# while >= 0.5 over-steers and hurts (worse on larger molecules); 0.25 keeps the
-# most early guidance without degrading. (Was 2.0, calibrated for the old summed
-# prior, which froze the search after the mean change.)
+# so the exponent means the same thing across molecule sizes. The prior sweep
+# selected exponent 0.5 with a per-step decay of 0.5: strong early guidance that
+# fades quickly so the data-driven acquisition takes over within a few steps.
+# (Was 2.0, calibrated for the old summed prior, which froze the search after the
+# mean change.)
 DEFAULT_PRIOR_EXPONENT = 0.5
-DEFAULT_PRIOR_DECAY = 0.7
+DEFAULT_PRIOR_DECAY = 0.5
 # Cap on von Mises concentration when fitted priors are used for search; see
 # bouquet.priors.DEFAULT_MAX_CONCENTRATION.
 DEFAULT_PRIOR_MAX_CONCENTRATION = 50.0

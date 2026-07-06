@@ -151,14 +151,6 @@ class RDKitMMFFCalculator(RDKitCalculator):
 class RDKitUFFCalculator(RDKitCalculator):
     """ASE Calculator wrapper for RDKit's UFF (Universal Force Field)."""
 
-    def __init__(self, mol: Chem.Mol, **kwargs):
-        """Initialize the UFF calculator.
-
-        Args:
-            mol: RDKit molecule (connectivity information used for force field)
-        """
-        super().__init__(mol, **kwargs)
-
     def _setup_force_field(self) -> None:
         """Verify UFF can handle this molecule."""
         # UFF doesn't require pre-computed properties like MMFF,

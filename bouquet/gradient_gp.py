@@ -86,7 +86,6 @@ class GradientEnhancedPeriodicGP(Model):
         # Zero out excluded (possibly NaN) gradient rows so they can't poison the
         # stack even though _keep drops them anyway.
         train_grad = torch.where(grad_mask.unsqueeze(-1), train_grad, 0.0)
-        self._train_Y = train_Y
         # Interleaved targets [y_0, g_0,1..d, y_1, ...] matching the kernel layout.
         self._train_stack = torch.cat([train_Y, train_grad], dim=1).reshape(-1, 1)
         # Indices into the full interleaved vector that we actually condition on.

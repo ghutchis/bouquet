@@ -50,8 +50,7 @@ from typing import Optional
 
 import numpy as np
 
-# 1 kcal/mol in eV (matches bouquet.config.KCAL_TO_EV = 1/23.0605).
-_KCAL_TO_EV = 1.0 / 23.0605
+from bouquet.config import KCAL_TO_EV as _KCAL_TO_EV
 
 
 def _wrap_to_pi(x: np.ndarray) -> np.ndarray:

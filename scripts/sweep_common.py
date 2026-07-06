@@ -33,6 +33,7 @@ sweep, rely on the per-molecule-mean statistics in ``analyze`` to average it out
 
 import argparse
 import csv
+import os
 import re
 import sys
 import threading

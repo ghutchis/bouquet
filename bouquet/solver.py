@@ -78,6 +78,8 @@ from bouquet.config import (
     ENSEMBLE_TEMPERATURE,
     ENSEMBLE_WINDOW_KCAL,
     FAILURE_ENERGY_EV,
+    DEFAULT_PRIOR_DECAY,
+    DEFAULT_PRIOR_EXPONENT,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
     HIGH_D_DIHEDRAL_THRESHOLD,
@@ -212,8 +214,8 @@ class OptimizationState:
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
-    prior_exponent: float = 2.0
-    prior_decay: float = 0.9
+    prior_exponent: float = DEFAULT_PRIOR_EXPONENT
+    prior_decay: float = DEFAULT_PRIOR_DECAY
 
     def append_observation(
         self,
@@ -1247,8 +1249,8 @@ def _perform_final_relaxation(
     dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
-) -> Atoms:
-    """Perform final relaxation steps and return best atoms.
+) -> tuple[Atoms, float]:
+    """Perform final relaxation steps and return the best atoms and its e_e0.
 
     Performs two relaxations: first with dihedral constraints, then without.
 
@@ -1259,7 +1261,7 @@ def _perform_final_relaxation(
         relaxCalc: Calculator used for geometry relaxation
 
     Returns:
-        Final optimized Atoms structure
+        (Final optimized Atoms structure, its energy relative to state.start_energy)
     """
     best_idx = state.observed_energies.argmin().item()
     best_coords = state.observed_coords[best_idx].cpu().numpy()
@@ -1319,7 +1321,7 @@ def _perform_final_relaxation(
     if state.add_entry is not None:
         state.add_entry(best_coords, best_atoms, best_energy)
 
-    return best_atoms
+    return best_atoms, best_energy - state.start_energy
 
 
 def _build_selection_gp(
@@ -1528,8 +1530,8 @@ def run_optimization(
     initial_dihedrals: np.ndarray | None = None,
     # New PiBO parameters
     prior_module: DihedralPriorModule | None = None,
-    initial_prior_exponent: float = 2.0,
-    prior_exponent_decay: float = 0.9,
+    initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT,
+    prior_exponent_decay: float = DEFAULT_PRIOR_DECAY,
     return_ensemble: bool = False,
     use_gradients: bool = False,
     gradient_steps: int = 0,
@@ -1712,13 +1714,13 @@ def run_optimization(
         # the ensemble comes back empty (e.g. all evaluations failed).
         ensemble = _perform_ensemble_relaxation(state, dihedrals, calc, relaxCalc)
         if ensemble:
-            best_atoms = ensemble[0][0]
+            best_atoms, best_e_e0, _weight = ensemble[0]
         else:
-            best_atoms = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
-        _log_improvement_geometry(state, best_atoms, "final")
+            best_atoms, best_e_e0 = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+        _log_improvement_geometry(state, best_atoms, "final", e_e0_eV=best_e_e0)
         return best_atoms, ensemble
 
     # Final relaxation and return best structure
-    best_atoms = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
-    _log_improvement_geometry(state, best_atoms, "final")
+    best_atoms, best_e_e0 = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+    _log_improvement_geometry(state, best_atoms, "final", e_e0_eV=best_e_e0)
     return best_atoms

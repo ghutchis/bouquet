@@ -173,7 +173,7 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
-            executables=("dftd4"),
+            executables=("dftd4",),
             description="B3LYP with D4 dispersion",
         ),
         "wb97x": MethodSpec(
@@ -183,7 +183,7 @@ def _build_full_registry() -> Dict[str, MethodSpec]:
             ),
             category="dft",
             requires=("ase.calculators.psi4",),
-            executables=("s-dftd3"),
+            executables=("s-dftd3",),
             description="ωB97X with D3(BJ) dispersion",
         ),
 
