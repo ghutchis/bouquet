@@ -248,11 +248,13 @@ def select_initial_structure(
         return candidates[0], float("nan")
 
     best_atoms, best_energy = None, float("inf")
+    last_error: Exception | None = None
     for i, cand in enumerate(candidates):
         try:
             energy = calc.get_potential_energy(cand)
         except Exception as e:
             logger.warning(f"Energy evaluation failed for candidate {i}: {e}")
+            last_error = e
             continue
         logger.info(f"Initial candidate {i}: {energy:.6f} eV")
         if energy < best_energy:

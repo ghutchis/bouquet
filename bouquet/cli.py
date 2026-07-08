@@ -147,6 +147,16 @@ def main():
         help="Relax the non-dihedral degrees of freedom before computing energy",
     )
     parser.add_argument(
+        "--solvent",
+        type=str,
+        default=None,
+        help="Implicit solvent model (e.g. 'water'). Default: gas phase (no "
+        "solvent). Supported by gfn2 and gfnff (via xtb's native GBSA/ALPB "
+        "solvent keyword) and psi4 methods (via DDX continuum solvation); not "
+        "supported by gfn0 (no fitted GBSA parameters), ani, aimnet2, mmff, "
+        "or uff.",
+    )
+    parser.add_argument(
         "--use-gradients",
         action="store_true",
         help="Use the gradient-enhanced GP surrogate: project the calculator's "
@@ -398,6 +408,7 @@ def main():
         init_conformer_cap=args.init_conformers,
         auto_steps=args.auto,
         relax=args.relax,
+        solvent=args.solvent,
         use_gradients=args.use_gradients,
         gradient_steps=args.gradient_steps,
         grad_refit_dense_until=args.grad_refit_dense_until,
@@ -446,6 +457,24 @@ def main():
             "dE*/dtheta at a constrained minimum of the energy calculator, but the "
             "geometry is relaxed on the optimizer surface. Use "
             f"--optimizer {config.energy_method}, or drop --use-gradients / --relax."
+        )
+
+    # Relaxation drives the optimizer calculator through FIRE2/LBFGS, which need
+    # forces (atoms.get_forces()) at every step. _psi4_calculator's DDX solvation
+    # branch (calculator.py) is only exercised for single-point energies in
+    # practice -- gradients under DDX are not validated here -- so reject the
+    # combination outright rather than risk silently wrong or crashing forces.
+    if (
+        config.solvent is not None
+        and config.relax
+        and CalculatorFactory.uses_psi4(config.optimizer_method)
+    ):
+        raise ValueError(
+            "--solvent with --relax and a psi4-based --optimizer is not supported "
+            f"(got optimizer={config.optimizer_method!r}). Relaxation needs forces "
+            "from the optimizer calculator, and psi4 DDX solvation gradients are "
+            "not validated. Drop --solvent, drop --relax, or use a non-psi4 "
+            "--optimizer (e.g. gfn2/gfnff, which support --solvent directly)."
         )
 
     # Make an output directory

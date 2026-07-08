@@ -101,8 +101,13 @@ def read_checked(path: Path, expected_fields: List[str]) -> List[dict]:
 
 def merge_summary(
     summary_paths: List[Path], out_path: Path, allow_overlap: bool
-) -> Tuple[int, set]:
-    """Concatenate summary CSVs into ``out_path``; return (n_rows, key_set).
+) -> Tuple[int, dict]:
+    """Concatenate summary CSVs into ``out_path``; return (n_rows, key_map).
+
+    ``key_map`` is (config, name, seed) -> the path that won that cell, so
+    ``merge_traj`` can keep only trajectory rows from the same file that
+    survived the summary merge (relevant when ``--allow-overlap`` drops a
+    duplicate: its traj sibling must be dropped too, not just its summary row).
 
     Keys are (config, name, seed). A key appearing in two files means two tasks
     ran the same cell -- fatal unless ``allow_overlap`` (then the first wins).
@@ -136,17 +141,18 @@ def merge_summary(
         w = csv.DictWriter(f, fieldnames=FIELDNAMES)
         w.writeheader()
         w.writerows(merged)
-    return len(merged), set(seen_keys)
+    return len(merged), seen_keys
 
 
 def merge_traj(
-    summary_paths: List[Path], out_path: Path, keep_keys: set
+    summary_paths: List[Path], out_path: Path, keep_keys: dict
 ) -> int:
     """Concatenate the ``_traj`` siblings of each summary file into ``out_path``.
 
-    Only rows whose (config, name, seed) survived the summary merge are kept, so
-    the trajectory file can't carry a duplicate cell the summary dropped. A
-    missing sibling is fatal (the pair must stay consistent for paired analysis).
+    Only rows whose (config, name, seed) survived the summary merge, AND whose
+    file is the one that won that key, are kept -- so an --allow-overlap drop
+    can't leak a duplicate's trajectory rows in. A missing sibling is fatal
+    (the pair must stay consistent for paired analysis).
     """
     merged: List[dict] = []
     for path in summary_paths:
@@ -156,22 +162,10 @@ def merge_traj(
                 f"Missing trajectory sibling for {path.name}: expected {sib.name}. "
                 "Pass --no-traj to merge summaries only."
             )
-@@ merge_summary
-) -> Tuple[int, dict]:
-@@
-    return len(merged), seen_keys
-
-@@ merge_traj
--def merge_traj(
--    summary_paths: List[Path], out_path: Path, keep_keys: set
-def merge_traj(
-    summary_paths: List[Path], out_path: Path, keep_keys: dict
-) -> int:
-@@
-         for row in read_checked(sib, TRAJ_FIELDNAMES):
-             key = (row["config"], row["name"], str(row["seed"]))
+        for row in read_checked(sib, TRAJ_FIELDNAMES):
+            key = (row["config"], row["name"], str(row["seed"]))
             if keep_keys.get(key) == path:
-                 merged.append(row)
+                merged.append(row)
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=TRAJ_FIELDNAMES)
         w.writeheader()

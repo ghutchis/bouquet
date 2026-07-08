@@ -241,7 +241,7 @@ class DihedralPriorModule(nn.Module):
             acq_function=LogExpectedImprovement(...),
             prior_module=prior_module,
             log=True,
-            prior_exponent=2.0,
+            prior_exponent=0.5,
         )
     """
 
