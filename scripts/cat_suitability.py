@@ -34,7 +34,11 @@ if __name__=='__main__':
     args=ap.parse_args()
     print('name\td\ttied_spec\ttied_gen\tmax_spec')
     for smi,name in parse(args.smiles_file):
-        try: r=scan_one(smi, args.priors)
-        except: r=None
-        if r is None: continue
+        try:
+            r = scan_one(smi, args.priors)
+        except Exception as e:
+            print(f"warning: skip {name}: {e}", file=sys.stderr)
+            continue
+        if r is None:
+            continue
         print(f'{name}\t{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}')
