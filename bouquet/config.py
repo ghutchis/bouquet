@@ -65,6 +65,18 @@ DEFAULT_MIN_AUTO_BO_STEPS = 10
 # Low-mode also slashes step-1 trapping (26.8%/43.2% -> 6.2%). 12 is exactly the crossover.
 HIGH_D_DIHEDRAL_THRESHOLD = 12
 
+# Category-tied move (Phase 3) auto-enable thresholds. Unlike low-mode, the category
+# move helps only when there is a repeat the tie can exploit, so it is gated on BOTH the
+# dihedral count AND max_spec (the largest tied fitted-library category = repeat units).
+# From the high_d_lowmode benchmark (scripts/cat_stratified.py on the 103-mol set): cat
+# gain by max_spec is ~0 at <=4 (0.009 eV, coin-flip win) and rises with it; the d>=20
+# bins gain ~0.6 eV while the 14-20 bin is ~0.09 (near the 0.11 eV seed noise floor). The
+# CONTROL (d>=20 & max_spec<=4, large-but-irregular) has median gain -0.11: cat mildly
+# HURTS with no repeat to exploit. So max_spec>4 is the necessary gate; d>14 is inclusive
+# (bump toward 20 for wins clearly above noise). Needs a prior_module for the categories.
+CAT_D_THRESHOLD = 14        # auto-enable only when n_dihedrals > this
+CAT_MAXSPEC_THRESHOLD = 4   # ...AND the largest tied category > this (real repeat)
+
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
@@ -213,6 +225,16 @@ class Configuration:
     lowmode_warmup: int = 100
     lowmode_kick_deg: float = 60.0
     lowmode_kick_dir: str = "pca"
+    # Phase 3 category-tied collective move (see solver._category_move). With prob
+    # category_prob (past category_warmup evals) a step sets every dihedral in a SMARTS
+    # prior category to one shared value (chemistry-defined embedding) and relaxes
+    # UNCONSTRAINED; requires priors_file. category_min_moves reduced points are
+    # prior-seeded before the reduced-space GP is fit. None = auto (0.5 when priors are
+    # given and n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD, i.e.
+    # a large molecule with real repeat structure; else 0); a float sets it explicitly.
+    category_prob: Optional[float] = None
+    category_warmup: int = 20
+    category_min_moves: int = 6
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
     # Prior settings
