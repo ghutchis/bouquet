@@ -127,7 +127,15 @@ def relax_structure(atoms: Atoms, energyCalc: Calculator, calc: Calculator, step
             # Tight final relaxation: L-BFGS to TIGHT_FMAX, no step limit.
             dyn = LBFGS(atoms, logfile=os.devnull)
             dyn.run(fmax=TIGHT_FMAX)
-    except ValueError:  # optimizer failed to converge, probably high energy
+    except Exception:
+        # The optimizer step failed -- either a non-convergent line search
+        # (ValueError) or a calculator failure mid-relaxation (e.g. xtb SCF
+        # non-convergence raised as CalculationFailed) when the geometry walks
+        # into a clashing region. Both mean "this geometry is bad"; fall through
+        # and let the energy evaluation below assign the failure energy. This is
+        # essential for collective category / low-mode moves, whose broadcast
+        # kick can land in a compact clashing coil the constrained pre-relax does
+        # not fully clean up -- an uncaught CalculationFailed there crashes the run.
         pass
 
     # if the energy calculation fails, return a high energy

@@ -116,8 +116,8 @@ def _make_state(energies, coords, atoms, start_energy=-100.0):
         start_atoms=atoms[0],
         start_coords=np.zeros(coords.shape[1]),
         start_energy=start_energy,
-        observed_coords=coords,
-        observed_energies=energies,
+        initial_coords=coords,
+        initial_energies=energies,
         observed_atoms=atoms,
     )
 
