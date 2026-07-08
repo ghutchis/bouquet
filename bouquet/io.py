@@ -12,6 +12,7 @@ __lazy_modules__ = [
 import hashlib
 import json
 import logging
+import re
 import sys
 from csv import DictWriter
 from datetime import datetime
@@ -35,18 +36,43 @@ def setup_logging(out_dir: Path, logger_name: str = "bouquet") -> logging.Logger
     Returns:
         Configured logger instance
     """
-    handlers = [
-        logging.FileHandler(out_dir / "runtime.log"),
-        logging.StreamHandler(sys.stdout),
-    ]
+    # Configure the named "bouquet" logger directly rather than via
+    # logging.basicConfig, which is a no-op after the first call: multiple
+    # programmatic runs in one process would otherwise keep logging to the first
+    # run's handlers/files. Replace (and close) any handlers left from a previous
+    # run so this run's records go to this run's out_dir.
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
 
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-        handlers=handlers,
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+    file_handler = logging.FileHandler(out_dir / "runtime.log")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    # Handlers live on this logger; don't also bubble to the root logger (avoids
+    # duplicate lines if the root is configured elsewhere).
+    logger.propagate = False
 
-    return logging.getLogger(logger_name)
+    return logger
+
+
+def _slugify_name(name: str, max_length: int = 60) -> str:
+    """Sanitize a display name/SMILES into a single safe path segment.
+
+    Replaces any character outside ``[A-Za-z0-9._-]`` (including path separators)
+    with ``_`` and caps the length so a long SMILES cannot blow out the path. Falls
+    back to ``"mol"`` if nothing usable remains.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._")
+    slug = slug[:max_length].strip("._")
+    return slug or "mol"
 
 
 def create_output_directory(name: str, seed: int, energy_method: str, args_dict: dict) -> Path:
@@ -62,7 +88,13 @@ def create_output_directory(name: str, seed: int, energy_method: str, args_dict:
         Path to the created output directory
     """
     params_hash = hashlib.sha256(str(args_dict).encode()).hexdigest()
-    out_dir = Path.cwd() / f"solutions/{name}-{seed}-{energy_method}-{params_hash[-6:]}"
+    # Sanitize the display name before putting it in a path: raw names/SMILES can
+    # contain path separators and other filesystem-hostile characters (e.g.
+    # r"C/C=C\C" would otherwise create nested "solutions/C/C=C\C-..." dirs). The
+    # params hash keeps the directory unique, and the original name is preserved in
+    # run_params.json.
+    slug = _slugify_name(name)
+    out_dir = Path.cwd() / f"solutions/{slug}-{seed}-{energy_method}-{params_hash[-6:]}"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
