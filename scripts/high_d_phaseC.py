@@ -60,7 +60,7 @@ def build_configurations() -> dict:
         "lmonly_enm": PHASE_A + ["--lowmode-prob", "1.0"] + _WARMUP + ["--lowmode-kick-dir", "enm"],
         # Category-tied move in place of the PCA kick; prior loaded for grouping only
         # (--prior-exponent 0 turns off PiBO acquisition steering).
-        "cat": PHASE_A + ["--category-prob", "0.5"] + _CAT_WARMUP
+        "cat": PHASE_A + ["--category-prob", "0.5", "--lowmode-prob", "0"] + _CAT_WARMUP
         + ["--priors", PRIORS, "--prior-exponent", "0"],
         # Both collective moves enabled: the dispatch tries the category move first, then
         # the PCA low-mode on steps it didn't fire -- so P(cat)=0.5, P(pca)=0.25,
