@@ -799,11 +799,11 @@ def _setup_initial_state(
     logger.info(f"Initial dihedral angles: {start_coords}")
     if use_gradients:
         start_energy, start_atoms, start_gradient = evaluate_energy_with_gradient(
-            start_coords, atoms, dihedrals, calc, relaxCalc, relax
+            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax
         )
     else:
         start_energy, start_atoms = evaluate_energy(
-            start_coords, atoms, dihedrals, calc, relaxCalc, relax
+            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax
         )
         start_gradient = np.full(len(start_coords), np.nan, dtype=float)
     logger.info(f"Computed initial energy: {start_energy}")
@@ -1589,9 +1589,12 @@ def _perform_final_relaxation(
     constrained_atoms = best_atoms.copy()  # retained-bonds fallback
     constrained_energy = best_energy  # its energy, restored alongside if we revert
     best_atoms.set_constraint()
-    best_energy, best_atoms = evaluate_energy(
-        best_coords, best_atoms, dihedrals, calc, relaxCalc, steps=None
-    )
+    # Relax the released geometry directly. Going through evaluate_energy would
+    # reapply FixInternals (relax=True re-pins the dihedrals via
+    # set_dihedral/FixInternals), leaving final.xyz still constrained and making
+    # the --retain-bonds release check test a pinned geometry rather than a real
+    # released one.
+    best_energy, best_atoms = relax_structure(best_atoms, calc, relaxCalc, None)
     logger.info(
         f"Performed final relaxation without dihedral constraints. "
         f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
@@ -1863,6 +1866,47 @@ def run_optimization(
     # An explicit prior name, or a concrete lowmode_prob, always wins over "auto"/None.
     # Resolve into locals (the "auto"/None sentinels become concrete values used below).
     n_dihedrals = len(dihedrals)
+
+    # No-rotor short-circuit: with zero dihedrals the BO machinery has nothing to
+    # search (SobolEngine requires dim >= 1 and the GP has no features), so relax
+    # once, write the same outputs a normal run would, and return.
+    if n_dihedrals == 0:
+        logger.info("No rotatable dihedrals detected; relaxing once and returning.")
+        if relax:
+            energy, best_atoms = relax_structure(atoms, calc, relaxCalc, None)
+        else:
+            best_atoms = atoms.copy()
+            best_atoms.calc = calc
+            try:
+                energy = calc.get_potential_energy(best_atoms)
+            except Exception:
+                energy = RELAX_FAILURE_ENERGY_EV
+        logger.info(f"Energy (no rotatable dihedrals): {energy}")
+        # Produce the same artifacts a normal run would. There is a single
+        # (zero-dihedral) structure, so it is both the start and the best: mirror
+        # _setup_initial_state's relaxed.xyz + structure log and the final
+        # current_best.xyz / geometry-trail frame that _perform_final_relaxation's
+        # caller emits.
+        coords = np.zeros(n_dihedrals, dtype=float)
+        if out_dir is not None:
+            if relax:
+                save_structure(out_dir, best_atoms, "relaxed.xyz")
+            log_path, ens_path = initialize_structure_log(out_dir)
+            add_entry = create_structure_logger(log_path, ens_path, energy)
+            add_entry(coords, best_atoms, energy)
+            save_structure(out_dir, best_atoms, "current_best.xyz")
+        # Benchmark geometry trail (no-op unless --geom-log is set): one 'final'
+        # frame, matching _log_improvement_geometry(state, best_atoms, "final").
+        if opts.geom_log_path is not None:
+            geom_log_path = Path(opts.geom_log_path)
+            geom_log_path.open("w").close()
+            append_xyz_frame(
+                geom_log_path, best_atoms, "n_calls=1 e_e0_eV=0.000000 kind=final"
+            )
+        if return_ensemble:
+            return best_atoms, [(best_atoms, 0.0, 1.0)]
+        return best_atoms
+
     lengthscale_prior = opts.lengthscale_prior
     if lengthscale_prior == "auto":
         lengthscale_prior = (
