@@ -1,7 +1,6 @@
 """Low-energy collective-coordinate subspace extraction for high-dimensional search.
 
-This is the shared abstraction for Phase 2/3 of the HDBO plan (see
-``bouquet_hdbo_plan.md``). On flexible foldamers the low-energy basin is reached only
+On flexible foldamers the low-energy basin is reached only
 by a *correlated* rotation of many dihedrals at once (a "fold" / soft collective
 coordinate), which axis-wise acquisition never finds. :class:`LowEnergySubspace`
 extracts that coordinate from the conformers already sampled and exposes it as a

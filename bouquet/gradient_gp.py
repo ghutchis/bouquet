@@ -1,6 +1,6 @@
 """Gradient-enhanced periodic GP that exposes a function-*value* posterior.
 
-This is the integration layer for Phase 1 of gradient-enhanced BO (see
+This is the integration layer for gradient-enhanced BO (see
 ``docs/gradient_enhanced_bo.md``). It trains a GP on stacked ``[E, dE/dtheta]``
 observations using :class:`bouquet.periodic_grad_kernel.PeriodicKernelGrad`, but
 exposes only the marginal posterior over the function value ``E``. Acquisition

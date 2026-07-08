@@ -1,6 +1,6 @@
 """Elastic-network-model (ANM) soft modes projected into torsion space.
 
-Data-*independent* kick directions for the low-mode conformer search (Phase 2.5). The
+Data-*independent* kick directions for the low-mode conformer search. The
 fold diagnostics (D1) found that data-derived modes (PCA of low-energy positions, the
 gradient-covariance active subspace) miss the fold direction because the fold basin was
 never sampled. The Anisotropic Network Model reads the global bend/compaction motions
