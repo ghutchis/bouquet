@@ -10,7 +10,7 @@ from typing import Optional
 # CalculatorFactory.available_methods() (the installed subset).
 from bouquet.calculator import MethodType
 
-__all__ = ["Configuration", "MethodType"]
+__all__ = ["Configuration", "RunOptions", "MethodType"]
 
 
 # Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation
@@ -160,6 +160,92 @@ NUM_THREADS = 4
 
 
 @dataclass(slots=True)
+class RunOptions:
+    """Tuning knobs for :func:`bouquet.solver.run_optimization`.
+
+    Groups the ~two-dozen scalar search/surrogate/benchmark knobs that used to be
+    threaded through ``run_optimization`` as individual keyword arguments, so the
+    solver's public entry point takes the runtime objects (atoms, calculators,
+    ...) plus one ``opts`` object. :class:`Configuration` embeds one as its
+    ``run`` field (so these defaults are declared in exactly one place); the CLI
+    populates it from argparse and the solver reads it back as ``opts``.
+    Direct/library callers construct it directly (all fields default, so
+    ``RunOptions()`` reproduces the historical defaults).
+    """
+
+    # Prior (PiBO) weighting
+    initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT
+    prior_exponent_decay: float = DEFAULT_PRIOR_DECAY
+
+    # Gradient-enhanced surrogate + its cost controls
+    use_gradients: bool = False
+    gradient_steps: int = 0
+    grad_refit_dense_until: int = 20
+    grad_refit_every: int = 0
+    # High-leverage gradient subset (0 = keep all); keep = recent | best | both.
+    gradient_window: int = 0
+    gradient_keep: str = "both"
+
+    # Acquisition-optimizer effort (optimize_acqf)
+    acq_num_restarts: int = ACQ_NUM_RESTARTS
+    acq_raw_samples: int = ACQ_RAW_SAMPLES
+
+    # Value-only-GP lengthscale prior: "auto" | "none" | "dim_scaled"
+    lengthscale_prior: str = "auto"
+
+    # Phase 2.5 low-mode / basin-hopping move (None = auto by dihedral count)
+    lowmode_prob: Optional[float] = None
+    lowmode_warmup: int = 100
+    lowmode_kick_deg: float = 60.0
+    lowmode_modes: int = 4
+    lowmode_kick_dir: str = "pca"
+
+    # Phase 3 category-tied collective move (None = auto; needs a prior_module)
+    category_prob: Optional[float] = None
+    category_warmup: int = 20
+    category_min_moves: int = 6
+
+    # Benchmark-only logging (hidden from the normal CLI happy path)
+    cert_log_path: Optional[Path] = None
+    cert_betas: tuple = DEFAULT_CERTIFICATE_BETAS
+    geom_log_path: Optional[Path] = None
+
+    # Reject evaluations that change the initial covalent bond graph
+    retain_bonds: bool = False
+
+    def __post_init__(self):
+        # Coerce string log paths (direct callers may pass str; the CLI already
+        # wraps with Path).
+        if isinstance(self.cert_log_path, str):
+            self.cert_log_path = Path(self.cert_log_path)
+        if isinstance(self.geom_log_path, str):
+            self.geom_log_path = Path(self.geom_log_path)
+
+        # Validate the gradient-windowing knobs up front: solver._restrict_gradient_mask
+        # silently treats window <= 0 as keep-all and any unknown mode as "both", so an
+        # out-of-range value would otherwise change the surrogate without warning.
+        if self.gradient_keep not in ("recent", "best", "both"):
+            raise ValueError(
+                "gradient_keep must be one of 'recent', 'best', 'both', got "
+                f"{self.gradient_keep!r}"
+            )
+        if self.gradient_window < 0:
+            raise ValueError(
+                "gradient_window must be a non-negative integer (0 = all), got "
+                f"{self.gradient_window}"
+            )
+
+        # Acquisition-optimizer effort must be positive: 0 or negative would reach
+        # optimize_acqf as an opaque failure (or silently skip the search).
+        if self.acq_num_restarts < 1 or self.acq_raw_samples < 1:
+            raise ValueError(
+                "acq_num_restarts and acq_raw_samples must be positive integers; got "
+                f"acq_num_restarts={self.acq_num_restarts}, "
+                f"acq_raw_samples={self.acq_raw_samples}."
+            )
+
+
+@dataclass(slots=True)
 class Configuration:
     """Configuration for a Bouquet optimization run."""
 
@@ -183,93 +269,23 @@ class Configuration:
     init_conformer_cap: int = DEFAULT_INIT_CONFORMER_CAP
     auto_steps: bool = False
     relax: bool = True
-    # Acquisition-optimizer effort (optimize_acqf). num_restarts L-BFGS runs seeded
-    # from raw_samples random points. These dominate per-step BO cost (each eval
-    # queries the GP posterior ~n(1+d)), so they are the main speed lever; lowering
-    # them trades search quality for speed (see scripts/acq_sweep / the timing study).
-    acq_num_restarts: int = ACQ_NUM_RESTARTS
-    acq_raw_samples: int = ACQ_RAW_SAMPLES
-    # High-leverage gradient subset (gradient GP): keep gradients for only this many
-    # points (0 = all), shrinking the augmented GP from n*(1+d) to n + window*d -- a
-    # high-d speedup that, unlike value-only-late, keeps gradients in the active
-    # region. gradient_keep selects which: recent | best | both. See
-    # solver._restrict_gradient_mask.
-    gradient_window: int = 0
-    gradient_keep: str = "both"
-    # Use the gradient-enhanced periodic GP surrogate: record dE/dtheta at each
-    # evaluation and feed it to the acquisition GP (see GradientEnhancedPeriodicGP).
-    use_gradients: bool = False
-    # Cap on the number of leading BO steps that use the gradient-enhanced GP; the
-    # remaining steps use the value-only GP. The gradient GP's per-step cost grows
-    # steeply with observation count, so this bounds it on large molecules while
-    # keeping the early benefit. <=0 keeps gradients for the whole run.
-    gradient_steps: int = 0
-    # Gradient-GP hyperparameter refit schedule (see solver._run_optimization_loop):
-    # cold full fits for the first `grad_refit_dense_until` BO steps, then freeze the
-    # hyperparameters and only re-condition; `grad_refit_every` > 0 cold-refreshes
-    # them every that many post-dense steps. Default (20, 0) = the "gradfreeze"
-    # schedule: cold-fit 20 steps then freeze (validated quality-neutral vs full
-    # refitting across 5-11 dihedrals). Set grad_refit_dense_until=0 to refit every
-    # step (the slow reference).
-    grad_refit_dense_until: int = 20
-    grad_refit_every: int = 0
-    # Value-only-GP lengthscale prior: "auto" (dim_scaled once d >= the high-d
-    # threshold, else none), "none" (free fit, historical), or "dim_scaled" (Hvarfner
-    # dimensionality-scaled LogNormal). See solver._periodic_covar_module / run_optimization.
-    lengthscale_prior: str = "auto"
-    # Phase 2.5 low-mode / basin-hopping moves (see solver._low_mode_move). None = auto
-    # (0.5 once d >= the high-d threshold, else 0); a float sets it explicitly (0 disables).
-    # With prob lowmode_prob (past lowmode_warmup evals) a step is a committed kick +
-    # UNCONSTRAINED relax along a soft mode. lowmode_kick_dir = "pca" (default) | "enm".
-    lowmode_prob: Optional[float] = None
-    lowmode_warmup: int = 100
-    lowmode_kick_deg: float = 60.0
-    lowmode_kick_dir: str = "pca"
-    # Phase 3 category-tied collective move (see solver._category_move). With prob
-    # category_prob (past category_warmup evals) a step sets every dihedral in a SMARTS
-    # prior category to one shared value (chemistry-defined embedding) and relaxes
-    # UNCONSTRAINED; requires priors_file. category_min_moves reduced points are
-    # prior-seeded before the reduced-space GP is fit. None = auto (0.5 when priors are
-    # given and n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD, i.e.
-    # a large molecule with real repeat structure; else 0); a float sets it explicitly.
-    category_prob: Optional[float] = None
-    category_warmup: int = 20
-    category_min_moves: int = 6
     seed: int = field(default_factory=lambda: datetime.now().microsecond)
 
-    # Prior settings
+    # Search / surrogate / benchmark tuning knobs handed to run_optimization.
+    # These live on a single nested RunOptions so their defaults are declared in
+    # exactly one place (RunOptions); the CLI builds one from argparse and the
+    # solver reads it back as ``opts``. See RunOptions for per-field docs.
+    run: RunOptions = field(default_factory=RunOptions)
+
+    # Prior settings. priors_file / concentration / background build the PiBO
+    # prior_module in the CLI; the exponent/decay that weight it at search time
+    # live on ``run`` (initial_prior_exponent / prior_exponent_decay).
     priors_file: Optional[Path] = None
-    initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT
-    prior_exponent_decay: float = DEFAULT_PRIOR_DECAY
     prior_max_concentration: float = DEFAULT_PRIOR_MAX_CONCENTRATION
     prior_background_weight: float = DEFAULT_PRIOR_BACKGROUND_WEIGHT
 
     # Ensemble selection
     ensemble: bool = False
-
-    # When set, reject any evaluated geometry whose covalent bond graph differs
-    # from the initial structure's (the optimizer can rearrange/dissociate strained
-    # or unusual species into a spuriously low, non-conformer minimum). Such points
-    # get a failure energy so they are never selected; a final relaxation that
-    # breaks bonds reverts to the constrained best. See bouquet.setup.connectivity.
-    retain_bonds: bool = False
-
-    # Stopping-rule calibration benchmark: when set, the solver logs a per-BO-step
-    # certificate (mu_min/alpha_max/lb + e_eval/e_best/n_calls/wall_s) to this CSV.
-    # certificate_betas is the grid of confidence multipliers for the lower-bound
-    # term -- one lb_b<beta> column per beta, so the offline replay can calibrate
-    # beta without re-running.
-    certificate_log: Optional[Path] = None
-    certificate_betas: tuple = DEFAULT_CERTIFICATE_BETAS
-
-    # Stopping-rule benchmark, geometry trail: when set, the solver writes the
-    # geometry at each best-so-far improvement (constrained-relaxed, the geometry
-    # actually visited) plus the final unconstrained-relaxed best to this
-    # multi-frame XYZ. Written incrementally so a timed-out (censored) run still
-    # keeps its improvements. Enables the RMSD-identity success criterion and
-    # distinct-conformer (basin) analysis offline -- the torsion vector alone can't,
-    # since it omits ring pucker and other non-dihedral DOF.
-    geometry_log: Optional[Path] = None
 
     # Output
     out_dir: Optional[Path] = None
@@ -300,17 +316,6 @@ class Configuration:
             self.out_dir = Path(self.out_dir)
         if isinstance(self.priors_file, str):
             self.priors_file = Path(self.priors_file)
-        if isinstance(self.certificate_log, str):
-            self.certificate_log = Path(self.certificate_log)
-
-        # Acquisition-optimizer effort must be positive: 0 or negative would reach
-        # optimize_acqf as an opaque failure (or silently skip the search).
-        if self.acq_num_restarts < 1 or self.acq_raw_samples < 1:
-            raise ValueError(
-                "acq_num_restarts and acq_raw_samples must be positive integers; got "
-                f"acq_num_restarts={self.acq_num_restarts}, "
-                f"acq_raw_samples={self.acq_raw_samples}."
-            )
 
         # Derive a run name from the input if one wasn't provided: prefer the
         # SMILES string, otherwise fall back to the input file's stem.

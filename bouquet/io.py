@@ -17,7 +17,7 @@ from csv import DictWriter
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable
 
 from ase import Atoms
 from ase.io.xyz import simple_write_xyz
@@ -253,10 +253,10 @@ def save_ensemble(
     """Write the final Boltzmann ensemble to disk.
 
     Produces two files in ``out_dir``:
-      * ``ensemble_final.xyz`` â one frame per conformer (sorted by energy),
+      * ``ensemble_final.xyz`` -- one frame per conformer (sorted by energy),
         each comment line carrying the relative energy (kcal/mol, measured from
         the lowest ensemble member) and the Boltzmann population; and
-      * ``ensemble.csv`` â a summary table of index, relative energy, and weight.
+      * ``ensemble.csv`` -- a summary table of index, relative energy, and weight.
 
     Args:
         out_dir: Output directory.

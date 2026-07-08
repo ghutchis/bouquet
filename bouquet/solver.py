@@ -29,7 +29,7 @@ import time
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, InitVar
 from pathlib import Path
 from typing import Callable
 
@@ -89,6 +89,7 @@ from bouquet.config import (
     KB_EV_PER_K,
     KCAL_TO_EV,
     RELAX_FAILURE_ENERGY_EV,
+    RunOptions,
 )
 from bouquet.gradient_gp import GradientEnhancedPeriodicGP
 from bouquet.io import (
@@ -136,12 +137,19 @@ class OptimizationState:
     start_atoms: Atoms
     start_coords: np.ndarray
     start_energy: float
-    observed_coords: torch.Tensor  # Shape: (n_observations, n_dihedrals)
-    observed_energies: torch.Tensor  # Shape: (n_observations,)
+    # Observations live in pre-sized buffers grown once per phase (see reserve /
+    # append_observation) so accumulating N points is O(N) copy cost, not O(N^2).
+    # They are exposed as index-aligned tensors via the observed_coords /
+    # observed_energies / observed_gradients properties below; the constructor
+    # takes the initial rows through these InitVar parameters (kwarg names differ
+    # from the properties to avoid shadowing them).
+    initial_coords: InitVar[torch.Tensor]  # Shape: (n_initial, n_dihedrals)
+    initial_energies: InitVar[torch.Tensor]  # Shape: (n_initial,)
     # dE/dtheta (eV/rad) per observation, index-aligned with the tensors above;
     # NaN where the gradient is unavailable (failed eval, or use_gradients off).
-    observed_gradients: torch.Tensor | None = None  # Shape: (n_observations, n_dihedrals)
-    # Per-observation Atoms, aligned index-for-index with the tensors above.
+    # None keeps gradients unrecorded entirely (never appended to in that case).
+    initial_gradients: InitVar[torch.Tensor | None] = None  # (n_initial, n_dihedrals)
+    # Per-observation Atoms, aligned index-for-index with the observed_* tensors.
     observed_atoms: list[Atoms] = field(default_factory=list)
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
@@ -244,6 +252,68 @@ class OptimizationState:
     prior_exponent: float = DEFAULT_PRIOR_EXPONENT
     prior_decay: float = DEFAULT_PRIOR_DECAY
 
+    # Observation buffers: pre-sized tensors whose first `_n` rows are the logical
+    # observations (exposed via the observed_* properties). init=False -- populated
+    # from the InitVar args in __post_init__ and grown by reserve().
+    _coords_buf: torch.Tensor = field(init=False, repr=False, default=None)
+    _energies_buf: torch.Tensor = field(init=False, repr=False, default=None)
+    _grads_buf: torch.Tensor | None = field(init=False, repr=False, default=None)
+    _n: int = field(init=False, repr=False, default=0)
+
+    def __post_init__(
+        self,
+        initial_coords: torch.Tensor,
+        initial_energies: torch.Tensor,
+        initial_gradients: torch.Tensor | None,
+    ) -> None:
+        # Adopt the initial rows as the starting buffers; reserve() grows them in
+        # place (exact, single allocation per phase) as observations are appended.
+        self._n = int(initial_coords.shape[0])
+        self._coords_buf = initial_coords.clone()
+        self._energies_buf = initial_energies.clone()
+        self._grads_buf = (
+            None if initial_gradients is None else initial_gradients.clone()
+        )
+
+    @property
+    def observed_coords(self) -> torch.Tensor:
+        """Observed dihedral coordinates, shape (n_observations, n_dihedrals)."""
+        return self._coords_buf[: self._n]
+
+    @property
+    def observed_energies(self) -> torch.Tensor:
+        """Observed relative energies, shape (n_observations,)."""
+        return self._energies_buf[: self._n]
+
+    @property
+    def observed_gradients(self) -> torch.Tensor | None:
+        """Observed dE/dtheta (n_observations, n_dihedrals), or None if unrecorded."""
+        return None if self._grads_buf is None else self._grads_buf[: self._n]
+
+    def reserve(self, additional: int) -> None:
+        """Ensure room for ``additional`` more observations without reallocating.
+
+        Grows the observation buffers once, to exactly ``_n + additional`` rows (a
+        single copy), when they are too small; a no-op otherwise. Call it at the
+        start of each append phase (the initial guesses and the BO loop, whose
+        sizes are known up front) so the per-append writes never reallocate --
+        keeping accumulation O(N) instead of the O(N^2) of a per-append torch.cat.
+        """
+        need = self._n + additional
+        if self._coords_buf.shape[0] >= need:
+            return
+        d = self._coords_buf.shape[1]
+
+        def _grown(buf: torch.Tensor, shape: tuple[int, ...]) -> torch.Tensor:
+            new = buf.new_empty(shape)
+            new[: self._n] = buf[: self._n]
+            return new
+
+        self._coords_buf = _grown(self._coords_buf, (need, d))
+        self._energies_buf = _grown(self._energies_buf, (need,))
+        if self._grads_buf is not None:
+            self._grads_buf = _grown(self._grads_buf, (need, d))
+
     def append_observation(
         self,
         coords: np.ndarray,
@@ -253,34 +323,34 @@ class OptimizationState:
     ) -> None:
         """Append a new observation, keeping observed_atoms index-aligned.
 
+        Writes into the pre-sized buffers (see reserve); it only reallocates if the
+        caller under-reserved, so the common path -- a phase-level reserve followed
+        by that phase's appends -- does no per-append copy.
+
         Args:
             coords: Dihedral coordinates as numpy array
             energy: Relative energy value
             atoms: Structure at this observation (copied for retention)
             gradient: Optional dE/dtheta (eV/rad) for each dihedral; stored as
                 NaN when not provided so the gradient tensor stays index-aligned.
+                Ignored when gradients are unrecorded (``observed_gradients`` None).
         """
-        # TODO: each append does three torch.cat reallocations, so accumulating N
-        # observations is O(N^2) in copy cost. Fine while N stays in the hundreds;
-        # if N grows to thousands, buffer into Python lists and torch.stack once at
-        # fit time instead.
-        new_coords = torch.tensor(
+        self.reserve(1)  # no-op after a phase-level reserve; safety net otherwise
+        i = self._n
+        self._coords_buf[i] = torch.as_tensor(
             coords, dtype=torch.float64, device=self.device
-        ).unsqueeze(0)
-        new_energy = torch.tensor([energy], dtype=torch.float64, device=self.device)
-        if gradient is None:
-            gradient = np.full(len(coords), np.nan, dtype=float)
-        new_grad = torch.tensor(
-            np.asarray(gradient, dtype=float), dtype=torch.float64, device=self.device
-        ).unsqueeze(0)
-        self.observed_coords = torch.cat([self.observed_coords, new_coords], dim=0)
-        self.observed_energies = torch.cat([self.observed_energies, new_energy], dim=0)
-        if self.observed_gradients is None:
-            self.observed_gradients = new_grad
-        else:
-            self.observed_gradients = torch.cat(
-                [self.observed_gradients, new_grad], dim=0
-            )
+        )
+        self._energies_buf[i] = energy
+        if self._grads_buf is not None:
+            if gradient is None:
+                self._grads_buf[i] = torch.nan
+            else:
+                self._grads_buf[i] = torch.as_tensor(
+                    np.asarray(gradient, dtype=float),
+                    dtype=torch.float64,
+                    device=self.device,
+                )
+        self._n = i + 1
         self.observed_atoms.append(atoms.copy())
 
 
@@ -318,6 +388,37 @@ def _periodic_covar_module(
     return gpykernels.ScaleKernel(
         gpykernels.ProductStructureKernel(num_dims=num_dims, base_kernel=base_kernel)
     )
+
+
+def _fit_value_gp(
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+    *,
+    covar_module: gpykernels.ScaleKernel,
+    outcome_transform=None,
+) -> SingleTaskGP:
+    """Build and fit a value-only ``SingleTaskGP`` with the shared fit config.
+
+    Both the acquisition GP and the ensemble-selection GP fit a periodic
+    ``SingleTaskGP`` with ``fit_gpytorch_mll_torch`` (Adam, lr 0.01, capped at
+    ``_GP_FIT_STEPS``); centralizing the construction and fit here keeps the two
+    from drifting apart. ``covar_module`` carries the (optionally prior-equipped)
+    kernel and ``outcome_transform`` is passed through (e.g. ``Standardize(m=1)``
+    for the selection GP fitting energies in eV).
+    """
+    gp = SingleTaskGP(
+        train_x,
+        train_y,
+        covar_module=covar_module,
+        outcome_transform=outcome_transform,
+    )
+    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
+    fit_gpytorch_mll_torch(
+        mll,
+        step_limit=_GP_FIT_STEPS,
+        optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
+    )
+    return gp
 
 
 def _restrict_gradient_mask(
@@ -589,18 +690,12 @@ def _select_next_points_botorch(
                 }
         else:
             # TODO: make the GP only once and reuse via updates
-            gp = SingleTaskGP(
+            gp = _fit_value_gp(
                 train_x,
                 train_y,
                 covar_module=_periodic_covar_module(
                     train_x.shape[1], lengthscale_prior=lengthscale_prior
                 ),
-            )
-            mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
-            fit_gpytorch_mll_torch(
-                mll,
-                step_limit=_GP_FIT_STEPS,
-                optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
             )
         t_gp_fit = time.perf_counter() - _t_fit0
 
@@ -726,13 +821,13 @@ def _setup_initial_state(
         start_coords=start_coords,
         start_energy=start_energy,
         init_steps=0,
-        observed_coords=torch.tensor(
+        initial_coords=torch.tensor(
             np.asarray([start_coords]), dtype=torch.float64, device=device
         ),
-        observed_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
+        initial_energies=torch.tensor([0.0], dtype=torch.float64, device=device),
         # Start-point gradient (real dE/dtheta when use_gradients, else NaN),
         # index-aligned with the energy/coord tensors.
-        observed_gradients=torch.tensor(
+        initial_gradients=torch.tensor(
             np.asarray([start_gradient]), dtype=torch.float64, device=device
         ),
         use_gradients=use_gradients,
@@ -941,6 +1036,7 @@ def _evaluate_initial_guesses(
         label = "random initial guess"
 
     state.init_steps = len(guesses)
+    state.reserve(len(guesses))  # size the buffers once for this phase's appends
     logger.info(f"Evaluating {state.init_steps} initial guesses ({label}s)")
     for i, guess in enumerate(guesses):
         energy, cur_atoms, gradient = _evaluate_point(
@@ -1286,6 +1382,9 @@ def _run_optimization_loop(
             n_calls=best_idx + 1, e_e0_eV=state.observed_energies[best_idx].item(),
         )
 
+    # The loop appends exactly one observation per step, so size the buffers once.
+    state.reserve(n_steps)
+
     loop_start = time.perf_counter()
     for step in range(n_steps):
         step_uses_gradients = state.use_gradients and (
@@ -1527,17 +1626,12 @@ def _build_selection_gp(
     """
     train_x = train_X_deg.clone() / 360.0
     train_y = train_y_eV.clone().unsqueeze(-1)  # (n, 1), eV, lower = better
-    gp = SingleTaskGP(
+    return _fit_value_gp(
         train_x,
         train_y,
         covar_module=_periodic_covar_module(train_x.shape[1]),
         outcome_transform=Standardize(m=1),
     )
-    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
-    fit_gpytorch_mll_torch(
-        mll, step_limit=_GP_FIT_STEPS, optimizer=lambda p: torch.optim.Adam(p, lr=0.01)
-    )
-    return gp
 
 
 def _select_ensemble_candidates(
@@ -1720,32 +1814,9 @@ def run_optimization(
     seed: int = 0,
     initial_conformers: list[Atoms] | None = None,
     initial_dihedrals: np.ndarray | None = None,
-    # New PiBO parameters
     prior_module: DihedralPriorModule | None = None,
-    initial_prior_exponent: float = DEFAULT_PRIOR_EXPONENT,
-    prior_exponent_decay: float = DEFAULT_PRIOR_DECAY,
     return_ensemble: bool = False,
-    use_gradients: bool = False,
-    gradient_steps: int = 0,
-    grad_refit_dense_until: int = 20,
-    grad_refit_every: int = 0,
-    acq_num_restarts: int = ACQ_NUM_RESTARTS,
-    acq_raw_samples: int = ACQ_RAW_SAMPLES,
-    gradient_window: int = 0,
-    gradient_keep: str = "recent",
-    lengthscale_prior: str = "auto",
-    lowmode_prob: float | None = None,
-    lowmode_warmup: int = 100,
-    lowmode_kick_deg: float = 60.0,
-    lowmode_modes: int = 4,
-    lowmode_kick_dir: str = "pca",
-    category_prob: float | None = None,
-    category_warmup: int = 20,
-    category_min_moves: int = 6,
-    cert_log_path: Path | None = None,
-    cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
-    geom_log_path: Path | None = None,
-    retain_bonds: bool = False,
+    opts: RunOptions | None = None,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
@@ -1764,35 +1835,17 @@ def run_optimization(
         initial_dihedrals: Optional array of dihedral guesses (degrees) to use as
                            initial points (e.g. from plan_initial_points). Used
                            when no conformers are provided; falls back to random.
+        prior_module: Optional PiBO dihedral prior guiding acquisition (and, when
+                           set, enabling the category-tied collective move).
         return_ensemble: If True, also select and tightly optimize a Boltzmann
             ensemble of low-energy conformers and return it alongside the best
             structure.
-        use_gradients: If True, record dE/dtheta at each evaluation and use the
-            gradient-enhanced periodic GP surrogate for acquisition. With
-            ``relax=True`` the projected gradient is only consistent with the
-            energy objective when ``calc`` and ``relaxCalc`` are the same surface
-            (the envelope theorem needs the geometry to be a constrained minimum
-            of the energy calculator); pass matching calculators in that case.
-        gradient_steps: If > 0 (and ``use_gradients``), use the gradient-enhanced
-            GP only for the first ``gradient_steps`` BO steps, then switch to the
-            value-only GP for the remainder. The gradient GP's per-step cost grows
-            steeply with the observation count, so this caps it on large molecules
-            while keeping the early-search benefit. <=0 keeps gradients for the
-            whole run; a budget smaller than ``gradient_steps`` never switches.
-        grad_refit_dense_until: Number of leading BO steps that do a full
-            gradient-GP hyperparameter fit. Refitting is the dominant cost (~200
-            Choleskys, growing with observation count), so beyond this the
-            hyperparameters are frozen and later steps only re-condition (one
-            Cholesky). Hyperparameters move most early, when the matrices are still
-            small, so the cold fits there are both useful and cheap. Default 20
-            (validated quality-neutral vs full refitting for 5-11 dihedrals); 0
-            refits every step (the slow full-gradient reference).
-        grad_refit_every: After the dense phase, optionally do a *cold* refit of the
-            frozen hyperparameters every this many BO steps (<=0 or 1 with no dense
-            phase keeps the original full-fit-every-step behavior; >0 with a dense
-            phase refreshes periodically, 0 freezes for the rest of the run). Cold,
-            not warm-started: warm-starting the fit drifts the hyperparameters and
-            degrades the search.
+        opts: Search/surrogate/benchmark tuning knobs (see :class:`RunOptions`).
+            ``None`` uses the defaults. The gradient-enhanced surrogate
+            (``opts.use_gradients``) needs ``calc`` and ``relaxCalc`` to be the
+            same surface when ``relax=True`` (the envelope theorem makes the
+            projected torsion gradient equal ``dE/dtheta`` only at a constrained
+            minimum of the *energy* calculator); pass matching calculators then.
 
     Returns:
         If ``return_ensemble`` is False, the optimized lowest-energy geometry as
@@ -1801,27 +1854,21 @@ def run_optimization(
         by energy ascending (``best_atoms`` is the lowest-energy ensemble member,
         or the single-best relaxation if the ensemble is empty).
     """
-    # Validate the gradient-windowing knobs up front: _restrict_gradient_mask
-    # silently treats window <= 0 as keep-all and any unknown mode as "both", so
-    # an out-of-range value would otherwise change the surrogate without warning.
-    if gradient_keep not in ("recent", "best", "both"):
-        raise ValueError(
-            f"gradient_keep must be one of 'recent', 'best', 'both', got {gradient_keep!r}"
-        )
-    if gradient_window < 0:
-        raise ValueError(
-            f"gradient_window must be a non-negative integer (0 = all), got {gradient_window}"
-        )
+    # RunOptions.__post_init__ has already validated the gradient-windowing knobs.
+    opts = opts if opts is not None else RunOptions()
 
     # High-d auto defaults: unless explicitly overridden, turn on the dimensionality-
     # scaled lengthscale prior and low-mode search once the dihedral count crosses the
     # high-d threshold -- both help there (see the HDBO benchmarks) and are off at low d.
     # An explicit prior name, or a concrete lowmode_prob, always wins over "auto"/None.
+    # Resolve into locals (the "auto"/None sentinels become concrete values used below).
     n_dihedrals = len(dihedrals)
+    lengthscale_prior = opts.lengthscale_prior
     if lengthscale_prior == "auto":
         lengthscale_prior = (
             "dim_scaled" if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else "none"
         )
+    lowmode_prob = opts.lowmode_prob
     if lowmode_prob is None:
         lowmode_prob = 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
 
@@ -1835,6 +1882,7 @@ def run_optimization(
         _build_category_groups(prior_module, n_dihedrals)
         if prior_module is not None else None
     )
+    category_prob = opts.category_prob
     if category_prob is None:
         max_spec = max((len(g) for g in category_groups), default=0) if category_groups else 0
         category_prob = 0.5 if (
@@ -1874,21 +1922,21 @@ def run_optimization(
 
     # Setup initial state (relaxation, starting point, logging)
     state = _setup_initial_state(
-        atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=use_gradients
+        atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=opts.use_gradients
     )
-    state.gradient_steps = gradient_steps
-    state.grad_refit_dense_until = grad_refit_dense_until
-    state.grad_refit_every = grad_refit_every
-    state.acq_num_restarts = acq_num_restarts
-    state.acq_raw_samples = acq_raw_samples
-    state.gradient_window = gradient_window
-    state.gradient_keep = gradient_keep
+    state.gradient_steps = opts.gradient_steps
+    state.grad_refit_dense_until = opts.grad_refit_dense_until
+    state.grad_refit_every = opts.grad_refit_every
+    state.acq_num_restarts = opts.acq_num_restarts
+    state.acq_raw_samples = opts.acq_raw_samples
+    state.gradient_window = opts.gradient_window
+    state.gradient_keep = opts.gradient_keep
     state.lengthscale_prior = lengthscale_prior
     state.lowmode_prob = lowmode_prob
-    state.lowmode_warmup = lowmode_warmup
-    state.lowmode_kick_deg = lowmode_kick_deg
-    state.lowmode_modes = lowmode_modes
-    state.lowmode_kick_dir = lowmode_kick_dir
+    state.lowmode_warmup = opts.lowmode_warmup
+    state.lowmode_kick_deg = opts.lowmode_kick_deg
+    state.lowmode_modes = opts.lowmode_modes
+    state.lowmode_kick_dir = opts.lowmode_kick_dir
     # Dedicated RNG for the low-mode-move coin/direction, offset from the global seed so
     # it doesn't co-vary with the torch/numpy streams but stays reproducible (paired
     # comparisons across arms at a fixed seed).
@@ -1899,8 +1947,8 @@ def run_optimization(
     # give the move its own reproducible RNG (offset from the seed, distinct from the
     # low-mode stream) for the move coin and prior-seeded warmup draws.
     state.category_prob = category_prob
-    state.category_warmup = category_warmup
-    state.category_min_moves = category_min_moves
+    state.category_warmup = opts.category_warmup
+    state.category_min_moves = opts.category_min_moves
     if category_prob > 0:
         # Reuse the partition built for the auto-default decision above (prior_module is
         # non-None here: category_prob > 0 was validated to require it).
@@ -1915,25 +1963,25 @@ def run_optimization(
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
     # reference every later evaluation must preserve. The start is computed inside
     # _setup_initial_state above and defines the molecule's connectivity.
-    if retain_bonds:
+    if opts.retain_bonds:
         state.required_bonds = geometry_bond_set(state.start_atoms)
 
     # Optional per-step stopping-rule certificate log (calibration benchmark).
-    if cert_log_path is not None:
-        state.cert_betas = tuple(cert_betas)
-        state.cert_log = create_certificate_logger(cert_log_path, state.cert_betas)
+    if opts.cert_log_path is not None:
+        state.cert_betas = tuple(opts.cert_betas)
+        state.cert_log = create_certificate_logger(opts.cert_log_path, state.cert_betas)
 
     # Optional geometry trail (benchmark): start a fresh file; frames are appended
     # at each best-so-far improvement (and the final relaxed best) for the offline
     # RMSD-identity / distinct-conformer analysis.
-    if geom_log_path is not None:
-        state.geom_log_path = Path(geom_log_path)
+    if opts.geom_log_path is not None:
+        state.geom_log_path = Path(opts.geom_log_path)
         state.geom_log_path.open("w").close()
 
     # Add prior settings to state
     state.prior_module = prior_module
-    state.prior_exponent = initial_prior_exponent
-    state.prior_decay = prior_exponent_decay
+    state.prior_exponent = opts.initial_prior_exponent
+    state.prior_decay = opts.prior_exponent_decay
 
     # Evaluate initial guesses (conformers, prior peaks, or random)
     _evaluate_initial_guesses(

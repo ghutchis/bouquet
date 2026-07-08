@@ -1,4 +1,3 @@
-import logging
 from argparse import SUPPRESS, ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +23,7 @@ from bouquet.config import (
     DEFAULT_PRIOR_EXPONENT,
     DEFAULT_PRIOR_MAX_CONCENTRATION,
     Configuration,
+    RunOptions,
     format_certificate_betas,
     parse_certificate_betas,
 )
@@ -358,7 +358,7 @@ def main():
     parser.add_argument(
         "--gradient-window",
         type=int,
-        default=150,  # 0 = no window, default for now
+        default=0,  # 0 = no window, default for now
         help="Gradient GP: keep gradients for only this many high-leverage points "
         "(0 = all). Shrinks the augmented GP to n + window*d -- a high-d speedup "
         "that keeps gradients in the active region (unlike value-only-late).",
@@ -393,6 +393,33 @@ def main():
             f"--gradient-window must be >= 0 (0 = all), got {args.gradient_window}"
         )
 
+    # Search / surrogate / benchmark knobs handed to run_optimization (lowmode_modes
+    # has no CLI flag, so it keeps its RunOptions default).
+    run_opts = RunOptions(
+        use_gradients=args.use_gradients,
+        gradient_steps=args.gradient_steps,
+        grad_refit_dense_until=args.grad_refit_dense_until,
+        grad_refit_every=args.grad_refit_every,
+        gradient_window=args.gradient_window,
+        gradient_keep=args.gradient_keep,
+        acq_num_restarts=args.acq_num_restarts,
+        acq_raw_samples=args.acq_raw_samples,
+        lengthscale_prior=args.lengthscale_prior,
+        lowmode_prob=args.lowmode_prob,
+        lowmode_warmup=args.lowmode_warmup,
+        lowmode_kick_deg=args.lowmode_kick_deg,
+        lowmode_kick_dir=args.lowmode_kick_dir,
+        category_prob=args.category_prob,
+        category_warmup=args.category_warmup,
+        category_min_moves=args.category_min_moves,
+        initial_prior_exponent=args.prior_exponent,
+        prior_exponent_decay=args.prior_decay,
+        cert_log_path=Path(args.certificate_log) if args.certificate_log else None,
+        cert_betas=parse_certificate_betas(args.certificate_betas),
+        geom_log_path=Path(args.geometry_log) if args.geometry_log else None,
+        retain_bonds=args.retain_bonds,
+    )
+
     # Create configuration from parsed arguments
     config = Configuration(
         smiles=args.smiles,
@@ -409,33 +436,12 @@ def main():
         auto_steps=args.auto,
         relax=args.relax,
         solvent=args.solvent,
-        use_gradients=args.use_gradients,
-        gradient_steps=args.gradient_steps,
-        grad_refit_dense_until=args.grad_refit_dense_until,
-        grad_refit_every=args.grad_refit_every,
-        lengthscale_prior=args.lengthscale_prior,
-        lowmode_prob=args.lowmode_prob,
-        lowmode_warmup=args.lowmode_warmup,
-        lowmode_kick_deg=args.lowmode_kick_deg,
-        lowmode_kick_dir=args.lowmode_kick_dir,
-        category_prob=args.category_prob,
-        category_warmup=args.category_warmup,
-        category_min_moves=args.category_min_moves,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
-        initial_prior_exponent=args.prior_exponent,
-        prior_exponent_decay=args.prior_decay,
         prior_max_concentration=args.prior_max_concentration,
         prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
-        certificate_log=Path(args.certificate_log) if args.certificate_log else None,
-        certificate_betas=parse_certificate_betas(args.certificate_betas),
-        geometry_log=Path(args.geometry_log) if args.geometry_log else None,
-        retain_bonds=args.retain_bonds,
-        acq_num_restarts=args.acq_num_restarts,
-        acq_raw_samples=args.acq_raw_samples,
-        gradient_window=args.gradient_window,
-        gradient_keep=args.gradient_keep,
+        run=run_opts,
     )
 
     # Gradient labels are only consistent with the energy objective when the
@@ -446,7 +452,7 @@ def main():
     # the GP biased gradient labels. (Without --relax the rigid-scan gradient is
     # always consistent, so the check is limited to the relaxed case.)
     if (
-        config.use_gradients
+        config.run.use_gradients
         and config.relax
         and config.energy_method != config.optimizer_method
     ):
@@ -646,29 +652,8 @@ def main():
         initial_conformers=initial_conformers,
         initial_dihedrals=initial_dihedrals,
         prior_module=prior_module,
-        initial_prior_exponent=config.initial_prior_exponent,
-        prior_exponent_decay=config.prior_exponent_decay,
         return_ensemble=config.ensemble,
-        use_gradients=config.use_gradients,
-        gradient_steps=config.gradient_steps,
-        grad_refit_dense_until=config.grad_refit_dense_until,
-        grad_refit_every=config.grad_refit_every,
-        lengthscale_prior=config.lengthscale_prior,
-        lowmode_prob=config.lowmode_prob,
-        lowmode_warmup=config.lowmode_warmup,
-        lowmode_kick_deg=config.lowmode_kick_deg,
-        lowmode_kick_dir=config.lowmode_kick_dir,
-        category_prob=config.category_prob,
-        category_warmup=config.category_warmup,
-        category_min_moves=config.category_min_moves,
-        acq_num_restarts=config.acq_num_restarts,
-        acq_raw_samples=config.acq_raw_samples,
-        gradient_window=config.gradient_window,
-        gradient_keep=config.gradient_keep,
-        cert_log_path=config.certificate_log,
-        cert_betas=config.certificate_betas,
-        geom_log_path=config.geometry_log,
-        retain_bonds=config.retain_bonds,
+        opts=config.run,
     )
 
     if config.ensemble:
