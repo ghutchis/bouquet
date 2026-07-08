@@ -1882,9 +1882,27 @@ def run_optimization(
             except Exception:
                 energy = RELAX_FAILURE_ENERGY_EV
         logger.info(f"Energy (no rotatable dihedrals): {energy}")
+        # Produce the same artifacts a normal run would. There is a single
+        # (zero-dihedral) structure, so it is both the start and the best: mirror
+        # _setup_initial_state's relaxed.xyz + structure log and the final
+        # current_best.xyz / geometry-trail frame that _perform_final_relaxation's
+        # caller emits.
+        coords = np.zeros(n_dihedrals, dtype=float)
         if out_dir is not None:
-            save_structure(out_dir, best_atoms, "relaxed.xyz")
+            if relax:
+                save_structure(out_dir, best_atoms, "relaxed.xyz")
+            log_path, ens_path = initialize_structure_log(out_dir)
+            add_entry = create_structure_logger(log_path, ens_path, energy)
+            add_entry(coords, best_atoms, energy)
             save_structure(out_dir, best_atoms, "current_best.xyz")
+        # Benchmark geometry trail (no-op unless --geom-log is set): one 'final'
+        # frame, matching _log_improvement_geometry(state, best_atoms, "final").
+        if opts.geom_log_path is not None:
+            geom_log_path = Path(opts.geom_log_path)
+            geom_log_path.open("w").close()
+            append_xyz_frame(
+                geom_log_path, best_atoms, "n_calls=1 e_e0_eV=0.000000 kind=final"
+            )
         if return_ensemble:
             return best_atoms, [(best_atoms, 0.0, 1.0)]
         return best_atoms

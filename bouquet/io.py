@@ -50,7 +50,7 @@ def setup_logging(out_dir: Path, logger_name: str = "bouquet") -> logging.Logger
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
-    file_handler = logging.FileHandler(out_dir / "runtime.log")
+    file_handler = logging.FileHandler(out_dir / "runtime.log", encoding="utf-8")
     file_handler.setFormatter(formatter)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
