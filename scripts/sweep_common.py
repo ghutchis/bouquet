@@ -962,10 +962,11 @@ def analyze(args: argparse.Namespace, baseline: str) -> None:
             rho, p = spearmanr(g[col], g["delta"])
             print(f"  {config:<24} rho={rho:+.3f}  p={p:.3f}  (n={len(g)})")
 
-    strat = pd.concat(
-        [d.assign(config=c) for c, d in deltas_by_config.items() if not d.empty],
-        ignore_index=True,
-    ) if deltas_by_config else pd.DataFrame()
+    strat_dfs = [d.assign(config=c) for c, d in deltas_by_config.items() if not d.empty]
+    strat = (
+        pd.concat(strat_dfs, ignore_index=True)
+        if strat_dfs else pd.DataFrame()
+    )
     if not strat.empty:
         _strat_rho(strat, "num_dihedrals",
                    [float(x) for x in args.dihedral_bins.split(",")],

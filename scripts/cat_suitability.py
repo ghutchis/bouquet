@@ -30,7 +30,12 @@ def parse(path):
 if __name__=='__main__':
     print('name\td\ttied_spec\ttied_gen\tmax_spec')
     for smi,name in parse(sys.argv[1]):
-        try: r=scan_one(smi)
-        except: r=None
+        try:
+            r = scan_one(smi)
+        except Exception as e:
+            print(f"warning: skip {name}: {e}", file=sys.stderr)
+            continue
+        if r is None:
+            continue
         if r is None: continue
         print(f'{name}\t{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}')

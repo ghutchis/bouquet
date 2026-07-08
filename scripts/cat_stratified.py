@@ -102,7 +102,6 @@ def main() -> None:
             print(f"\n### {arm}: no paired data (missing arm?)")
             continue
         gains["max_spec"] = gains["name"].map(man["max_spec"])
-        gains["tier"] = gains["name"].map(man.get("tier"))
         have_ms = gains.dropna(subset=["max_spec"])
 
         print(f"\n{'='*70}\n### {arm} vs {args.baseline}  "
