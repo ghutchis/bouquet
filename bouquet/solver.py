@@ -1599,6 +1599,27 @@ def _perform_final_relaxation(
         f"Performed final relaxation without dihedral constraints. "
         f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
     )
+    # If the final tight relaxation walked into a geometry the calculator cannot
+    # evaluate (SCF non-convergence -> sentinel failure energy), the released
+    # structure is garbage and would be written to final.xyz with a nonsense
+    # energy. Fall back to the best geometry we can still trust: the constrained
+    # final relaxation if it succeeded, otherwise the lowest structure actually
+    # observed during the search (which was evaluated successfully to be selected).
+    if best_energy >= RELAX_FAILURE_ENERGY_EV:
+        if constrained_energy < RELAX_FAILURE_ENERGY_EV:
+            logger.warning(
+                "Final unconstrained relaxation failed (calculator error, e.g. SCF "
+                "non-convergence); reverting to the constrained final relaxation."
+            )
+            best_atoms, best_energy = constrained_atoms, constrained_energy
+        else:
+            logger.warning(
+                "Final relaxation failed (calculator error, e.g. SCF non-convergence); "
+                "reverting to the best structure observed during the search."
+            )
+            best_atoms = state.observed_atoms[best_idx].copy()
+            best_energy = state.observed_energies[best_idx].item()
+
     # --retain-bonds: if releasing the dihedral constraints let the geometry
     # rearrange, keep the constrained (bond-preserving) result instead.
     if state.required_bonds is not None and bonds_broken(
