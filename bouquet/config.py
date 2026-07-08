@@ -10,7 +10,7 @@ from typing import Optional
 # CalculatorFactory.available_methods() (the installed subset).
 from bouquet.calculator import MethodType
 
-__all__ = ["Configuration", "RunOptions", "MethodType"]
+__all__ = ["Configuration", "MethodType", "RunOptions"]
 
 
 # Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation
@@ -242,6 +242,15 @@ class RunOptions:
                 "acq_num_restarts and acq_raw_samples must be positive integers; got "
                 f"acq_num_restarts={self.acq_num_restarts}, "
                 f"acq_raw_samples={self.acq_raw_samples}."
+            )
+
+        # Kick-direction source must be recognized: solver._lowmode_move silently
+        # falls back to the PCA path for any unknown value, so an out-of-range
+        # value would otherwise change the move source without warning.
+        if self.lowmode_kick_dir not in ("pca", "enm"):
+            raise ValueError(
+                "lowmode_kick_dir must be one of 'pca', 'enm', got "
+                f"{self.lowmode_kick_dir!r}"
             )
 
 
