@@ -77,6 +77,8 @@ from bouquet.config import (
     ENSEMBLE_SIGMA_FLOOR_KCAL,
     ENSEMBLE_TEMPERATURE,
     ENSEMBLE_WINDOW_KCAL,
+    CAT_D_THRESHOLD,
+    CAT_MAXSPEC_THRESHOLD,
     FAILURE_ENERGY_EV,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
@@ -209,6 +211,31 @@ class OptimizationState:
     lowmode_kick_dir: str = "pca"
     lowmode_rng: np.random.Generator | None = None
     lowmode_count: int = 0
+
+    # Phase 3 category-tied collective move (chemistry-defined REMBO). With probability
+    # category_prob an eligible step is replaced by a low-dimensional move over
+    # *per-SMARTS-category* dihedral values: every dihedral sharing a prior category is
+    # set to one shared value (a chemistry-defined embedding, available from step 0 --
+    # unlike the low-mode move's data-derived PCA, which needs an accumulated elite set).
+    # The reduced (n_group-dim) point is chosen by a periodic GP + LogEI over a dedicated
+    # buffer of past reduced points, then broadcast and constrained + UNCONSTRAINED relaxed
+    # (same clash-cleanup-then-release schedule as the low-mode move). See _category_move.
+    #   category_groups   -- the tied-index partition (list of index lists), built at setup
+    #                        from the prior's univariate assignments; each dihedral is in
+    #                        exactly one group (a real category, or its own singleton).
+    #   category_warmup   -- gate on the *outer* buffer size (need an incumbent to anchor).
+    #   category_min_moves-- how many prior-seeded reduced points to collect before the
+    #                        reduced-space GP is fit (below this, sample z from the prior).
+    #   _cat_Z / _cat_Y   -- the reduced-space BO buffer (per-category values in degrees,
+    #                        relative eV), grown one row per category move.
+    category_prob: float = 0.0
+    category_warmup: int = 20
+    category_min_moves: int = 6
+    category_groups: list | None = None
+    category_rng: np.random.Generator | None = None
+    category_count: int = 0
+    _cat_Z: list = field(default_factory=list)
+    _cat_Y: list = field(default_factory=list)
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
@@ -992,6 +1019,45 @@ _LOWMODE_CONSTRAINED_STEPS = 20
 _LOWMODE_FREE_STEPS = 100
 
 
+def _collective_kick_relax(
+    target_deg: np.ndarray,
+    anchor: Atoms,
+    dihedrals: list[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+) -> tuple[float, Atoms]:
+    """Shared collective-move evaluation: set the proposed dihedrals and short CONSTRAINED
+    relax (clash cleanup), then release the constraint and relax UNCONSTRAINED to a local
+    minimum -- so the geometry can slide along the curved fold valley a standard, dihedral-
+    pinned BO step cannot cross. Used by both the low-mode kick and the category broadcast.
+    Returns (energy [eV], relaxed atoms)."""
+    _, atoms = evaluate_energy(
+        target_deg, anchor, dihedrals, calc, relaxCalc,
+        relax=True, steps=_LOWMODE_CONSTRAINED_STEPS,
+    )
+    atoms.set_constraint()
+    return relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
+
+
+def _collective_result(
+    state: OptimizationState,
+    atoms: Atoms,
+    energy: float,
+    dihedrals: list[DihedralInfo],
+) -> tuple[np.ndarray, Atoms, float] | None:
+    """Finish a collective move: reject it (return None) if the UNCONSTRAINED relax changed
+    connectivity under --retain-bonds, else return (relaxed dihedrals [deg], atoms, energy)."""
+    if (
+        state.required_bonds is not None
+        and energy < RELAX_FAILURE_ENERGY_EV
+        and bonds_broken(atoms, state.required_bonds)
+    ):
+        state.n_bond_breaks += 1
+        return None
+    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
+    return new_coords, atoms, energy
+
+
 def _low_mode_move(
     state: OptimizationState,
     dihedrals: list[DihedralInfo],
@@ -1047,26 +1113,125 @@ def _low_mode_move(
     amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
     target_deg = ss.line(direction, np.array([amp]))[0]
 
-    # Stage 1: set the kicked dihedrals and short *constrained* relax (clash cleanup).
-    _, atoms = evaluate_energy(
-        target_deg, anchor, dihedrals, calc, relaxCalc,
-        relax=True, steps=_LOWMODE_CONSTRAINED_STEPS,
-    )
-    # Stage 2: release the dihedral constraint and relax UNCONSTRAINED to a local min.
-    atoms.set_constraint()
-    energy, atoms = relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
+    energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
+    return _collective_result(state, atoms, energy, dihedrals)
 
-    # --retain-bonds: reject a move whose relaxation changed connectivity.
-    if (
-        state.required_bonds is not None
-        and energy < RELAX_FAILURE_ENERGY_EV
-        and bonds_broken(atoms, state.required_bonds)
-    ):
-        state.n_bond_breaks += 1
+
+def _build_category_groups(
+    prior_module: DihedralPriorModule | None, n_dihedrals: int
+) -> list[list[int]]:
+    """Partition dihedral indices into tied categories for the category move.
+
+    Two dihedrals share a group iff the prior's SMARTS matcher assigned them the same
+    *specific* fitted-library category (an integer type id) -- i.e. they are the same
+    chemical rotor (e.g. the k-th dihedral of every monomer in a foldamer). The generic
+    builtin fallbacks (``sp3_sp3``/``sp3_sp2``, string type ids), unassigned dihedrals,
+    and bivariate-pair dihedrals are NOT a shared rotor, so each becomes its own singleton
+    group -- matching the ``max_spec`` in scripts/cat_suitability.py and the
+    ``CAT_MAXSPEC_THRESHOLD`` auto-enable calibration. A homopolymer foldamer thus collapses
+    to a handful of groups (the repeat unit); a molecule with no specific repeats stays at
+    one group per dihedral (the move degenerates to ordinary REMBO). Returns the groups as
+    sorted lists of indices, ordered by first member.
+    """
+    key_to_members: dict = {}
+    assignments = getattr(prior_module, "univariate_assignments", {}) or {}
+    for d in range(n_dihedrals):
+        t = assignments.get(d)
+        # Only an integer (fitted-library) id is a real shared rotor; generic string ids
+        # and unassigned/bivariate dihedrals get their own singleton group.
+        key = ("cat", t) if isinstance(t, int) else ("solo", d)
+        key_to_members.setdefault(key, []).append(d)
+    groups = sorted(key_to_members.values(), key=lambda m: m[0])
+    return groups
+
+
+def _sample_category_z_from_prior(
+    state: OptimizationState, rng: np.random.Generator
+) -> np.ndarray:
+    """Draw one reduced-space point (one value per category group, degrees) from the
+    prior, for warming up the reduced-space GP. Each group's value is sampled from a
+    mode of that category's fitted 1D von Mises mixture (weighted by mixture weight,
+    with a small angular jitter); a uniform (no-preference) category draws uniformly.
+    """
+    groups = state.category_groups or []
+    pm = state.prior_module
+    uni_dists = getattr(pm, "univariate_dists", {}) if pm is not None else {}
+    z = np.empty(len(groups), dtype=float)
+    for gi, members in enumerate(groups):
+        dist = uni_dists.get(members[0])
+        if dist is None:
+            z[gi] = rng.uniform(0.0, 360.0)
+            continue
+        locs = dist.component_distribution.loc.detach().cpu().numpy()      # radians
+        probs = dist.mixture_distribution.probs.detach().cpu().numpy()
+        probs = probs / probs.sum()
+        k = int(rng.choice(len(locs), p=probs))
+        z[gi] = (math.degrees(float(locs[k])) + rng.normal(0.0, 15.0)) % 360.0
+    return z
+
+
+def _category_move(
+    state: OptimizationState,
+    dihedrals: list[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, Atoms, float] | None:
+    """One category-tied collective move: choose a per-category value vector (from the
+    prior while the reduced buffer is small, else by reduced-space LogEI), set every
+    dihedral in a category to its category's value on top of the incumbent, then
+    constrained + UNCONSTRAINED relax -- returning (relaxed dihedrals [deg], relaxed
+    atoms, energy [eV]).
+
+    This is the chemistry-defined counterpart of :func:`_low_mode_move`: instead of
+    kicking along a data-derived PCA direction, it moves along the fixed block-constant
+    embedding implied by the SMARTS categories, so a correlated fold is one reduced-space
+    point and is reachable from the very first move. The reduced point is recorded in
+    ``state._cat_Z/_cat_Y`` (the low-D BO buffer) before the connectivity check, so even a
+    rejected move informs the reduced GP. Returns ``None`` to fall back to a standard step
+    (no groups, or a move that broke bonds under --retain-bonds).
+
+    NOTE (prototype): the reduced coordinates use period 360 for every category. Aromatic
+    categories are physically 180-periodic (theta == theta+180), so their search domain is
+    2x larger than necessary -- correct, just not maximally efficient. Per-category period
+    is the obvious next refinement.
+    """
+    groups = state.category_groups
+    if not groups:
         return None
 
-    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
-    return new_coords, atoms, energy
+    best_idx = int(state.observed_energies.argmin().item())
+    anchor = state.observed_atoms[best_idx]
+    incumbent_deg = state.observed_coords[best_idx].detach().cpu().numpy()
+
+    # Reduced-space point z (one value per category), in degrees. Below the warmup the
+    # prior seeds it; after that the reduced-space GP picks it -- the same value-only
+    # periodic-GP + LogEI selector the outer loop uses, just over the n_group-dim buffer.
+    if len(state._cat_Z) < state.category_min_moves:
+        z = _sample_category_z_from_prior(state, rng)
+    else:
+        z = _select_next_points_botorch(
+            torch.tensor(np.asarray(state._cat_Z), dtype=torch.float64, device=state.device),
+            torch.tensor(np.asarray(state._cat_Y), dtype=torch.float64, device=state.device),
+            acq_num_restarts=state.acq_num_restarts,
+            acq_raw_samples=state.acq_raw_samples,
+        )
+
+    # Broadcast: every dihedral takes its group's value (singletons get their own
+    # coordinate). The groups partition all indices, so the incumbent copy is just a
+    # defensive base -- every entry is overwritten.
+    target_deg = incumbent_deg.copy()
+    for gi, members in enumerate(groups):
+        target_deg[members] = z[gi] % 360.0
+
+    energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
+
+    # Record the reduced-space observation (energy relative to the run's start) for the
+    # low-D BO, before the connectivity check so a rejected z still teaches the GP.
+    state._cat_Z.append([float(v) for v in z])
+    state._cat_Y.append(float(energy - state.start_energy))
+
+    return _collective_result(state, atoms, energy, dihedrals)
 
 
 def _run_optimization_loop(
@@ -1138,28 +1303,49 @@ def _run_optimization_loop(
             state.grad_gp_hypers,
         )
 
-        # Phase 2.5: with probability lowmode_prob (past the warmup), this step is a
-        # low-mode / basin-hopping move -- a committed kick + UNCONSTRAINED relax that
-        # combines selection and evaluation, so it short-circuits the standard step.
-        lowmode_result = None
+        # Collective moves: with some probability (past a warmup) this step is replaced
+        # by a committed move + UNCONSTRAINED relax that combines selection and
+        # evaluation, so it short-circuits the standard step. Two flavors, checked in
+        # order and mutually exclusive per step:
+        #   Phase 3  category move -- tie same-SMARTS-category dihedrals (chemistry-defined
+        #             embedding, available from step 0); takes precedence when enabled.
+        #   Phase 2.5 low-mode move -- kick along a data-derived PCA soft mode.
+        collective_result = None
+        t_collective = 0.0
         if (
-            state.lowmode_prob > 0
+            state.category_prob > 0
+            and len(state.observed_energies) >= state.category_warmup
+            and state.category_rng is not None
+            and state.category_rng.random() < state.category_prob
+        ):
+            _t0 = time.perf_counter()
+            collective_result = _category_move(
+                state, dihedrals, calc, relaxCalc, state.category_rng
+            )
+            t_collective = time.perf_counter() - _t0
+            if collective_result is not None:
+                state.category_count += 1
+
+        if (
+            collective_result is None
+            and state.lowmode_prob > 0
             and len(state.observed_energies) >= state.lowmode_warmup
             and state.lowmode_rng is not None
             and state.lowmode_rng.random() < state.lowmode_prob
         ):
             _t0 = time.perf_counter()
-            lowmode_result = _low_mode_move(
+            collective_result = _low_mode_move(
                 state, dihedrals, calc, relaxCalc, state.lowmode_rng
             )
-            t_lowmode = time.perf_counter() - _t0
+            t_collective = time.perf_counter() - _t0
+            if collective_result is not None:
+                state.lowmode_count += 1
 
-        if lowmode_result is not None:
-            next_coords, cur_atoms, energy = lowmode_result
+        if collective_result is not None:
+            next_coords, cur_atoms, energy = collective_result
             gradient = None
             cert_out = None
-            t_select, t_eval = 0.0, t_lowmode
-            state.lowmode_count += 1
+            t_select, t_eval = 0.0, t_collective
         else:
             # ---- standard BO step: fit the GP and optimize the acquisition ----
             cert_out = {} if state.cert_log is not None else None
@@ -1239,6 +1425,12 @@ def _run_optimization_loop(
         logger.info(
             f"Phase 2.5: {state.lowmode_count} low-mode (kick + unconstrained-relax) "
             f"move(s) of {n_steps} BO steps."
+        )
+    if state.category_prob > 0:
+        n_groups = len(state.category_groups) if state.category_groups else 0
+        logger.info(
+            f"Phase 3: {state.category_count} category-tied move(s) of {n_steps} BO "
+            f"steps over {n_groups} categor(y/ies) for {len(dihedrals)} dihedrals."
         )
 
 
@@ -1545,6 +1737,9 @@ def run_optimization(
     lowmode_kick_deg: float = 60.0,
     lowmode_modes: int = 4,
     lowmode_kick_dir: str = "pca",
+    category_prob: float | None = None,
+    category_warmup: int = 20,
+    category_min_moves: int = 6,
     cert_log_path: Path | None = None,
     cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
     geom_log_path: Path | None = None,
@@ -1628,6 +1823,22 @@ def run_optimization(
     if lowmode_prob is None:
         lowmode_prob = 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
 
+    # Category-tied move auto default. Like low-mode it turns on at high d, but ALSO gated
+    # on repeat structure: the benchmark shows the win requires a real tie to exploit
+    # (max_spec = the largest tied SMARTS category), and that on large-but-irregular
+    # molecules (high d, low max_spec) the tie mildly HURTS -- so raw d is not enough.
+    # Needs a prior_module (no categories without one). Build the groups once here and
+    # reuse them below. An explicit category_prob always wins over None/auto.
+    category_groups = (
+        _build_category_groups(prior_module, n_dihedrals)
+        if prior_module is not None else None
+    )
+    if category_prob is None:
+        max_spec = max((len(g) for g in category_groups), default=0) if category_groups else 0
+        category_prob = 0.5 if (
+            n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD
+        ) else 0.0
+
     # A low-mode move is a kick followed by a constrained + UNCONSTRAINED relaxation
     # (see _low_mode_move); it is meaningless without relaxation and would silently
     # relax structures in a run that asked not to. Reject the combination up front.
@@ -1635,6 +1846,20 @@ def run_optimization(
         raise ValueError(
             "lowmode_prob > 0 requires relax=True: low-mode moves are kick + relax steps"
         )
+
+    # A category-tied move broadcasts a per-category value then relaxes (see
+    # _category_move); like the low-mode move it is meaningless without relaxation, and
+    # it needs the prior's SMARTS categories to know which dihedrals to tie.
+    if category_prob > 0:
+        if not relax:
+            raise ValueError(
+                "category_prob > 0 requires relax=True: category moves are broadcast + relax steps"
+            )
+        if prior_module is None:
+            raise ValueError(
+                "category_prob > 0 requires a prior_module: the SMARTS categories define "
+                "which dihedrals are tied. Pass --priors / build one with create_prior_module."
+            )
 
     # Seed every RNG the run touches from `seed`, so a run is reproducible and the
     # seed actually controls the search. The acquisition optimizer (optimize_acqf)
@@ -1667,6 +1892,23 @@ def run_optimization(
     # comparisons across arms at a fixed seed).
     if lowmode_prob > 0:
         state.lowmode_rng = np.random.default_rng(seed + 99991)
+
+    # Category-tied move setup: partition the dihedrals into SMARTS categories once, and
+    # give the move its own reproducible RNG (offset from the seed, distinct from the
+    # low-mode stream) for the move coin and prior-seeded warmup draws.
+    state.category_prob = category_prob
+    state.category_warmup = category_warmup
+    state.category_min_moves = category_min_moves
+    if category_prob > 0:
+        # Reuse the partition built for the auto-default decision above (prior_module is
+        # non-None here: category_prob > 0 was validated to require it).
+        state.category_groups = category_groups
+        state.category_rng = np.random.default_rng(seed + 88883)
+        logger.info(
+            f"Phase 3 category move enabled: {len(state.category_groups)} categor(y/ies) "
+            f"for {len(dihedrals)} dihedrals (embedding dim "
+            f"{len(state.category_groups)})."
+        )
 
     # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
     # reference every later evaluation must preserve. The start is computed inside

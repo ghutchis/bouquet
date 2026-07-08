@@ -33,6 +33,7 @@ sweep, rely on the per-molecule-mean statistics in ``analyze`` to average it out
 
 import argparse
 import csv
+import os
 import re
 import sys
 import threading
@@ -931,17 +932,21 @@ def analyze(args: argparse.Namespace, baseline: str) -> None:
           "tests the per-molecule mean paired Δ vs 0 with n=molecules. "
           "p > ~0.05 => not distinguishable from noise.)")
 
-    # Stratify the per-(molecule, seed) paired gain by molecule size. A config should
-    # help most where the search is hard (many dihedrals). Spearman
-    # rho(gain, num_dihedrals): positive => it helps more as molecules get larger.
-    edges = [0] + [float(x) for x in args.dihedral_bins.split(",")] + [float("inf")]
-    strat = pd.concat(
-        [d.assign(config=c) for c, d in deltas_by_config.items() if not d.empty],
-        ignore_index=True,
-    ).dropna(subset=["num_dihedrals"]) if deltas_by_config else pd.DataFrame()
-    if not strat.empty:
-        strat["bin"] = pd.cut(strat["num_dihedrals"], bins=edges, right=True)
-        print(f"\n=== Paired gain vs '{baseline}', stratified by num_dihedrals ===")
+    # Stratify the per-(molecule, seed) paired gain by a molecule-level covariate and
+    # report a per-config Spearman rho(gain, covariate): positive => the config helps more
+    # as that covariate grows. Done for num_dihedrals (search difficulty) and, when a
+    # --suitability manifest is given, for max_spec (repeat structure) -- the axis that
+    # predicts the category move's win, where raw num_dihedrals is confounded (large
+    # molecules are usually repeat-rich).
+    from scipy.stats import spearmanr
+
+    def _strat_rho(strat: "pd.DataFrame", col: str, mid_edges: list, positive_msg: str) -> None:
+        strat = strat.dropna(subset=[col])
+        if strat.empty:
+            return
+        edges = [0.0] + mid_edges + [float("inf")]
+        strat = strat.assign(bin=pd.cut(strat[col], bins=edges, right=True))
+        print(f"\n=== Paired gain vs '{baseline}', stratified by {col} ===")
         by_bin = strat.groupby(["config", "bin"], observed=True).agg(
             n=("delta", "size"),
             wins=("delta", lambda s: int((s > tol).sum())),
@@ -949,16 +954,32 @@ def analyze(args: argparse.Namespace, baseline: str) -> None:
             median_gain_eV=("delta", "median"),
         )
         print(by_bin.round(4).to_string())
-
-        print("\nSpearman rho(gain, num_dihedrals) per config "
-              "(positive => the config helps more on larger molecules):")
-        from scipy.stats import spearmanr
+        print(f"\nSpearman rho(gain, {col}) per config ({positive_msg}):")
         for config, g in strat.groupby("config"):
-            if g["num_dihedrals"].nunique() < 3 or len(g) < 6:
+            if g[col].nunique() < 3 or len(g) < 6:
                 print(f"  {config:<24} rho=  n/a (too few points)")
                 continue
-            rho, p = spearmanr(g["num_dihedrals"], g["delta"])
+            rho, p = spearmanr(g[col], g["delta"])
             print(f"  {config:<24} rho={rho:+.3f}  p={p:.3f}  (n={len(g)})")
+
+    strat_dfs = [d.assign(config=c) for c, d in deltas_by_config.items() if not d.empty]
+    strat = (
+        pd.concat(strat_dfs, ignore_index=True)
+        if strat_dfs else pd.DataFrame()
+    )
+    if not strat.empty:
+        _strat_rho(strat, "num_dihedrals",
+                   [float(x) for x in args.dihedral_bins.split(",")],
+                   "positive => the config helps more on larger molecules")
+        # max_spec (repeat structure) from the optional suitability manifest.
+        if getattr(args, "suitability", None) is not None:
+            man = (
+                pd.read_csv(args.suitability)
+                .drop_duplicates("name").set_index("name")["max_spec"]
+            )
+            _strat_rho(strat.assign(max_spec=strat["name"].map(man)), "max_spec",
+                       [float(x) for x in args.maxspec_bins.split(",")],
+                       "positive => the config helps more where there is real repeat structure")
 
     # Noise floor: how much does a single molecule's best E-E0 move between seeds?
     # If this dwarfs the config gains above, the comparison is seed-noise-limited and
@@ -1314,6 +1335,15 @@ def add_analyze_args(parser) -> None:
     parser.add_argument("--dihedral-bins", default="3,6",
                         help="Comma-separated upper edges for num_dihedrals strata; "
                         "'3,6' => bins (0,3], (3,6], (6,inf) (default '3,6')")
+    parser.add_argument("--suitability", type=Path, default=None,
+                        help="Optional manifest CSV (name,max_spec,...) from "
+                        "scripts/cat_suitability.py. When given, the paired gain is also "
+                        "stratified by max_spec (repeat structure) with a parallel "
+                        "Spearman rho(gain, max_spec) per config -- the axis that "
+                        "predicts the category move's win (vs raw num_dihedrals).")
+    parser.add_argument("--maxspec-bins", default="4,7",
+                        help="Comma-separated upper edges for max_spec strata (with "
+                        "--suitability); '4,7' => (0,4], (4,7], (7,inf) (default '4,7')")
     parser.add_argument("--summary-out", type=Path, default=None,
                         help="Optional path to write the per-config summary CSV")
 

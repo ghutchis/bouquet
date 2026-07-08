@@ -229,6 +229,35 @@ def main():
         "Default 'pca'.",
     )
     parser.add_argument(
+        "--category-prob",
+        type=float,
+        default=None,
+        help="Phase 3 category-tied search: probability that an eligible BO step (past "
+        "--category-warmup evaluations) is replaced by a collective move that sets every "
+        "dihedral sharing a SMARTS prior category to one shared value (a chemistry-"
+        "defined low-dimensional embedding, available from step 0 -- unlike --lowmode's "
+        "data-derived PCA), chosen by a periodic GP + LogEI over the reduced space, then "
+        "relaxed UNCONSTRAINED. Requires --priors and --relax. Default: auto (0.5 when "
+        "--priors is given and the molecule is large with real repeat structure -- "
+        "n_dihedrals > 14 and max category > 4 -- else 0). Set 0 to disable, or a "
+        "probability in (0, 1]. Takes precedence over a low-mode move on a shared step.",
+    )
+    parser.add_argument(
+        "--category-warmup",
+        type=int,
+        default=20,
+        help="With --category-prob, only start category moves after this many "
+        "evaluations (default 20); the incumbent anchors each move.",
+    )
+    parser.add_argument(
+        "--category-min-moves",
+        type=int,
+        default=6,
+        help="With --category-prob, number of prior-seeded reduced points to collect "
+        "before fitting the reduced-space GP (default 6); below this, the per-category "
+        "value is drawn from the prior.",
+    )
+    parser.add_argument(
         "--priors",
         type=str,
         help="JSON file with dihedral prior definitions",
@@ -378,6 +407,9 @@ def main():
         lowmode_warmup=args.lowmode_warmup,
         lowmode_kick_deg=args.lowmode_kick_deg,
         lowmode_kick_dir=args.lowmode_kick_dir,
+        category_prob=args.category_prob,
+        category_warmup=args.category_warmup,
+        category_min_moves=args.category_min_moves,
         seed=args.seed,
         priors_file=Path(args.priors) if args.priors else None,
         initial_prior_exponent=args.prior_exponent,
@@ -597,6 +629,9 @@ def main():
         lowmode_warmup=config.lowmode_warmup,
         lowmode_kick_deg=config.lowmode_kick_deg,
         lowmode_kick_dir=config.lowmode_kick_dir,
+        category_prob=config.category_prob,
+        category_warmup=config.category_warmup,
+        category_min_moves=config.category_min_moves,
         acq_num_restarts=config.acq_num_restarts,
         acq_raw_samples=config.acq_raw_samples,
         gradient_window=config.gradient_window,
