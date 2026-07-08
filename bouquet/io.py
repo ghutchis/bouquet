@@ -67,11 +67,20 @@ def _slugify_name(name: str, max_length: int = 60) -> str:
     """Sanitize a display name/SMILES into a single safe path segment.
 
     Replaces any character outside ``[A-Za-z0-9._-]`` (including path separators)
-    with ``_`` and caps the length so a long SMILES cannot blow out the path. Falls
-    back to ``"mol"`` if nothing usable remains.
+    with ``_``, collapses runs of ``_`` to a single one, and caps the length so a
+    long SMILES cannot blow out the path. When the sanitized name exceeds
+    ``max_length`` the middle is elided (``head...tail``) rather than truncated
+    from the tail, so both ends stay recognizable; the caller's params hash keeps
+    the full directory name unique. Falls back to ``"mol"`` if nothing usable
+    remains.
     """
-    slug = re.sub(r"[^A-Za-z0-9._-]", "_", name).strip("._")
-    slug = slug[:max_length].strip("._")
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    slug = re.sub(r"_+", "_", slug).strip("._")
+    if len(slug) > max_length:
+        ellipsis = "..."
+        tail_length = 10
+        head_length = max_length - len(ellipsis) - tail_length
+        slug = f"{slug[:head_length].strip('._')}{ellipsis}{slug[-tail_length:].strip('._')}"
     return slug or "mol"
 
 

@@ -86,21 +86,23 @@ def main():
         default=DEFAULT_INIT_STEPS,
         help="Number of initial guesses to make (ignored if --conformer-file is provided)",
     )
+    # "How to generate initial guesses: 'random' (Gaussian around the "
+    # "start) or 'peaks' (systematic grid / weighted sampling from the "
+    # "dihedral prior peaks). 'peaks' uses built-in priors if --priors is "
+    # "not given, and is ignored when --conformer-file is provided."
     parser.add_argument(
         "--init-method",
         choices=["random", "peaks"],
         default=DEFAULT_INIT_METHOD,
-        help="How to generate initial guesses: 'random' (Gaussian around the "
-        "start) or 'peaks' (systematic grid / weighted sampling from the "
-        "dihedral prior peaks). 'peaks' uses built-in priors if --priors is "
-        "not given, and is ignored when --conformer-file is provided.",
+        help=SUPPRESS,
     )
+    # "Maximum systematic peak-grid size for --init-method peaks before "
+    # "falling back to weighted sampling of --init-steps points."
     parser.add_argument(
         "--init-grid-budget",
         type=int,
         default=DEFAULT_INIT_GRID_BUDGET,
-        help="Maximum systematic peak-grid size for --init-method peaks before "
-        "falling back to weighted sampling of --init-steps points.",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--init-conformers",
@@ -163,109 +165,119 @@ def main():
         "forces onto each torsion (dE/dtheta) and feed them to the acquisition "
         "GP, so each energy evaluation also contributes a gradient observation.",
     )
+    # "With --use-gradients, use the gradient-enhanced GP only for the "
+    # "first N BO steps, then switch to the value-only GP. The gradient GP's "
+    # "per-step cost grows steeply with the observation count, so this caps it "
+    # "on large/flexible molecules while keeping the early-search benefit. "
+    # "0 (default) keeps gradients for the whole run."
     parser.add_argument(
         "--gradient-steps",
         type=int,
         default=0,
-        help="With --use-gradients, use the gradient-enhanced GP only for the "
-        "first N BO steps, then switch to the value-only GP. The gradient GP's "
-        "per-step cost grows steeply with the observation count, so this caps it "
-        "on large/flexible molecules while keeping the early-search benefit. "
-        "0 (default) keeps gradients for the whole run.",
+        help=SUPPRESS,
     )
+    # "Gradient-GP refit schedule ('gradfreeze'): do a full hyperparameter "
+    # "fit for the first N BO steps, then FREEZE the hyperparameters and only "
+    # "re-condition (one Cholesky/step instead of ~200). Refitting is the dominant "
+    # "gradient-GP cost and grows with observation count, so freezing keeps the "
+    # "full-gradient run affordable on large molecules. Default 20 (validated "
+    # "quality-neutral vs full refitting, 5-11 dihedrals); set 0 to refit every "
+    # "step (the slow reference)."
     parser.add_argument(
         "--grad-refit-dense-until",
         type=int,
         default=20,
-        help="Gradient-GP refit schedule ('gradfreeze'): do a full hyperparameter "
-        "fit for the first N BO steps, then FREEZE the hyperparameters and only "
-        "re-condition (one Cholesky/step instead of ~200). Refitting is the dominant "
-        "gradient-GP cost and grows with observation count, so freezing keeps the "
-        "full-gradient run affordable on large molecules. Default 20 (validated "
-        "quality-neutral vs full refitting, 5-11 dihedrals); set 0 to refit every "
-        "step (the slow reference).",
+        help=SUPPRESS,
     )
+    # "After the dense phase, optionally cold-refresh the frozen "
+    # "hyperparameters every Nth BO step (0 freezes for the rest of the run; the "
+    # "refresh is a cold fit -- warm-starting drifts the hyperparameters and "
+    # "degrades the search). 0 (default); with no dense phase, fits every step."
     parser.add_argument(
         "--grad-refit-every",
         type=int,
         default=0,
-        help="After the dense phase, optionally cold-refresh the frozen "
-        "hyperparameters every Nth BO step (0 freezes for the rest of the run; the "
-        "refresh is a cold fit -- warm-starting drifts the hyperparameters and "
-        "degrades the search). 0 (default); with no dense phase, fits every step.",
+        help=SUPPRESS,
     )
+    # "Prior on the value-only GP's periodic lengthscale. 'auto' (default): "
+    # "'dim_scaled' once the dihedral count reaches the high-d threshold, else 'none'. "
+    # "'none': free MLL fit (historical). 'dim_scaled': Hvarfner et al. (ICML 2024) "
+    # "dimensionality-scaled LogNormal prior, biasing the GP toward smoother fits "
+    # "as the dihedral count grows -- helps high-d search."
     parser.add_argument(
         "--lengthscale-prior",
         choices=["auto", "none", "dim_scaled"],
         default="auto",
-        help="Prior on the value-only GP's periodic lengthscale. 'auto' (default): "
-        "'dim_scaled' once the dihedral count reaches the high-d threshold, else 'none'. "
-        "'none': free MLL fit (historical). 'dim_scaled': Hvarfner et al. (ICML 2024) "
-        "dimensionality-scaled LogNormal prior, biasing the GP toward smoother fits "
-        "as the dihedral count grows -- helps high-d search.",
+        help=SUPPRESS,
     )
+    # "Low-mode search: probability that an eligible BO step (past "
+    # "--lowmode-warmup evaluations) is replaced by a committed kick along a soft "
+    # "mode followed by an UNCONSTRAINED relaxation (letting the dihedrals move, so "
+    # "the geometry can slide along a curved fold valley a standard BO step cannot "
+    # "cross). Default: auto (0.5 once the dihedral count reaches the high-d "
+    # "threshold, else 0). Set 0 to disable, or a probability in (0, 1]."
     parser.add_argument(
         "--lowmode-prob",
         type=float,
         default=None,
-        help="Phase 2.5 low-mode search: probability that an eligible BO step (past "
-        "--lowmode-warmup evaluations) is replaced by a committed kick along a soft "
-        "mode followed by an UNCONSTRAINED relaxation (letting the dihedrals move, so "
-        "the geometry can slide along a curved fold valley a standard BO step cannot "
-        "cross). Default: auto (0.5 once the dihedral count reaches the high-d "
-        "threshold, else 0). Set 0 to disable, or a probability in (0, 1].",
+        help=SUPPRESS,
     )
+    # "With --lowmode-prob, only start low-mode moves after this many "
+    # "evaluations (default 100); align it past the gradient Phase A."
     parser.add_argument(
         "--lowmode-warmup",
         type=int,
         default=100,
-        help="With --lowmode-prob, only start low-mode moves after this many "
-        "evaluations (default 100); align it past the gradient Phase A.",
+        help=SUPPRESS,
     )
+    # "With --lowmode-prob, per-dihedral RMS kick amplitude (degrees, "
+    # "default 60) along the chosen soft mode."
     parser.add_argument(
         "--lowmode-kick-deg",
         type=float,
         default=60.0,
-        help="With --lowmode-prob, per-dihedral RMS kick amplitude (degrees, "
-        "default 60) along the chosen soft mode.",
+        help=SUPPRESS,
     )
+    # "Kick-direction source for low-mode moves: 'pca' (data-derived position "
+    # "PCA of the low-energy set) or 'enm' (data-independent elastic-network soft "
+    # "modes -- global bend/compaction = folding, projected to torsion space). "
+    #"Default 'pca'."
     parser.add_argument(
         "--lowmode-kick-dir",
         choices=["pca", "enm"],
         default="pca",
-        help="Kick-direction source for low-mode moves: 'pca' (data-derived position "
-        "PCA of the low-energy set) or 'enm' (data-independent elastic-network soft "
-        "modes -- global bend/compaction = folding, projected to torsion space). "
-        "Default 'pca'.",
+        help=SUPPRESS,
     )
+    # "Category-tied search: probability that an eligible BO step (past "
+    # "--category-warmup evaluations) is replaced by a collective move that sets every "
+    #    "dihedral sharing a SMARTS prior category to one shared value (a chemistry-"
+    #    "defined low-dimensional embedding), chosen by a periodic GP + LogEI over the reduced space, then "
+    #    "relaxed UNCONSTRAINED. Requires --priors and --relax. Default: auto (0.5 when "
+    #    "--priors is given and the molecule is large with real repeat structure -- "
+    #    "n_dihedrals > 14 and max category > 4 -- else 0). Set 0 to disable, or a "
+    #    "probability in (0, 1]. Takes precedence over a low-mode move on a shared step.",
     parser.add_argument(
         "--category-prob",
         type=float,
         default=None,
-        help="Phase 3 category-tied search: probability that an eligible BO step (past "
-        "--category-warmup evaluations) is replaced by a collective move that sets every "
-        "dihedral sharing a SMARTS prior category to one shared value (a chemistry-"
-        "defined low-dimensional embedding, available from step 0 -- unlike --lowmode's "
-        "data-derived PCA), chosen by a periodic GP + LogEI over the reduced space, then "
-        "relaxed UNCONSTRAINED. Requires --priors and --relax. Default: auto (0.5 when "
-        "--priors is given and the molecule is large with real repeat structure -- "
-        "n_dihedrals > 14 and max category > 4 -- else 0). Set 0 to disable, or a "
-        "probability in (0, 1]. Takes precedence over a low-mode move on a shared step.",
+        help=SUPPRESS
     )
+    # "With --category-prob, only start category moves after this many "
+    # "evaluations (default 20); the incumbent anchors each move."
     parser.add_argument(
         "--category-warmup",
         type=int,
         default=20,
-        help="With --category-prob, only start category moves after this many "
-        "evaluations (default 20); the incumbent anchors each move.",
+        help=SUPPRESS,
     )
+    # "With --category-prob, number of prior-seeded reduced points to collect "
+    #  "before fitting the reduced-space GP (default 6); below this, the per-category "
+    #  "value is drawn from the prior."
     parser.add_argument(
         "--category-min-moves",
         type=int,
         default=6,
-        help="With --category-prob, number of prior-seeded reduced points to collect "
-        "before fitting the reduced-space GP (default 6); below this, the per-category "
-        "value is drawn from the prior.",
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--priors",
@@ -312,13 +324,14 @@ def main():
         help="Select a Boltzmann ensemble of low-energy conformers, tightly "
         "optimize them all, and write ensemble_final.xyz + ensemble.csv",
     )
+    # "Path to write a per-BO-step stopping-rule certificate CSV "
+    # "(mu_min/lb/alpha_max + e_eval/e_best/n_calls/wall_s). Used by the "
+    #"various benchmarks; off by default."
     parser.add_argument(
         "--certificate-log",
         type=str,
         default=None,
-        help="Path to write a per-BO-step stopping-rule certificate CSV "
-        "(mu_min/lb/alpha_max + e_eval/e_best/n_calls/wall_s). Used by the "
-        "various benchmarks; off by default.",
+        help=SUPPRESS,
     )
     # Comma-separated confidence multipliers for the certificate lower
     # bound (mu - beta*sigma); one lb_b<beta> column is logged per value so the
@@ -361,7 +374,7 @@ def main():
         default=0,  # 0 = no window, default for now
         help="Gradient GP: keep gradients for only this many high-leverage points "
         "(0 = all). Shrinks the augmented GP to n + window*d -- a high-d speedup "
-        "that keeps gradients in the active region (unlike value-only-late).",
+        "that keeps gradients in the active region.",
     )
     parser.add_argument(
         "--gradient-keep",
