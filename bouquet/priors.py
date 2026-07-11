@@ -940,7 +940,14 @@ def load_torlib_smarts(
                 continue
             parts = line.split("\t")
             if len(parts) >= 2:
-                idx = int(parts[0])
+                try:
+                    idx = int(parts[0])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Malformed torlib line in {path}: expected an integer "
+                        f"category id in the first tab-separated field, got "
+                        f"{parts[0]!r} (line: {line!r})"
+                    ) from exc
                 smarts = parts[1]
             else:
                 idx += 1
@@ -980,13 +987,12 @@ def assign_categories(
     """
     # Some torlib rows use recursive-SMARTS label syntax RDKit can't parse; the matcher
     # skips any pattern that fails to compile, but RDKit logs each failure to stderr.
-    # Silence those while compiling so a normal run isn't spammed, then restore logging.
-    from rdkit import RDLogger
+    # Silence those while compiling so a normal run isn't spammed. BlockLogs saves and
+    # restores the prior log state on exit, so we don't clobber a caller that had already
+    # disabled (or enabled) rdApp.error.
+    from rdkit import rdBase
 
-    RDLogger.DisableLog("rdApp.error")
-    try:
+    with rdBase.BlockLogs():
         matcher = DihedralPriorMatcher(load_torlib_smarts(torlib_path), [])
-    finally:
-        RDLogger.EnableLog("rdApp.error")
     univariate, _bivariate = matcher.assign_all(mol, dihedrals)
     return univariate

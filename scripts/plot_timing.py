@@ -230,7 +230,13 @@ def plot_breakdown(df, out_dir, checkpoint, normalize, fname, title, arms):
         denom = np.array([sum(totals[s].values()) for s in sizes]) if normalize else None
         for b, label, color in BUCKETS:
             vals = np.array([totals[s][b] for s in sizes], dtype=float)
-            plotv = (vals / denom * 100.0) if normalize else (vals / 60.0)
+            if normalize:
+                # A size with all-zero buckets has denom==0; yield 0% for it rather
+                # than inf/nan so the stacked bars stay finite.
+                plotv = np.divide(vals, denom, out=np.zeros_like(vals),
+                                  where=denom > 0) * 100.0
+            else:
+                plotv = vals / 60.0
             ax.bar(x, plotv, bottom=bottoms, color=color, width=0.72,
                    label=label, zorder=3, edgecolor="white", linewidth=1.2)
             bottoms += plotv

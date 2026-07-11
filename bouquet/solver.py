@@ -1429,7 +1429,7 @@ def _run_optimization_loop(
             collective_result = _category_move(
                 state, dihedrals, calc, relaxCalc, state.category_rng
             )
-            t_collective = time.perf_counter() - _t0
+            t_collective += time.perf_counter() - _t0
             if collective_result is not None:
                 state.category_count += 1
 
@@ -1444,7 +1444,7 @@ def _run_optimization_loop(
             collective_result = _low_mode_move(
                 state, dihedrals, calc, relaxCalc, state.lowmode_rng
             )
-            t_collective = time.perf_counter() - _t0
+            t_collective += time.perf_counter() - _t0
             if collective_result is not None:
                 state.lowmode_count += 1
 
@@ -1494,7 +1494,10 @@ def _run_optimization_loop(
             if cert_out is not None:
                 cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
                 cert_out["t_eval"] = t_eval      # xTB energy + relaxation
-                cert_out["t_collective"] = 0.0   # standard step: no collective move
+                # Any collective attempt(s) this step returned None (failed), so we fell
+                # through to the standard BO step. Their attempt time still elapsed, so
+                # record it (0.0 when no collective move was tried) to reconcile wall_s.
+                cert_out["t_collective"] = t_collective
         rel_energy = energy - state.start_energy
         logger.info(
             f"Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}"
