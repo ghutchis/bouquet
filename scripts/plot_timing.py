@@ -85,7 +85,7 @@ def size_colors(sizes):
     """Map each ordinal size to a ramp colour (interpolate if >len(ramp))."""
     if len(sizes) <= len(SIZE_RAMP):
         idx = np.linspace(0, len(SIZE_RAMP) - 1, len(sizes)).round().astype(int)
-        return {s: SIZE_RAMP[i] for s, i in zip(sizes, idx)}
+        return {s: SIZE_RAMP[i] for s, i in zip(sizes, idx, strict=True)}
     cmap = matplotlib.colors.LinearSegmentedColormap.from_list("blues", SIZE_RAMP)
     return {s: matplotlib.colors.to_hex(cmap(i / (len(sizes) - 1)))
             for i, s in enumerate(sizes)}
@@ -115,7 +115,7 @@ def plot_time_vs_steps(df, out_dir, arms):
     axes = np.atleast_1d(axes)
     sizes_all = sorted(df["num_dihedrals"].astype(int).unique())
     cmap = size_colors(sizes_all)
-    for ax, arm in zip(axes, arms):
+    for ax, arm in zip(axes, arms, strict=True):
         _style_ax(ax)
         series = median_wall_by_step(df[df["config"] == arm])
         max_step = 0
@@ -154,7 +154,7 @@ def wall_at_checkpoints(df_arm):
     series = median_wall_by_step(df_arm)  # size -> DataFrame(bo_steps, wall_s)
     out = {cp: {} for cp in CHECKPOINTS}
     for size, m in series.items():
-        lut = dict(zip(m["bo_steps"], m["wall_s"]))
+        lut = dict(zip(m["bo_steps"], m["wall_s"], strict=True))
         for cp in CHECKPOINTS:
             avail = [s for s in lut if s <= cp]
             if avail:
@@ -168,7 +168,7 @@ def plot_time_vs_size(df, out_dir, arms):
     axes = np.atleast_1d(axes)
     # Step budget is ordinal -> sequential blue ramp (light=50 -> dark=300).
     cmap = size_colors(CHECKPOINTS)
-    for ax, arm in zip(axes, arms):
+    for ax, arm in zip(axes, arms, strict=True):
         _style_ax(ax)
         by_cp = wall_at_checkpoints(df[df["config"] == arm])
         for cp in CHECKPOINTS:
@@ -221,7 +221,7 @@ def bucket_totals_at(df_arm, checkpoint):
 def plot_breakdown(df, out_dir, checkpoint, normalize, fname, title, arms):
     fig, axes = plt.subplots(1, len(arms), figsize=(6 * len(arms), 5), sharey=True)
     axes = np.atleast_1d(axes)
-    for ax, arm in zip(axes, arms):
+    for ax, arm in zip(axes, arms, strict=True):
         _style_ax(ax)
         totals = bucket_totals_at(df[df["config"] == arm], checkpoint)
         sizes = list(totals.keys())
@@ -257,7 +257,7 @@ def write_checkpoints(df, out_dir, arms):
     for arm in arms:
         series = median_wall_by_step(df[df["config"] == arm])
         for size, m in series.items():
-            lut = dict(zip(m["bo_steps"], m["wall_s"]))
+            lut = dict(zip(m["bo_steps"], m["wall_s"], strict=True))
             for cp in CHECKPOINTS:
                 # nearest recorded step <= cp (cumulative wall time to reach it)
                 avail = [s for s in lut if s <= cp]
