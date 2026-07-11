@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sweep_common as sc  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
-GFN2 = str(REPO / "gfn2_priors.json")
+GFN2 = str(REPO / "bouquet" / "data" / "gfn2_priors.json")
 IDEAL = str(REPO / "smoke_priors" / "ideal_prior.json")
 
 CONFIGURATIONS = {

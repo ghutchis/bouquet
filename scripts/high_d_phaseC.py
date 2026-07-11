@@ -45,7 +45,7 @@ _WARMUP = ["--lowmode-warmup", "55"]  # init(5) + grad Phase A(50)
 # Category arm: reuse the same post-Phase-A start (55 evals); the prior file supplies the
 # SMARTS categories + warmup seeds, with PiBO steering disabled so only the move differs.
 _CAT_WARMUP = ["--category-warmup", "55"]
-PRIORS = "gfn2_priors.json"  # repo-root fitted 1D prior library; run cd's to $BOUQUET
+PRIORS = "bouquet/data/gfn2_priors.json"  # bundled fitted 1D prior library; run cd's to $BOUQUET
 CONFIG_NAMES = ["base", "lm_pca", "lm_enm", "lmonly_enm", "cat", "cat_pca"]
 BASELINE_LABEL = "base"
 

@@ -105,7 +105,7 @@ def run_single(
         "--auto",
         "--relax",
         "--priors",
-        "gfn2_priors.json"
+        "__bundled__"
     ]
 
     if energy_method:

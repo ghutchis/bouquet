@@ -226,6 +226,8 @@ CERTIFICATE_BASE_FIELDNAMES = [
     "t_eval",     # seconds this step in the xTB energy evaluation + relaxation
     "t_gp_fit",   # subset of t_select: GP construction + fit/condition
     "t_acq",      # subset of t_select: acquisition build + optimize_acqf
+    "t_collective",  # collective (low-mode/category) step: kick + unconstrained relax
+                     # (GFN2). 0 on standard BO steps; t_select/t_eval are 0 on these.
     # ... then one lb_b<beta> column per beta (the certificate lower bound).
 ]
 
@@ -279,6 +281,7 @@ def create_certificate_logger(
             "t_eval": cert.get("t_eval"),
             "t_gp_fit": cert.get("t_gp_fit"),
             "t_acq": cert.get("t_acq"),
+            "t_collective": cert.get("t_collective"),
         }
         for col, val in zip(lb_cols, cert.get("lb", [])):
             row[col] = val

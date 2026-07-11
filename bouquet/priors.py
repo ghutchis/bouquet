@@ -6,6 +6,7 @@ This module provides:
 - JSON loading for custom fitted priors
 """
 
+import importlib.resources as importlib_resources
 import json
 import logging
 import math
@@ -876,3 +877,122 @@ def create_prior_module(
         max_concentration=max_concentration,
         background_weight=background_weight,
     )
+
+
+# ============================================================================
+# Bundled data files (packaged under bouquet/data/)
+# ============================================================================
+
+
+def _data_file(name: str) -> Path:
+    """Return the on-disk path of a file bundled under ``bouquet/data/``.
+
+    Uses ``importlib.resources`` so it resolves correctly whether bouquet is run
+    from a source checkout or an installed wheel. bouquet has heavyweight, non-zip-
+    safe dependencies (RDKit, torch), so the package is always unpacked on disk and
+    the traversable is a real filesystem path.
+    """
+    return Path(str(importlib_resources.files("bouquet") / "data" / name))
+
+
+def default_priors_path() -> Path:
+    """Path to the bundled fitted univariate priors JSON (PubChemQC GFN2 fits).
+
+    This is the default used when ``--priors`` is given without an explicit file.
+    Priors remain opt-in: no ``--priors`` flag means no PiBO steering.
+    """
+    return _data_file("gfn2_priors.json")
+
+
+def default_torlib_path() -> Path:
+    """Path to the bundled torsion-library SMARTS file (``torlib.txt``).
+
+    Each non-empty line is ``<int id>\\t<SMARTS>``; the integer id is the category
+    label used to tie chemically-equivalent rotors together for the category-tied
+    collective move (see :func:`assign_categories`). This mapping is independent of
+    the fitted priors JSON -- categories are available even when priors are off.
+    """
+    return _data_file("torlib.txt")
+
+
+def load_torlib_smarts(
+    torlib_path: Optional[Union[str, Path]] = None,
+) -> List[UnivariateSMARTS]:
+    """Load the torsion-library SMARTS patterns as :class:`UnivariateSMARTS`.
+
+    The first tab-separated column of each line is used as the (integer) prior type,
+    so two dihedrals matching the same library row share a category id. Falls back to
+    a 1-based running index when a line carries only a SMARTS string.
+
+    Args:
+        torlib_path: Path to a torlib file. ``None`` uses the bundled default.
+
+    Returns:
+        List of UnivariateSMARTS with integer ``prior_type`` category labels.
+    """
+    path = Path(torlib_path) if torlib_path is not None else default_torlib_path()
+    patterns: List[UnivariateSMARTS] = []
+    idx = 0
+    with path.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                try:
+                    idx = int(parts[0])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Malformed torlib line in {path}: expected an integer "
+                        f"category id in the first tab-separated field, got "
+                        f"{parts[0]!r} (line: {line!r})"
+                    ) from exc
+                smarts = parts[1]
+            else:
+                idx += 1
+                smarts = parts[0]
+            patterns.append(
+                UnivariateSMARTS(
+                    smarts=smarts,
+                    prior_type=idx,
+                    description=f"torlib category {idx}",
+                    priority=50,
+                )
+            )
+    return patterns
+
+
+def assign_categories(
+    mol: "Chem.Mol",
+    dihedrals: List[Tuple[int, int, int, int]],
+    torlib_path: Optional[Union[str, Path]] = None,
+) -> Dict[int, PriorTypeId]:
+    """Assign a torsion-library category id to each dihedral via SMARTS matching.
+
+    Categories tie chemically-equivalent rotors (e.g. the k-th backbone dihedral of
+    every monomer in a foldamer) together for the category-tied collective move. This
+    uses only the SMARTS->id mapping from ``torlib.txt`` -- it does NOT need the fitted
+    priors JSON, so category moves are available with PiBO steering off.
+
+    Args:
+        mol: RDKit molecule.
+        dihedrals: Dihedral atom-index tuples (from ``detect_dihedrals``).
+        torlib_path: Path to a torlib file. ``None`` uses the bundled default.
+
+    Returns:
+        ``{dihedral_index: category_id}`` for every dihedral that matched a library
+        pattern (unmatched dihedrals are absent and become their own singleton group
+        downstream).
+    """
+    # Some torlib rows use recursive-SMARTS label syntax RDKit can't parse; the matcher
+    # skips any pattern that fails to compile, but RDKit logs each failure to stderr.
+    # Silence those while compiling so a normal run isn't spammed. BlockLogs saves and
+    # restores the prior log state on exit, so we don't clobber a caller that had already
+    # disabled (or enabled) rdApp.error.
+    from rdkit import rdBase
+
+    with rdBase.BlockLogs():
+        matcher = DihedralPriorMatcher(load_torlib_smarts(torlib_path), [])
+    univariate, _bivariate = matcher.assign_all(mol, dihedrals)
+    return univariate
