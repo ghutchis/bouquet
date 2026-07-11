@@ -29,7 +29,7 @@ RDLogger.DisableLog('rdApp.*')
 # from Ring ETKDG paper: https://pubs.acs.org/doi/10.1021/acs.jcim.0c00025
 # torsions=pd.read_table("ring_smarts_patterns.txt",header=None,usecols=[1])
 # Based on the TorLib 2020 paper: https://doi.org/10.1021/acs.jcim.2c00043
-torsions=pd.read_table("torlib.txt",header=None,usecols=[1])
+torsions=pd.read_table("bouquet/data/torlib.txt",header=None,usecols=[1])
 
 # filename template for output, e.g. t1.txt, t2.txt, etc.
 out_template = 'torsions/tl{}.txt'

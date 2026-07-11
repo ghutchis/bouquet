@@ -67,6 +67,8 @@ requires = ["hatchling"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["bouquet"]
+# Bundle the SMARTS torsion library and fitted priors (see bouquet/priors.py loaders).
+force-include = { "bouquet/data" = "bouquet/data" }
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]

@@ -50,7 +50,7 @@ from bouquet.calculator import CalculatorFactory  # noqa: E402
 # Energy/optimizer choices come from the calculator registry (installed subset),
 # so they track new methods automatically and never offer an unavailable one.
 ENERGY_CHOICES = list(CalculatorFactory.available_methods())
-PRIORS_FILE_DEFAULT = "gfn2_priors.json"
+PRIORS_FILE_DEFAULT = "bouquet/data/gfn2_priors.json"
 
 # Tidy summary-CSV columns.
 FIELDNAMES = [

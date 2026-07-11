@@ -105,7 +105,7 @@ def run_single(
         "--auto",
         "--relax",
         "--priors",
-        "gfn2_priors.json"
+        "bouquet/data/gfn2_priors.json"
     ]
 
     if energy_method:

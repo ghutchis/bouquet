@@ -1154,7 +1154,7 @@ def main():
     parser.add_argument(
         "--torlib",
         type=Path,
-        default=Path("torlib.txt"),
+        default=Path("bouquet/data/torlib.txt"),
         help="Path to torlib.txt with SMARTS patterns",
     )
     parser.add_argument(

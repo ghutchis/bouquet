@@ -200,7 +200,8 @@ class RunOptions:
     lowmode_modes: int = 4
     lowmode_kick_dir: str = "pca"
 
-    # Phase 3 category-tied collective move (None = auto; needs a prior_module)
+    # Phase 3 category-tied collective move (None = auto; uses torlib SMARTS categories,
+    # independent of the fitted priors)
     category_prob: Optional[float] = None
     category_warmup: int = 20
     category_min_moves: int = 6

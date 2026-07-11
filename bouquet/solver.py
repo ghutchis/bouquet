@@ -25,6 +25,7 @@ __lazy_modules__ = [
 import itertools
 import logging
 import math
+import os
 import time
 import warnings
 from contextlib import contextmanager
@@ -1114,6 +1115,7 @@ def _log_improvement_geometry(
 # straight kick onto the curved fold valley (the straight-line dihedral path is
 # clash-barrier-blocked; see the Phase 2.4 diagnostics in bouquet_hdbo_plan.md).
 _LOWMODE_CONSTRAINED_STEPS = 20
+# Unconstrained relax budget for a collective (low-mode / category) move.
 _LOWMODE_FREE_STEPS = 100
 
 
@@ -1216,12 +1218,12 @@ def _low_mode_move(
 
 
 def _build_category_groups(
-    prior_module: DihedralPriorModule | None, n_dihedrals: int
+    category_assignments: dict | None, n_dihedrals: int
 ) -> list[list[int]]:
     """Partition dihedral indices into tied categories for the category move.
 
-    Two dihedrals share a group iff the prior's SMARTS matcher assigned them the same
-    *specific* fitted-library category (an integer type id) -- i.e. they are the same
+    Two dihedrals share a group iff the SMARTS matcher assigned them the same
+    *specific* torsion-library category (an integer type id) -- i.e. they are the same
     chemical rotor (e.g. the k-th dihedral of every monomer in a foldamer). The generic
     builtin fallbacks (``sp3_sp3``/``sp3_sp2``, string type ids), unassigned dihedrals,
     and bivariate-pair dihedrals are NOT a shared rotor, so each becomes its own singleton
@@ -1230,9 +1232,13 @@ def _build_category_groups(
     to a handful of groups (the repeat unit); a molecule with no specific repeats stays at
     one group per dihedral (the move degenerates to ordinary REMBO). Returns the groups as
     sorted lists of indices, ordered by first member.
+
+    ``category_assignments`` is the ``{dihedral_index: type_id}`` map from
+    :func:`bouquet.priors.assign_categories` (torlib SMARTS ids) -- independent of the
+    fitted priors, so categories are available with PiBO steering off.
     """
     key_to_members: dict = {}
-    assignments = getattr(prior_module, "univariate_assignments", {}) or {}
+    assignments = category_assignments or {}
     for d in range(n_dihedrals):
         t = assignments.get(d)
         # Only an integer (fitted-library) id is a real shared rotor; generic string ids
@@ -1445,8 +1451,14 @@ def _run_optimization_loop(
         if collective_result is not None:
             next_coords, cur_atoms, energy = collective_result
             gradient = None
-            cert_out = None
-            t_select, t_eval = 0.0, t_collective
+            t_select, t_eval = 0.0, 0.0
+            # Collective (low-mode / category) step: no GP fit or acquisition ran, so
+            # there is no posterior to certify (mu_min/alpha_max/lb stay blank). The
+            # whole cost is the committed kick + UNCONSTRAINED relax (GFN2); record it
+            # in its own t_collective bucket so the row is still logged. Previously
+            # cert_out was None here, which dropped the row and hid this time entirely.
+            cert_out = ({"t_select": 0.0, "t_eval": 0.0, "t_collective": t_collective}
+                        if state.cert_log is not None else None)
         else:
             # ---- standard BO step: fit the GP and optimize the acquisition ----
             cert_out = {} if state.cert_log is not None else None
@@ -1482,6 +1494,7 @@ def _run_optimization_loop(
             if cert_out is not None:
                 cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
                 cert_out["t_eval"] = t_eval      # xTB energy + relaxation
+                cert_out["t_collective"] = 0.0   # standard step: no collective move
         rel_energy = energy - state.start_energy
         logger.info(
             f"Evaluated energy in step {step+1: >3}/{n_steps}. Energy-E0: {rel_energy:12.6f}"
@@ -1578,10 +1591,8 @@ def _perform_final_relaxation(
     best_energy, best_atoms = evaluate_energy(
         best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
     )
-    logger.info(
-        f"Performed final relaxation with dihedral constraints. "
-        f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
-    )
+    # (E-E0 is logged once at the end, after any failed-relax fallback, so the value
+    # the sweep log-parser reads is always the trustworthy final energy.)
     if state.add_entry is not None:
         state.add_entry(best_coords, best_atoms, best_energy)
 
@@ -1595,10 +1606,6 @@ def _perform_final_relaxation(
     # the --retain-bonds release check test a pinned geometry rather than a real
     # released one.
     best_energy, best_atoms = relax_structure(best_atoms, calc, relaxCalc, None)
-    logger.info(
-        f"Performed final relaxation without dihedral constraints. "
-        f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
-    )
     # If the final tight relaxation walked into a geometry the calculator cannot
     # evaluate (SCF non-convergence -> sentinel failure energy), the released
     # structure is garbage and would be written to final.xyz with a nonsense
@@ -1618,7 +1625,9 @@ def _perform_final_relaxation(
                 "reverting to the best structure observed during the search."
             )
             best_atoms = state.observed_atoms[best_idx].copy()
-            best_energy = state.observed_energies[best_idx].item()
+            # observed_energies stores E-E0 (relative); restore the absolute energy so
+            # the E/E-E0 bookkeeping below (return, add_entry, logging) stays consistent.
+            best_energy = state.observed_energies[best_idx].item() + state.start_energy
 
     # --retain-bonds: if releasing the dihedral constraints let the geometry
     # rearrange, keep the constrained (bond-preserving) result instead.
@@ -1631,6 +1640,22 @@ def _perform_final_relaxation(
         )
         best_atoms = constrained_atoms
         best_energy = constrained_energy
+
+    # Log the FINAL energies here -- after any failed-relax fallback above -- so the
+    # values the sweep log-parser scrapes are always trustworthy and never the sentinel
+    # failure energy. If the constrained final relax itself failed, report the reverted
+    # best in its place rather than the sentinel.
+    report_constrained = (
+        constrained_energy if constrained_energy < RELAX_FAILURE_ENERGY_EV else best_energy
+    )
+    logger.info(
+        f"Performed final relaxation with dihedral constraints. "
+        f"E: {report_constrained}. E-E0: {report_constrained - state.start_energy}"
+    )
+    logger.info(
+        f"Performed final relaxation without dihedral constraints. "
+        f"E: {best_energy}. E-E0: {best_energy - state.start_energy}"
+    )
 
     best_coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
     if state.add_entry is not None:
@@ -1839,6 +1864,7 @@ def run_optimization(
     initial_conformers: list[Atoms] | None = None,
     initial_dihedrals: np.ndarray | None = None,
     prior_module: DihedralPriorModule | None = None,
+    category_assignments: dict | None = None,
     return_ensemble: bool = False,
     opts: RunOptions | None = None,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
@@ -1859,8 +1885,15 @@ def run_optimization(
         initial_dihedrals: Optional array of dihedral guesses (degrees) to use as
                            initial points (e.g. from plan_initial_points). Used
                            when no conformers are provided; falls back to random.
-        prior_module: Optional PiBO dihedral prior guiding acquisition (and, when
-                           set, enabling the category-tied collective move).
+        prior_module: Optional PiBO dihedral prior guiding acquisition. Independent
+                           of the category-tied collective move (see
+                           ``category_assignments``).
+        category_assignments: Optional ``{dihedral_index: torlib category id}`` map
+                           (from :func:`bouquet.priors.assign_categories`) that ties
+                           chemically-equivalent rotors for the category-tied
+                           collective move. Decoupled from ``prior_module`` so category
+                           moves work with PiBO steering off. When ``None``, falls back
+                           to ``prior_module``'s univariate assignments (legacy callers).
         return_ensemble: If True, also select and tightly optimize a Boltzmann
             ensemble of low-energy conformers and return it alongside the best
             structure.
@@ -1941,11 +1974,14 @@ def run_optimization(
     # on repeat structure: the benchmark shows the win requires a real tie to exploit
     # (max_spec = the largest tied SMARTS category), and that on large-but-irregular
     # molecules (high d, low max_spec) the tie mildly HURTS -- so raw d is not enough.
-    # Needs a prior_module (no categories without one). Build the groups once here and
-    # reuse them below. An explicit category_prob always wins over None/auto.
+    # Categories come from torlib SMARTS (category_assignments), independent of the fitted
+    # priors; legacy callers that pass only a prior_module still work via its assignments.
+    # Build the groups once here and reuse them below. Explicit category_prob wins over auto.
+    if category_assignments is None and prior_module is not None:
+        category_assignments = getattr(prior_module, "univariate_assignments", None)
     category_groups = (
-        _build_category_groups(prior_module, n_dihedrals)
-        if prior_module is not None else None
+        _build_category_groups(category_assignments, n_dihedrals)
+        if category_assignments is not None else None
     )
     category_prob = opts.category_prob
     if category_prob is None:
@@ -1964,16 +2000,17 @@ def run_optimization(
 
     # A category-tied move broadcasts a per-category value then relaxes (see
     # _category_move); like the low-mode move it is meaningless without relaxation, and
-    # it needs the prior's SMARTS categories to know which dihedrals to tie.
+    # it needs SMARTS category assignments to know which dihedrals to tie.
     if category_prob > 0:
         if not relax:
             raise ValueError(
                 "category_prob > 0 requires relax=True: category moves are broadcast + relax steps"
             )
-        if prior_module is None:
+        if not category_assignments:
             raise ValueError(
-                "category_prob > 0 requires a prior_module: the SMARTS categories define "
-                "which dihedrals are tied. Pass --priors / build one with create_prior_module."
+                "category_prob > 0 requires category_assignments: the torlib SMARTS "
+                "categories define which dihedrals are tied. Build them with "
+                "bouquet.priors.assign_categories (or pass a prior_module)."
             )
 
     # Seed every RNG the run touches from `seed`, so a run is reproducible and the
@@ -2015,8 +2052,8 @@ def run_optimization(
     state.category_warmup = opts.category_warmup
     state.category_min_moves = opts.category_min_moves
     if category_prob > 0:
-        # Reuse the partition built for the auto-default decision above (prior_module is
-        # non-None here: category_prob > 0 was validated to require it).
+        # Reuse the partition built for the auto-default decision above (category_assignments
+        # is non-empty here: category_prob > 0 was validated to require it).
         state.category_groups = category_groups
         state.category_rng = np.random.default_rng(seed + 88883)
         logger.info(

@@ -1,6 +1,7 @@
 from argparse import SUPPRESS, ArgumentParser
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from rdkit import Chem
@@ -44,6 +45,21 @@ from bouquet.setup import (
     select_initial_structure,
 )
 from bouquet.solver import plan_initial_points, run_optimization
+
+
+def _resolve_priors_arg(value: Optional[str]) -> Optional[Path]:
+    """Resolve the ``--priors`` argument to a JSON path (or ``None`` = priors off).
+
+    ``None`` (flag omitted) leaves PiBO steering off. The bare-flag sentinel selects
+    the bundled fitted priors; anything else is treated as a user-supplied path.
+    """
+    if value is None:
+        return None
+    if value == "__bundled__":
+        from bouquet.priors import default_priors_path
+
+        return default_priors_path()
+    return Path(value)
 
 
 def main():
@@ -282,7 +298,11 @@ def main():
     parser.add_argument(
         "--priors",
         type=str,
-        help="JSON file with dihedral prior definitions",
+        nargs="?",
+        const="__bundled__",
+        default=None,
+        help="Enable PiBO priors. Bare --priors uses the bundled fitted priors "
+        "(gfn2_priors.json); pass a path for a custom JSON. Omit to leave priors off.",
     )
     # Initial prior exponent for PiBO (0 to disable, default is 0.5)
     parser.add_argument(
@@ -450,7 +470,7 @@ def main():
         relax=args.relax,
         solvent=args.solvent,
         seed=args.seed,
-        priors_file=Path(args.priors) if args.priors else None,
+        priors_file=_resolve_priors_arg(args.priors),
         prior_max_concentration=args.prior_max_concentration,
         prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
@@ -597,6 +617,18 @@ def main():
         logger.info(f"Created prior module from {config.priors_file}")
         logger.info(prior_module.describe())
 
+    # Assign torsion-library SMARTS categories to every dihedral. This ties chemically-
+    # equivalent rotors for the category-tied collective move and is independent of the
+    # fitted priors above -- so category moves are available even with PiBO steering off
+    # (the auto-default fires on large molecules with real repeat structure).
+    from bouquet.priors import assign_categories
+
+    category_assignments = assign_categories(mol, [d.chain for d in dihedrals])
+    logger.info(
+        f"Assigned torlib categories to {len(category_assignments)} of "
+        f"{len(dihedrals)} dihedrals"
+    )
+
     # Plan prior-peak initial guesses (opt-in via --init-method peaks).
     # Conformers take precedence. Peak-seeding is decoupled from PiBO
     # acquisition: when no --priors file is given we build a built-ins-only
@@ -665,6 +697,7 @@ def main():
         initial_conformers=initial_conformers,
         initial_dihedrals=initial_dihedrals,
         prior_module=prior_module,
+        category_assignments=category_assignments,
         return_ensemble=config.ensemble,
         opts=config.run,
     )
