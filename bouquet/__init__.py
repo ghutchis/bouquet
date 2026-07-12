@@ -21,6 +21,9 @@ __lazy_modules__ = [
     "bouquet.priors",
     "bouquet.setup",
     "bouquet.solver",
+    "bouquet.solver_ensemble",
+    "bouquet.solver_moves",
+    "bouquet.surrogate",
 ]
 
 _SUBMODULES = frozenset(name.split(".", 1)[1] for name in __lazy_modules__)
@@ -36,6 +39,9 @@ if TYPE_CHECKING:  # keep static analyzers / IDEs aware of the attributes
         priors,
         setup,
         solver,
+        solver_ensemble,
+        solver_moves,
+        surrogate,
     )
 
 

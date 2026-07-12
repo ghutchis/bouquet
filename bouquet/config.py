@@ -326,6 +326,51 @@ class RunOptions:
                 f"got {self.ensemble_explore_mode!r}."
             )
 
+    # ---- auto-default resolution (the "auto"/None sentinels -> concrete values) ----
+    # Kept next to the fields and thresholds they read; run_optimization calls these
+    # once it knows the dihedral count (and, for categories, the SMARTS partition).
+
+    def resolve_lengthscale_prior(self, n_dihedrals: int) -> str:
+        """Resolve the ``"auto"`` value-GP lengthscale prior to a concrete choice.
+
+        ``"auto"`` turns on the dimensionality-scaled prior once the dihedral count
+        crosses the high-d threshold (it helps there, and is off at low d); an
+        explicit ``"none"`` / ``"dim_scaled"`` passes through unchanged.
+        """
+        if self.lengthscale_prior != "auto":
+            return self.lengthscale_prior
+        return "dim_scaled" if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else "none"
+
+    def resolve_lowmode_prob(self, n_dihedrals: int) -> float:
+        """Resolve the ``None`` (auto) low-mode move probability by dihedral count.
+
+        Auto enables the low-mode move at high d; an explicit float passes through.
+        """
+        if self.lowmode_prob is not None:
+            return self.lowmode_prob
+        return 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
+
+    def resolve_category_prob(
+        self, n_dihedrals: int, category_groups: Optional[list] = None
+    ) -> float:
+        """Resolve the ``None`` (auto) category-tied move probability.
+
+        Auto enables the move only when the molecule is both high-d AND has a real
+        repeat to exploit -- the largest tied SMARTS category (``max_spec``) exceeds
+        ``CAT_MAXSPEC_THRESHOLD``. On large-but-irregular molecules (high d, low
+        max_spec) the tie mildly hurts, so raw dihedral count is not enough. An
+        explicit float passes through unchanged.
+        """
+        if self.category_prob is not None:
+            return self.category_prob
+        max_spec = (
+            max((len(g) for g in category_groups), default=0)
+            if category_groups else 0
+        )
+        return 0.5 if (
+            n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD
+        ) else 0.0
+
 
 @dataclass(slots=True)
 class Configuration:
