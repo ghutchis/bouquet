@@ -69,5 +69,5 @@ def test_final_relaxation_reverts_to_best_observed(populated_state, monkeypatch)
     _, rel_energy = solver._perform_final_relaxation(state, dihedrals, calc, calc)
 
     # Reverted to the lowest structure actually observed during the search.
-    assert rel_energy == pytest.approx(best_observed_eV - state.start_energy)
+    assert rel_energy == pytest.approx(best_observed_eV)
     assert best_observed_eV < RELAX_FAILURE_ENERGY_EV

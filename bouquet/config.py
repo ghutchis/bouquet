@@ -151,6 +151,53 @@ FAILURE_ENERGY_EV = 100.0
 # Boltzmann constant in eV/K.
 KB_EV_PER_K = 8.617333262e-5
 
+# --- Ensemble level-set exploration ---
+# Active exploration budget after the main search: -1 = auto (scale by dihedral
+# count), 0 = passive harvest only (historical --ensemble behavior), >0 = fixed
+# hard cap on exploration steps.
+DEFAULT_ENSEMBLE_STEPS = -1
+# Discovery window: the level-set acquisition pushes toward conformers within
+# this energy of the running best. Wider than ENSEMBLE_WINDOW_KCAL so basins
+# just outside the (narrower) reporting window are still found and can relax in.
+ENSEMBLE_EXPLORE_KCAL = 10.0
+# Torsion-space diversity strength for the level-set acquisition (0 = off).
+# Multiplicative local penalization: the acquisition near a known basin is scaled
+# by (1 - diversity), so 0.5 halves it there and 1.0 fully suppresses re-sampling
+# it, while regions far from every basin are left untouched (see
+# _LevelSetAcquisition). Values in (0, 1]; the basin width is ENSEMBLE_BASIN_DEG.
+DEFAULT_ENSEMBLE_DIVERSITY = 0.5
+# Two conformers count as the same basin when their wrapped RMS angular distance
+# is below this (degrees); the coarse in-search analog of the final RMSD dedup.
+ENSEMBLE_BASIN_DEG = 40.0
+# Adaptive stop: require this many consecutive steps with no newly discovered
+# basin AND a collapsed posterior before ending exploration early.
+ENSEMBLE_SATURATION_ITERS = 5
+# Adaptive stop: max posterior sigma (kcal/mol) over a Sobol pool below which the
+# surface is considered well-characterized.
+ENSEMBLE_SIGMA_STOP_KCAL = 1.0
+# Exploration mode:
+#   "levelset" -- P_in * sigma over the whole window; best low-energy recall but
+#                 under-covers the high-energy shell.
+#   "hybrid"   -- level-set for the first half of the budget (lock in the
+#                 low-energy manifold), then a boundary sweep for the second half
+#                 -- the boundary acquisition (-|mu - target| + kappa*sigma) with
+#                 the target energy annealed upward -- to fill the high-energy
+#                 shell: captures both instead of trading one for the other.
+# (A pure-boundary mode was benchmarked and dropped -- it under-covered the
+# low-energy manifold; the boundary sweep is only useful as hybrid's second half.)
+DEFAULT_ENSEMBLE_EXPLORE_MODE = "levelset"
+ENSEMBLE_EXPLORE_MODES = ("levelset", "hybrid")
+# Hybrid boundary sweep: uncertainty-bonus weight and the target-offset sweep (kcal/mol,
+# relative to the running best) marched from LO to HI. HI intentionally OVERSHOOTS
+# the report window (ENSEMBLE_WINDOW_KCAL): each proposal is constrained-relaxed
+# then tight-optimized, which lowers its energy, so to *populate* a 4-6 kcal
+# minimum the acquisition must *target* ~6-10 kcal and let relaxation drop it into
+# the shell. Capping HI at the window instead starves the high-energy shell
+# (empirically worse recall there -- see the cysteine benchmark).
+ENSEMBLE_BOUNDARY_KAPPA = 2.0
+ENSEMBLE_BOUNDARY_LO_KCAL = 1.5
+ENSEMBLE_BOUNDARY_HI_KCAL = ENSEMBLE_EXPLORE_KCAL  # 10.0 (overshoots report window)
+
 # Default methods
 DEFAULT_ENERGY_METHOD = "gfn2"
 DEFAULT_OPTIMIZER_METHOD = "gfnff"
@@ -214,6 +261,13 @@ class RunOptions:
     # Reject evaluations that change the initial covalent bond graph
     retain_bonds: bool = False
 
+    # Ensemble active level-set exploration (only used when Configuration.ensemble
+    # is set). ensemble_steps: -1 = auto, 0 = passive harvest only, >0 = hard cap.
+    # ensemble_diversity: torsion-space diversity penalty strength (0 = off).
+    ensemble_steps: int = DEFAULT_ENSEMBLE_STEPS
+    ensemble_diversity: float = DEFAULT_ENSEMBLE_DIVERSITY
+    ensemble_explore_mode: str = DEFAULT_ENSEMBLE_EXPLORE_MODE
+
     def __post_init__(self):
         # Coerce string log paths (direct callers may pass str; the CLI already
         # wraps with Path).
@@ -252,6 +306,24 @@ class RunOptions:
             raise ValueError(
                 "lowmode_kick_dir must be one of 'pca', 'enm', got "
                 f"{self.lowmode_kick_dir!r}"
+            )
+
+        # Ensemble exploration budget: -1 (auto) and 0 (off) are sentinels;
+        # anything below -1 is a typo, not a meaningful step cap.
+        if self.ensemble_steps < -1:
+            raise ValueError(
+                "ensemble_steps must be -1 (auto), 0 (passive harvest), or a "
+                f"positive step cap; got {self.ensemble_steps}."
+            )
+        if self.ensemble_diversity < 0:
+            raise ValueError(
+                "ensemble_diversity must be non-negative (0 = off), got "
+                f"{self.ensemble_diversity}."
+            )
+        if self.ensemble_explore_mode not in ENSEMBLE_EXPLORE_MODES:
+            raise ValueError(
+                f"ensemble_explore_mode must be one of {ENSEMBLE_EXPLORE_MODES}, "
+                f"got {self.ensemble_explore_mode!r}."
             )
 
 

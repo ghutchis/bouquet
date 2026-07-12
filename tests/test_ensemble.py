@@ -11,15 +11,9 @@ from ase import Atoms
 from ase.build import molecule
 
 from bouquet.config import KCAL_TO_EV
+from bouquet.ensemble import _HAVE_IRMSD, _boltzmann_weights, _dedup, _rmsd
 from bouquet.io import save_ensemble
-from bouquet.solver import (
-    _HAVE_IRMSD,
-    OptimizationState,
-    _boltzmann_weights,
-    _dedup,
-    _rmsd,
-    _select_ensemble_candidates,
-)
+from bouquet.solver import OptimizationState, _select_ensemble_candidates
 
 
 def _h2(length: float) -> Atoms:

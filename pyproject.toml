@@ -74,6 +74,12 @@ force-include = { "bouquet/data" = "bouquet/data" }
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
+# The optional iRMSD wheels (rotation/permutation-invariant RMSD for ensemble
+# dedup) are built for macosx_15_0_arm64; declare the macOS floor so pixi resolves
+# the arm64 wheel instead of defaulting to the conservative macos-13 tag.
+[tool.pixi.system-requirements]
+macos = "15.0"
+
 # Default dependencies — the lightweight xtb stack (GFN-FF / GFN2 / GFN0) plus
 # tooling. Heavy ab initio calculators live in optional features below so a plain
 # `pixi install` stays small.
@@ -104,6 +110,12 @@ all = { features = ["psi4"], solve-group = "default" }
 # match the local [project].name, not the PyPI distribution name.
 [tool.pixi.pypi-dependencies]
 bouquet-mol = { path = ".", editable = true }
+
+[tool.pixi.target.osx-arm64.pypi-dependencies]
+irmsd = ">=0.1.1"
+
+[tool.pixi.target.linux-64.pypi-dependencies]
+irmsd = ">=0.1.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
