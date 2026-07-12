@@ -2,34 +2,21 @@
 
 from __future__ import annotations
 
-# With annotations evaluated as strings (PEP 563), the heavy numeric/BO stack is
-# only touched inside function bodies, so defer it until an optimization actually
-# runs. This is the dominant `import bouquet` cost (Python 3.15+).
+# With annotations evaluated as strings (PEP 563), the heavy numeric stack is only
+# touched inside function bodies, so defer it until an optimization actually runs
+# (Python 3.15+); see bouquet/__init__.py. The GP/acquisition, collective-move, and
+# ensemble machinery now live in the split modules imported below, each of which
+# defers its own heavy imports the same way.
 __lazy_modules__ = [
     "numpy",
     "torch",
     "ase",
-    "ase.build",
     "ase.calculators.calculator",
-    "botorch.acquisition.analytic",
-    "botorch.acquisition.prior_guided",
-    "botorch.optim.fit",
-    "botorch.optim",
-    "botorch.models",
-    "botorch.models.transforms.outcome",
-    "gpytorch",
-    "gpytorch.mlls",
-    "gpytorch.priors",
 ]
 
 import itertools
 import logging
-import math
-import os
 import time
-import warnings
-from contextlib import contextmanager
-from functools import lru_cache
 from dataclasses import dataclass, field, InitVar
 from pathlib import Path
 from typing import Callable
@@ -38,16 +25,6 @@ import numpy as np
 import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
-from botorch.acquisition.analytic import LogExpectedImprovement
-from botorch.acquisition.prior_guided import PriorGuidedAcquisitionFunction
-from botorch.optim.fit import fit_gpytorch_mll_torch
-from botorch.models import SingleTaskGP
-from botorch.models.transforms.outcome import Standardize
-from botorch.optim import optimize_acqf
-from botorch.utils.sampling import draw_sobol_samples
-from gpytorch import kernels as gpykernels
-from gpytorch.mlls import ExactMarginalLogLikelihood
-from gpytorch.priors import LogNormalPrior, NormalPrior
 
 from bouquet.assess import (
     evaluate_energy,
@@ -59,43 +36,13 @@ from bouquet.config import (
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
     DEFAULT_RELAXATION_STEPS,
-    ENSEMBLE_BASIN_DEG,
-    ENSEMBLE_BOUNDARY_HI_KCAL,
-    ENSEMBLE_BOUNDARY_KAPPA,
-    ENSEMBLE_BOUNDARY_LO_KCAL,
-    ENSEMBLE_ENERGY_TOL_KCAL,
-    ENSEMBLE_EXPLORE_KCAL,
-    ENSEMBLE_P_THRESHOLD,
-    ENSEMBLE_RMSD_THRESHOLD,
-    ENSEMBLE_SATURATION_ITERS,
-    ENSEMBLE_SIGMA_FLOOR_KCAL,
-    ENSEMBLE_SIGMA_STOP_KCAL,
-    ENSEMBLE_TEMPERATURE,
-    ENSEMBLE_WINDOW_KCAL,
-    CAT_D_THRESHOLD,
-    CAT_MAXSPEC_THRESHOLD,
-    FAILURE_ENERGY_EV,
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
-    GP_PERIOD_LENGTH_MEAN,
-    GP_PERIOD_LENGTH_STD,
-    HIGH_D_DIHEDRAL_THRESHOLD,
     INITIAL_GUESS_STD,
     KCAL_TO_EV,
     RELAX_FAILURE_ENERGY_EV,
     RunOptions,
 )
-from bouquet.ensemble import (
-    _BoundaryAcquisition,
-    _LevelSetAcquisition,
-    _boltzmann_weights,
-    _dedup,
-    _exploration_plan,
-    _periodic_min_dist,
-    _resolve_ensemble_budget,
-    _rmsd,
-)
-from bouquet.gradient_gp import GradientEnhancedPeriodicGP
 from bouquet.io import (
     append_xyz_frame,
     create_certificate_logger,
@@ -106,26 +53,42 @@ from bouquet.io import (
 from bouquet.priors import DihedralPriorModule
 from bouquet.setup import DihedralInfo, bonds_broken, geometry_bond_set
 
+# The GP/acquisition, collective-move, and ensemble machinery split out of this
+# file. Imported here both because the loop/orchestrator below call into them and
+# to re-export the moved names from ``bouquet.solver`` (tests and external callers
+# still import several via ``solver._name``).
+from bouquet.surrogate import (
+    _GP_FIT_STEPS,
+    _cert_sobol_pool,
+    _compute_certificate,
+    _fit_gradient_gp,
+    _fit_value_gp,
+    _periodic_covar_module,
+    _restrict_gradient_mask,
+    _select_next_points_botorch,
+    _suppress_fit_warnings,
+)
+from bouquet.solver_moves import (
+    _build_category_groups,
+    _category_move,
+    _collective_kick_relax,
+    _collective_result,
+    _low_mode_move,
+    _sample_category_z_from_prior,
+)
+from bouquet.solver_ensemble import (
+    _build_selection_gp,
+    _fit_selection_gp_valid,
+    _initial_basins,
+    _max_posterior_sigma,
+    _perform_ensemble_exploration,
+    _perform_ensemble_relaxation,
+    _select_ensemble_candidates,
+    _select_exploration_point,
+    _valid_observation_idx,
+)
+
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _suppress_fit_warnings():
-    """Silence the expected, noisy botorch/gpytorch fit and acquisition warnings,
-    scoped to the wrapped block instead of the whole process (importing this module
-    used to install a global ``warnings.filterwarnings('ignore')``)."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        yield
-
-# Marginal-likelihood Adam iterations for a cold GP hyperparameter fit, shared by
-# the value-only acquisition GP, the ensemble-selection GP, and the cold
-# gradient-GP fit (see _fit_gradient_gp); gradient-GP condition-only updates run 0
-# steps. A benchmark found conformer quality is insensitive to fit convergence
-# (50/100/200 steps gave statistically indistinguishable minima despite very
-# different final NLLs), so 100 trims the cold fits at no quality cost; 50 showed a
-# faint degradation and is under-converged for larger molecules.
-_GP_FIT_STEPS = 100
 
 
 def _get_device() -> torch.device:
@@ -357,410 +320,53 @@ class OptimizationState:
         self._n = i + 1
         self.observed_atoms.append(atoms.copy())
 
+    def apply_run_options(
+        self,
+        opts: RunOptions,
+        *,
+        lengthscale_prior: str,
+        lowmode_prob: float,
+        category_prob: float,
+        category_groups: list | None,
+        seed: int,
+    ) -> None:
+        """Copy the resolved search/surrogate/move knobs from ``opts`` onto self.
 
-def _periodic_covar_module(
-    num_dims: int, lengthscale_prior: str = "none"
-) -> gpykernels.ScaleKernel:
-    """Build the periodic GP covariance module shared by the acquisition GP and
-    the ensemble-selection GP (a scaled product of per-dihedral periodic kernels).
+        The three ``auto``-resolved values (``lengthscale_prior``, ``lowmode_prob``,
+        ``category_prob``) are passed in already resolved (see the ``RunOptions.
+        resolve_*`` methods); every other field is a straight copy. Also seeds the
+        two collective-move RNGs when their move is enabled. Prior (PiBO) settings
+        are set by the caller since ``prior_module`` is not a ``RunOptions`` field.
+        """
+        self.gradient_steps = opts.gradient_steps
+        self.grad_refit_dense_until = opts.grad_refit_dense_until
+        self.grad_refit_every = opts.grad_refit_every
+        self.acq_num_restarts = opts.acq_num_restarts
+        self.acq_raw_samples = opts.acq_raw_samples
+        self.gradient_window = opts.gradient_window
+        self.gradient_keep = opts.gradient_keep
+        self.lengthscale_prior = lengthscale_prior
 
-    ``lengthscale_prior`` selects the prior on the (shared) periodic lengthscale:
-    - ``"none"`` (default): no lengthscale prior -- the historical behavior, where
-      the lengthscale is a free MLL fit.
-    - ``"dim_scaled"``: the Hvarfner et al. (ICML 2024) dimensionality-scaled
-      LogNormal prior, ``LogNormal(sqrt(2) + 0.5*ln d, sqrt(3))``, biasing the GP
-      toward smoother fits as ``d`` grows. NOTE: those constants were calibrated for
-      an RBF/Matern kernel; this PeriodicKernel uses ``exp(-2 sin^2(.)/l)`` (l at
-      first power over a bounded sin^2 term), so the *location offset* likely needs
-      recalibration -- the smoke test measures whether the canonical constants help
-      or over-smooth. The lengthscale is also initialized at the prior median.
-    """
-    base_kwargs = dict(
-        period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD)
-    )
-    loc = None
-    if lengthscale_prior == "dim_scaled":
-        loc = math.sqrt(2.0) + 0.5 * math.log(num_dims)
-        base_kwargs["lengthscale_prior"] = LogNormalPrior(loc, math.sqrt(3.0))
-    elif lengthscale_prior != "none":
-        raise ValueError(
-            f"lengthscale_prior must be 'none' or 'dim_scaled', got {lengthscale_prior!r}"
-        )
-    base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
-    if loc is not None:
-        base_kernel.lengthscale = math.exp(loc)  # start at the prior median
-    return gpykernels.ScaleKernel(
-        gpykernels.ProductStructureKernel(num_dims=num_dims, base_kernel=base_kernel)
-    )
+        # Phase 2.5 low-mode move. Its coin/direction RNG is offset from the global
+        # seed so it doesn't co-vary with the torch/numpy streams but stays
+        # reproducible (paired comparisons across arms at a fixed seed).
+        self.lowmode_prob = lowmode_prob
+        self.lowmode_warmup = opts.lowmode_warmup
+        self.lowmode_kick_deg = opts.lowmode_kick_deg
+        self.lowmode_modes = opts.lowmode_modes
+        self.lowmode_kick_dir = opts.lowmode_kick_dir
+        if lowmode_prob > 0:
+            self.lowmode_rng = np.random.default_rng(seed + 99991)
 
-
-def _fit_value_gp(
-    train_x: torch.Tensor,
-    train_y: torch.Tensor,
-    *,
-    covar_module: gpykernels.ScaleKernel,
-    outcome_transform=None,
-) -> SingleTaskGP:
-    """Build and fit a value-only ``SingleTaskGP`` with the shared fit config.
-
-    Both the acquisition GP and the ensemble-selection GP fit a periodic
-    ``SingleTaskGP`` with ``fit_gpytorch_mll_torch`` (Adam, lr 0.01, capped at
-    ``_GP_FIT_STEPS``); centralizing the construction and fit here keeps the two
-    from drifting apart. ``covar_module`` carries the (optionally prior-equipped)
-    kernel and ``outcome_transform`` is passed through (e.g. ``Standardize(m=1)``
-    for the selection GP fitting energies in eV).
-    """
-    gp = SingleTaskGP(
-        train_x,
-        train_y,
-        covar_module=covar_module,
-        outcome_transform=outcome_transform,
-    )
-    mll = ExactMarginalLogLikelihood(gp.likelihood, gp).to(device=train_x.device)
-    fit_gpytorch_mll_torch(
-        mll,
-        step_limit=_GP_FIT_STEPS,
-        optimizer=lambda p: torch.optim.Adam(p, lr=0.01),
-    )
-    return gp
-
-
-def _restrict_gradient_mask(
-    mask: torch.Tensor, raw_y: torch.Tensor, window: int, mode: str
-) -> torch.Tensor:
-    """Keep gradients for only ``window`` high-leverage points (others stay
-    value-only), shrinking the augmented GP from n*(1+d) to n + window*d.
-
-    ``mode``: 'recent' (the last ``window`` gradient-valid points -- local
-    navigation at the search frontier), 'best' (the ``window`` lowest-energy --
-    refining the incumbent basin), or 'both' (half each, union). Points are
-    selected only among those already in ``mask`` (gradient-valid, clamp-inactive);
-    every point still contributes its value. No-op if <= window valid gradients."""
-    valid = torch.nonzero(mask, as_tuple=False).flatten()  # ascending obs order
-    if window <= 0 or valid.numel() <= window:
-        return mask
-    if mode == "recent":
-        sel = valid[-window:]
-    elif mode == "best":
-        sel = valid[torch.argsort(raw_y[valid])[:window]]
-    else:  # both: half lowest-energy + half most-recent, unioned
-        n_best = window // 2
-        best_sel = valid[torch.argsort(raw_y[valid])[:n_best]]
-        recent_sel = valid[-(window - n_best):]
-        sel = torch.unique(torch.cat([best_sel, recent_sel]))
-    new_mask = torch.zeros_like(mask)
-    new_mask[sel] = True
-    return new_mask
-
-
-def _fit_gradient_gp(
-    train_x: torch.Tensor,
-    train_y: torch.Tensor,
-    raw_y: torch.Tensor,
-    energy_cap: torch.Tensor,
-    observed_gradients: torch.Tensor,
-    y_std: torch.Tensor,
-    frozen_hypers: dict | None = None,
-    gradient_window: int = 0,
-    gradient_keep: str = "recent",
-) -> GradientEnhancedPeriodicGP:
-    """Build and fit the gradient-enhanced periodic GP on standardized data.
-
-    Two modes (see ``_run_optimization_loop``):
-    - ``frozen_hypers=None``: a cold fit -- optimize fresh hyperparameters with
-      ``_GP_FIT_STEPS`` marginal-likelihood Adam iterations. The caller reads
-      ``gp.state_dict()`` afterwards to carry the hyperparameters forward.
-    - ``frozen_hypers`` set: a condition-only update -- load those hyperparameters
-      and fold in the new data for one Cholesky, running NO Adam steps.
-
-    We deliberately never optimize *from* loaded hyperparameters: warm-starting the
-    fit drifts them and degrades the search, so loaded hypers are only ever used for
-    conditioning. Collapsing the two knobs into one parameter makes that the only
-    expressible behavior.
-
-    The acquisition GP fits standardized values ``y' = (-clamp(E) - mean)/std``
-    over inputs ``x' = degrees / 360``. The stored gradients are ``dE/dtheta`` in
-    eV/rad, so the chain rule for the matching gradient observation is
-
-        dy'/dx' = -(2*pi / std) * dE/dtheta           [clamp inactive]
-
-    (``x_rad = 2*pi * x'``; the maximization sign flip contributes the minus).
-    ``y_std`` is the standardization std the caller applied to the values, so the
-    gradients are scaled by exactly the same factor. Points where the energy
-    clamp is active or whose gradient is NaN (failed evaluation) are dropped from
-    the gradient observations via the mask, but still contribute their value.
-    """
-    grad = observed_gradients.to(train_x)  # (n, d), eV/rad
-    grad_scaled = -(2.0 * math.pi / y_std) * grad  # (n, d)
-
-    clamp_inactive = raw_y <= energy_cap  # (n,)
-    grad_valid = ~torch.isnan(grad).any(dim=1)  # (n,)
-    mask = clamp_inactive & grad_valid
-    # High-leverage subset: optionally keep gradients for only a window of points
-    # (caps the augmented matrix at n + window*d -- the main high-d/late cost).
-    mask = _restrict_gradient_mask(mask, raw_y, gradient_window, gradient_keep)
-    grad_scaled = torch.nan_to_num(grad_scaled, nan=0.0)
-
-    gp = GradientEnhancedPeriodicGP(
-        train_x, train_y, grad_scaled, grad_mask=mask, period=1.0
-    )
-    if frozen_hypers is None:
-        gp.fit(steps=_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
-    else:
-        # Condition-only: load the frozen hypers and re-condition (steps=0, no Adam).
-        gp.load_state_dict(frozen_hypers, strict=True)
-        gp.fit(steps=0, lr=0.05)
-    return gp
-
-
-# Size of the Sobol space-filling pool used to estimate the stopping-rule
-# certificate each step. The certificate is a smooth function of the posterior, so
-# a modest pool localizes its min/max well; observed points and the chosen
-# candidate are added on top (see _compute_certificate).
-_CERT_POOL_SIZE = 1024
-# Fixed scramble seed for the certificate's Sobol pool. Held constant so the pool
-# is identical every step and every run: that isolates the certificate's
-# step-to-step motion to the GP (and the growing observed set), instead of letting
-# fresh Sobol scrambles add sampling noise to lb/alpha_max -- and makes the offline
-# stopping-rule replay reproducible.
-_CERT_POOL_SEED = 12345
-
-
-@lru_cache(maxsize=None)
-def _cert_sobol_pool(
-    num_dims: int, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """The certificate's fixed Sobol space-filling pool over [0, 1]^num_dims.
-
-    Size and scramble seed are constants, so the pool is identical every step and
-    every run (see _CERT_POOL_SEED); caching draws it once per (dims, dtype,
-    device) instead of regenerating 1024 points on every BO step. Returned
-    read-only -- callers ``cat`` it with the step's observations, never mutate it.
-    """
-    bounds = torch.stack(
-        [
-            torch.zeros(num_dims, device=device, dtype=dtype),
-            torch.ones(num_dims, device=device, dtype=dtype),
-        ]
-    )
-    return draw_sobol_samples(
-        bounds=bounds, n=_CERT_POOL_SIZE, q=1, seed=_CERT_POOL_SEED
-    ).squeeze(1)
-
-
-def _compute_certificate(
-    gp,
-    base_acqf,
-    train_x: torch.Tensor,
-    candidate: torch.Tensor,
-    y_std: torch.Tensor,
-    neg_mean: torch.Tensor,
-    betas: tuple[float, ...],
-) -> dict:
-    """Compute the per-step GP stopping-rule certificate, in run energy units.
-
-    The acquisition GP is fit on the *negated, standardized* energy (minimize ->
-    maximize), so a standardized posterior value ``v`` maps back to relative
-    energy (eV, the ``e_e0`` convention) as ``E = -(v * y_std + neg_mean)``.
-    Returns, all in relative eV:
-
-      * ``mu_min``    -- the predicted global-minimum energy ``min_x mu_t(x)``;
-      * ``lb``        -- list of high-probability lower bounds on it, one per beta
-                         in ``betas``: ``min_x [mu_t(x) - beta * sigma_t(x)]`` (a
-                         UCB on the maximized objective mapped back to energy). The
-                         argmax shifts with beta, so the bound is logged across a
-                         grid to let the offline replay pick/calibrate beta without
-                         re-running;
-      * ``alpha_max`` -- the maximum *plain* expected improvement (energy units,
-                         not log) over the pool, the quantity the log-EI stopping
-                         rule thresholds (beta-independent).
-
-    The pool reuses the observed coordinates and the chosen candidate (so the
-    incumbent basin is always represented, which guarantees ``lb <= e_best``)
-    plus a fixed Sobol space-filling set over the normalized [0, 1]^d cube.
-    """
-    device = train_x.device
-    num_dims = train_x.shape[1]
-    y_std_s = float(y_std.reshape(-1)[0])
-    neg_mean_s = float(neg_mean.reshape(-1)[0])
-
-    # Query in the dtype the acquisition optimizer used (the candidate's): the
-    # value-only GP caches its prediction strategy from that optimize_acqf pass
-    # (typically float32), so a mismatched dtype here errors. The gradient GP casts
-    # inputs to its training dtype internally, so this is safe for both paths.
-    cand = torch.as_tensor(candidate, device=device).reshape(1, num_dims)
-    dtype = cand.dtype
-    sobol = _cert_sobol_pool(num_dims, dtype, device)
-    pool = torch.cat([sobol, train_x.to(dtype), cand], dim=0).unsqueeze(1)  # (M, 1, d)
-
-    with torch.no_grad():
-        posterior = gp.posterior(pool)
-        mu_std = posterior.mean.reshape(-1)  # maximize-space mean
-        sd_std = posterior.variance.clamp_min(0).sqrt().reshape(-1)
-        # base_acqf is the unwrapped LogExpectedImprovement (no PiBO term), so
-        # exp() recovers plain EI; scale standardized -> energy units by y_std.
-        ei_energy = torch.exp(base_acqf(pool)) * y_std_s
-
-    # min predicted energy = -(max standardized mean) mapped back.
-    mu_min = -(float(mu_std.max()) * y_std_s + neg_mean_s)
-    # min_x [E_mean - beta*E_sd] = -(neg_mean + y_std * max_x(mu_std + beta*sd_std)),
-    # one bound per beta (the argmax point differs per beta, so compute each).
-    lb = [
-        -(neg_mean_s + y_std_s * float((mu_std + beta * sd_std).max()))
-        for beta in betas
-    ]
-    alpha_max = float(ei_energy.max())
-    return {"mu_min": mu_min, "lb": lb, "alpha_max": alpha_max}
-
-
-def _select_next_points_botorch(
-    train_X: torch.Tensor,
-    train_y: torch.Tensor,
-    prior_module: DihedralPriorModule | None = None,
-    prior_exponent: float = 0.0,
-    observed_gradients: torch.Tensor | None = None,
-    use_gradients: bool = False,
-    gp_frozen_hypers: dict | None = None,
-    gp_hyper_out: dict | None = None,
-    cert_out: dict | None = None,
-    cert_betas: tuple[float, ...] = DEFAULT_CERTIFICATE_BETAS,
-    acq_num_restarts: int = ACQ_NUM_RESTARTS,
-    acq_raw_samples: int = ACQ_RAW_SAMPLES,
-    gradient_window: int = 0,
-    gradient_keep: str = "recent",
-    lengthscale_prior: str = "none",
-) -> np.ndarray:
-    """
-    Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
-
-    Parameters:
-        train_X (torch.Tensor): Observed dihedral coordinates, shape (n_observations, n_dims), in degrees.
-        train_y (torch.Tensor): Observed energies corresponding to train_X, shape (n_observations,).
-        prior_module: Optional DihedralPriorModule for PiBO
-        prior_exponent: Prior strength (0 = no prior influence)
-        observed_gradients: Optional dE/dtheta (eV/rad), shape (n_observations,
-            n_dims), index-aligned with ``train_X``; NaN rows are dropped.
-        use_gradients: If True (and gradients are provided), fit the
-            gradient-enhanced surrogate instead of the value-only GP.
-        gp_frozen_hypers: Optional state-dict of gradient-GP hyperparameters. None
-            does a cold fit (optimize fresh hyperparameters); a value loads those
-            hyperparameters and conditions only (no Adam). Ignored unless gradients
-            are used. (The value-only GP path always uses the standard fit.)
-        gp_hyper_out: If provided and gradients are used, this dict is populated
-            with ``{"hypers": <fitted state-dict>}`` for the caller to carry forward.
-        cert_out: If provided, populated in place with the stopping-rule
-            certificate ``{"mu_min", "lb", "alpha_max"}`` (relative eV) computed
-            from the just-fitted GP -- see _compute_certificate. ``lb`` is a list
-            aligned with ``cert_betas``. None skips the (small) extra work.
-        cert_betas: Confidence multipliers for the certificate lower bound ``lb``
-            (``mu - beta*sigma``); one bound is computed per beta so the offline
-            replay can calibrate beta. Only used when ``cert_out`` is provided.
-
-    Returns:
-        np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
-    """
-    # make a copy of the train_X to standardize
-    # we know these are in degrees already
-    train_x = train_X.clone() / 360.0
-
-    # Clip the energies if needed
-    raw_y = train_y  # relative energies (eV), positive = worse
-    energy_cap = 2 + torch.log10(torch.clamp(raw_y, min=1))
-
-    # Negate (minimize -> maximize) and standardize (matching botorch.standardize).
-    # Keep the std so the gradient observations can be scaled by exactly the same
-    # factor as the values -- see _fit_gradient_gp.
-    neg = (-torch.minimum(raw_y, energy_cap))[:, None]
-    y_std = neg.std(dim=0, keepdim=True)
-    y_std = torch.where(y_std >= 1e-9, y_std, torch.ones_like(y_std))
-    neg_mean = neg.mean(dim=0, keepdim=True)  # kept to invert the transform for cert_out
-    train_y = (neg - neg_mean) / y_std
-
-    # Time the GP fit/condition and the acquisition optimization separately (logged
-    # to the certificate as t_gp_fit / t_acq) so the BO overhead can be attributed.
-    _t_fit0 = time.perf_counter()
-    with _suppress_fit_warnings():
-        if use_gradients and observed_gradients is not None:
-            gp = _fit_gradient_gp(
-                train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
-                frozen_hypers=gp_frozen_hypers,
-                gradient_window=gradient_window, gradient_keep=gradient_keep,
-            )
-            # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
-            # steps), so frozen condition-only steps don't clone them needlessly.
-            if gp_hyper_out is not None:
-                gp_hyper_out["hypers"] = {
-                    k: v.detach().clone() for k, v in gp.state_dict().items()
-                }
-        else:
-            # TODO: make the GP only once and reuse via updates
-            gp = _fit_value_gp(
-                train_x,
-                train_y,
-                covar_module=_periodic_covar_module(
-                    train_x.shape[1], lengthscale_prior=lengthscale_prior
-                ),
-            )
-        t_gp_fit = time.perf_counter() - _t_fit0
-
-        _t_acq0 = time.perf_counter()
-        # LogExpectedImprovement has been the best-performing botorch acquisition here.
-        base_acqf = LogExpectedImprovement(gp, best_f=torch.max(train_y), maximize=True)
-
-        # Wrap with PiBO if prior is provided and exponent > 0
-        if prior_module is not None and prior_exponent > 0:
-            # botorch optimizes over normalized [0, 1] bounds (see below), so the
-            # prior must interpret its inputs the same way. A module built directly
-            # with the DihedralPriorModule default (input_in_degrees=True) would
-            # silently mis-scale; require the normalized convention from
-            # create_prior_module instead of failing quietly.
-            if getattr(prior_module, "input_in_degrees", False):
-                raise ValueError(
-                    "prior_module expects inputs in degrees, but the acquisition "
-                    "optimizer operates in normalized [0, 1] space. Build the "
-                    "module with create_prior_module (or input_in_degrees=False)."
-                )
-            # base_acqf is LogExpectedImprovement (log-scale) and prior_module emits a
-            # log probability, so log=True makes botorch combine them additively
-            # (logEI + exponent * log_prior) -- the correct PiBO form. Without log=True
-            # botorch would multiply logEI by prior**exponent, inverting the prior.
-            acqf = PriorGuidedAcquisitionFunction(
-                acq_function=base_acqf,
-                prior_module=prior_module,
-                log=True,
-                prior_exponent=prior_exponent,
-            )
-        else:
-            acqf = base_acqf
-
-        # bounds are [0, 1] for each dihedral since we standardized above
-        bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
-        bounds[1, :] = 1.0
-        candidate, _ = optimize_acqf(
-            acqf,
-            bounds=bounds,
-            q=1,  # q = 1: no batching
-            num_restarts=acq_num_restarts,
-            raw_samples=acq_raw_samples,
-        )
-        t_acq = time.perf_counter() - _t_acq0
-
-    # Stopping-rule certificate: evaluate the just-fitted GP (and the unwrapped
-    # log-EI) over a candidate pool while it's still in hand -- re-deriving these
-    # offline would cost as much as re-running. Uses base_acqf (pure EI, no PiBO
-    # term) so the log-EI rule sees the unbiased acquisition.
-    if cert_out is not None:
-        cert_out["t_gp_fit"] = t_gp_fit  # GP construction + fit/condition
-        cert_out["t_acq"] = t_acq        # acquisition build + optimize_acqf
-        cert_out.update(
-            _compute_certificate(
-                gp, base_acqf, train_x, candidate, y_std, neg_mean, cert_betas
-            )
-        )
-
-    # make sure to convert the candidate back to degrees (.cpu() so a CUDA run
-    # can hand the array back to numpy).
-    return candidate.detach().cpu().numpy()[0, :] * 360.0
+        # Phase 3 category-tied move. Its RNG is a distinct offset stream (move coin
+        # + prior-seeded warmup draws). category_groups is the SMARTS partition built
+        # by the caller; only stored when the move is actually enabled.
+        self.category_prob = category_prob
+        self.category_warmup = opts.category_warmup
+        self.category_min_moves = opts.category_min_moves
+        if category_prob > 0:
+            self.category_groups = category_groups
+            self.category_rng = np.random.default_rng(seed + 88883)
 
 
 def _setup_initial_state(
@@ -1112,235 +718,6 @@ def _log_improvement_geometry(
     append_xyz_frame(state.geom_log_path, atoms, comment)
 
 
-# Phase 2.5 low-mode move relaxation budgets. The constrained pre-relax removes the
-# worst clashes at the kicked dihedrals; the UNCONSTRAINED relax then lets every DOF
-# (dihedrals included) slide to the nearest local minimum -- the step that bends a
-# straight kick onto the curved fold valley (the straight-line dihedral path is
-# clash-barrier-blocked; see the Phase 2.4 diagnostics in bouquet_hdbo_plan.md).
-_LOWMODE_CONSTRAINED_STEPS = 20
-# Unconstrained relax budget for a collective (low-mode / category) move.
-_LOWMODE_FREE_STEPS = 100
-
-
-def _collective_kick_relax(
-    target_deg: np.ndarray,
-    anchor: Atoms,
-    dihedrals: list[DihedralInfo],
-    calc: Calculator,
-    relaxCalc: Calculator,
-) -> tuple[float, Atoms]:
-    """Shared collective-move evaluation: set the proposed dihedrals and short CONSTRAINED
-    relax (clash cleanup), then release the constraint and relax UNCONSTRAINED to a local
-    minimum -- so the geometry can slide along the curved fold valley a standard, dihedral-
-    pinned BO step cannot cross. Used by both the low-mode kick and the category broadcast.
-    Returns (energy [eV], relaxed atoms)."""
-    _, atoms = evaluate_energy(
-        target_deg, anchor, dihedrals, calc, relaxCalc,
-        relax=True, steps=_LOWMODE_CONSTRAINED_STEPS,
-    )
-    atoms.set_constraint()
-    return relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
-
-
-def _collective_result(
-    state: OptimizationState,
-    atoms: Atoms,
-    energy: float,
-    dihedrals: list[DihedralInfo],
-) -> tuple[np.ndarray, Atoms, float] | None:
-    """Finish a collective move: reject it (return None) if the UNCONSTRAINED relax changed
-    connectivity under --retain-bonds, else return (relaxed dihedrals [deg], atoms, energy)."""
-    if (
-        state.required_bonds is not None
-        and energy < RELAX_FAILURE_ENERGY_EV
-        and bonds_broken(atoms, state.required_bonds)
-    ):
-        state.n_bond_breaks += 1
-        return None
-    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
-    return new_coords, atoms, energy
-
-
-def _low_mode_move(
-    state: OptimizationState,
-    dihedrals: list[DihedralInfo],
-    calc: Calculator,
-    relaxCalc: Calculator,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, Atoms, float] | None:
-    """One low-mode / basin-hopping move: kick the incumbent along a soft (position-PCA)
-    direction, then relax UNCONSTRAINED, returning (relaxed dihedrals [deg], relaxed
-    atoms, energy [eV]).
-
-    Unlike a standard BO step -- which relaxes only the non-dihedral DOF with the
-    dihedrals pinned -- the unconstrained relaxation lets the dihedrals move, so the
-    geometry can slide along the curved fold valley instead of stalling on the
-    straight-line clash ridge (Kolossvary-Guida low-mode search). Returns ``None`` to
-    fall back to a standard step (too few elite points, or a move that broke bonds)."""
-    from bouquet.subspace import LowEnergySubspace
-
-    coords = state.observed_coords.detach().cpu().numpy()
-    energies = state.observed_energies.detach().cpu().numpy()
-    # Clamp to the torsion count: the PCA basis has at most `d` columns, so a larger
-    # k would let the `rng.integers(k)` mode pick index past the available columns.
-    k = min(state.lowmode_modes, coords.shape[1])
-    ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
-    ss.update(coords, energies)
-    if ss.n_elite < k + 1:
-        return None
-
-    # Anchor = the incumbent's actual 3D structure (lowest-energy observation).
-    best_idx = int(state.observed_energies.argmin().item())
-    anchor = state.observed_atoms[best_idx]
-
-    # Kick direction: a random one of the k soft modes (random sign), amplitude
-    # ~ lowmode_kick_deg RMS/dih.
-    #  "pca" -- top-k position-PCA of the low-energy set (the default and benchmark
-    #           winner: adaptive directions that re-aim as relaxation walks the incumbent).
-    #  "enm" -- softest elastic-network modes projected into torsion space (bouquet.enm);
-    #           DORMANT: data-independent, lost to PCA in the Phase-C benchmark.
-    V = None
-    if state.lowmode_kick_dir == "enm":
-        from bouquet.enm import enm_dihedral_modes
-        chains = [tuple(di.chain) for di in dihedrals]
-        V = enm_dihedral_modes(anchor.get_positions(), chains, k)
-        if V.shape[1] == 0:                      # no usable ENM mode
-            V = None
-    if V is None:                                # PCA (default, or ENM fallback)
-        _, V = ss.pca_basis(k)                   # (d, k) tangent (radian) directions
-    direction = V[:, rng.integers(V.shape[1])]
-    direction = direction / np.linalg.norm(direction)
-    if rng.random() < 0.5:
-        direction = -direction
-    # incumbent + amp*direction, wrapped to torsion degrees (reuse LowEnergySubspace.line).
-    amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
-    target_deg = ss.line(direction, np.array([amp]))[0]
-
-    energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
-    return _collective_result(state, atoms, energy, dihedrals)
-
-
-def _build_category_groups(
-    category_assignments: dict | None, n_dihedrals: int
-) -> list[list[int]]:
-    """Partition dihedral indices into tied categories for the category move.
-
-    Two dihedrals share a group iff the SMARTS matcher assigned them the same
-    *specific* torsion-library category (an integer type id) -- i.e. they are the same
-    chemical rotor (e.g. the k-th dihedral of every monomer in a foldamer). The generic
-    builtin fallbacks (``sp3_sp3``/``sp3_sp2``, string type ids), unassigned dihedrals,
-    and bivariate-pair dihedrals are NOT a shared rotor, so each becomes its own singleton
-    group -- matching the ``max_spec`` in scripts/cat_suitability.py and the
-    ``CAT_MAXSPEC_THRESHOLD`` auto-enable calibration. A homopolymer foldamer thus collapses
-    to a handful of groups (the repeat unit); a molecule with no specific repeats stays at
-    one group per dihedral (the move degenerates to ordinary REMBO). Returns the groups as
-    sorted lists of indices, ordered by first member.
-
-    ``category_assignments`` is the ``{dihedral_index: type_id}`` map from
-    :func:`bouquet.priors.assign_categories` (torlib SMARTS ids) -- independent of the
-    fitted priors, so categories are available with PiBO steering off.
-    """
-    key_to_members: dict = {}
-    assignments = category_assignments or {}
-    for d in range(n_dihedrals):
-        t = assignments.get(d)
-        # Only an integer (fitted-library) id is a real shared rotor; generic string ids
-        # and unassigned/bivariate dihedrals get their own singleton group.
-        key = ("cat", t) if isinstance(t, int) else ("solo", d)
-        key_to_members.setdefault(key, []).append(d)
-    groups = sorted(key_to_members.values(), key=lambda m: m[0])
-    return groups
-
-
-def _sample_category_z_from_prior(
-    state: OptimizationState, rng: np.random.Generator
-) -> np.ndarray:
-    """Draw one reduced-space point (one value per category group, degrees) from the
-    prior, for warming up the reduced-space GP. Each group's value is sampled from a
-    mode of that category's fitted 1D von Mises mixture (weighted by mixture weight,
-    with a small angular jitter); a uniform (no-preference) category draws uniformly.
-    """
-    groups = state.category_groups or []
-    pm = state.prior_module
-    uni_dists = getattr(pm, "univariate_dists", {}) if pm is not None else {}
-    z = np.empty(len(groups), dtype=float)
-    for gi, members in enumerate(groups):
-        dist = uni_dists.get(members[0])
-        if dist is None:
-            z[gi] = rng.uniform(0.0, 360.0)
-            continue
-        locs = dist.component_distribution.loc.detach().cpu().numpy()      # radians
-        probs = dist.mixture_distribution.probs.detach().cpu().numpy()
-        probs = probs / probs.sum()
-        k = int(rng.choice(len(locs), p=probs))
-        z[gi] = (math.degrees(float(locs[k])) + rng.normal(0.0, 15.0)) % 360.0
-    return z
-
-
-def _category_move(
-    state: OptimizationState,
-    dihedrals: list[DihedralInfo],
-    calc: Calculator,
-    relaxCalc: Calculator,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, Atoms, float] | None:
-    """One category-tied collective move: choose a per-category value vector (from the
-    prior while the reduced buffer is small, else by reduced-space LogEI), set every
-    dihedral in a category to its category's value on top of the incumbent, then
-    constrained + UNCONSTRAINED relax -- returning (relaxed dihedrals [deg], relaxed
-    atoms, energy [eV]).
-
-    This is the chemistry-defined counterpart of :func:`_low_mode_move`: instead of
-    kicking along a data-derived PCA direction, it moves along the fixed block-constant
-    embedding implied by the SMARTS categories, so a correlated fold is one reduced-space
-    point and is reachable from the very first move. The reduced point is recorded in
-    ``state._cat_Z/_cat_Y`` (the low-D BO buffer) before the connectivity check, so even a
-    rejected move informs the reduced GP. Returns ``None`` to fall back to a standard step
-    (no groups, or a move that broke bonds under --retain-bonds).
-
-    NOTE (prototype): the reduced coordinates use period 360 for every category. Aromatic
-    categories are physically 180-periodic (theta == theta+180), so their search domain is
-    2x larger than necessary -- correct, just not maximally efficient. Per-category period
-    is the obvious next refinement.
-    """
-    groups = state.category_groups
-    if not groups:
-        return None
-
-    best_idx = int(state.observed_energies.argmin().item())
-    anchor = state.observed_atoms[best_idx]
-    incumbent_deg = state.observed_coords[best_idx].detach().cpu().numpy()
-
-    # Reduced-space point z (one value per category), in degrees. Below the warmup the
-    # prior seeds it; after that the reduced-space GP picks it -- the same value-only
-    # periodic-GP + LogEI selector the outer loop uses, just over the n_group-dim buffer.
-    if len(state._cat_Z) < state.category_min_moves:
-        z = _sample_category_z_from_prior(state, rng)
-    else:
-        z = _select_next_points_botorch(
-            torch.tensor(np.asarray(state._cat_Z), dtype=torch.float64, device=state.device),
-            torch.tensor(np.asarray(state._cat_Y), dtype=torch.float64, device=state.device),
-            acq_num_restarts=state.acq_num_restarts,
-            acq_raw_samples=state.acq_raw_samples,
-        )
-
-    # Broadcast: every dihedral takes its group's value (singletons get their own
-    # coordinate). The groups partition all indices, so the incumbent copy is just a
-    # defensive base -- every entry is overwritten.
-    target_deg = incumbent_deg.copy()
-    for gi, members in enumerate(groups):
-        target_deg[members] = z[gi] % 360.0
-
-    energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
-
-    # Record the reduced-space observation (energy relative to the run's start) for the
-    # low-D BO, before the connectivity check so a rejected z still teaches the GP.
-    state._cat_Z.append([float(v) for v in z])
-    state._cat_Y.append(float(energy - state.start_energy))
-
-    return _collective_result(state, atoms, energy, dihedrals)
-
-
 def _run_optimization_loop(
     state: OptimizationState,
     n_steps: int,
@@ -1670,403 +1047,6 @@ def _perform_final_relaxation(
     return best_atoms, best_energy - state.start_energy
 
 
-def _build_selection_gp(
-    train_X_deg: torch.Tensor, train_y_eV: torch.Tensor
-) -> SingleTaskGP:
-    """Fit a GP for ensemble selection.
-
-    Reuses the acquisition GP's kernel and [0, 1] input normalization, but fits
-    energies in their natural (minimization) sense with a ``Standardize`` outcome
-    transform, so the posterior is returned directly in eV (relative energies).
-    """
-    train_x = train_X_deg.clone() / 360.0
-    train_y = train_y_eV.clone().unsqueeze(-1)  # (n, 1), eV, lower = better
-    return _fit_value_gp(
-        train_x,
-        train_y,
-        covar_module=_periodic_covar_module(train_x.shape[1]),
-        outcome_transform=Standardize(m=1),
-    )
-
-
-def _select_ensemble_candidates(
-    state: OptimizationState,
-    window_eV: float,
-    p_threshold: float,
-    sigma_floor_eV: float,
-    failure_energy_eV: float,
-) -> list[tuple[np.ndarray, Atoms]]:
-    """Select observed conformers to tightly optimize, ordered by predicted energy.
-
-    A conformer ``i`` is included iff its GP posterior gives
-    ``P(E_i <= E_min + window) >= p_threshold``. The posterior sigma supplies a
-    per-candidate, data-driven buffer: tight where the surface is well sampled,
-    wide where it is sparse. No candidate cap is applied.
-    """
-    assert len(state.observed_atoms) == state.observed_energies.shape[0], (
-        "observed_atoms is misaligned with observed_energies"
-    )
-
-    energies = state.observed_energies
-    coords = state.observed_coords
-
-    # Drop failed evaluations BEFORE fitting (the ~1000 eV sentinel wrecks the GP).
-    valid = energies < failure_energy_eV
-    idx = torch.nonzero(valid, as_tuple=False).flatten()
-    if idx.numel() == 0:
-        logger.warning("No valid observations for ensemble selection.")
-        return []
-    e = energies[idx]
-    x = coords[idx]
-
-    # Fit selection GP and evaluate the posterior at the observed coordinates.
-    if idx.numel() < 3:
-        # Too few points for a meaningful posterior: fall back to a flat window.
-        mu, sigma = e, torch.full_like(e, sigma_floor_eV)
-    else:
-        with _suppress_fit_warnings():
-            gp = _build_selection_gp(x, e)
-            gp.eval()
-            with torch.no_grad():
-                post = gp.posterior(x / 360.0)
-        mu = post.mean.flatten()
-        sigma = post.variance.clamp_min(0.0).sqrt().flatten()
-    sigma = sigma.clamp_min(sigma_floor_eV)
-
-    # Probabilistic inclusion: P(E_i <= E_min + window) >= p_threshold.
-    e_min = e.min()
-    z = (e_min + window_eV - mu) / sigma
-    keep = torch.special.ndtr(z) >= p_threshold  # standard-normal CDF
-
-    # Map survivors back to global indices, ordered by predicted energy
-    # (no cap on the number kept).
-    sel_global = idx[keep][torch.argsort(mu[keep])]
-
-    logger.info(
-        f"Ensemble selection: {sel_global.numel()} candidates "
-        f"(from {idx.numel()} valid observations)."
-    )
-    return [
-        (coords[i].cpu().numpy(), state.observed_atoms[i])
-        for i in sel_global.tolist()
-    ]
-
-
-def _perform_ensemble_relaxation(
-    state: OptimizationState,
-    dihedrals: list[DihedralInfo],
-    calc: Calculator,
-    relaxCalc: Calculator,
-) -> list[tuple[Atoms, float, float]]:
-    """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
-
-    Returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy ascending,
-    where ``relative_energy_eV`` is measured against the run's start energy.
-    """
-    window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
-    sigma_floor_eV = ENSEMBLE_SIGMA_FLOOR_KCAL * KCAL_TO_EV
-    e_tol_eV = ENSEMBLE_ENERGY_TOL_KCAL * KCAL_TO_EV
-
-    candidates = _select_ensemble_candidates(
-        state,
-        window_eV=window_eV,
-        p_threshold=ENSEMBLE_P_THRESHOLD,
-        sigma_floor_eV=sigma_floor_eV,
-        failure_energy_eV=FAILURE_ENERGY_EV,
-    )
-
-    # Tight, UNCONSTRAINED optimization of each candidate (no step limit).
-    optimized: list[tuple[Atoms, float]] = []
-    for k, (coords, atoms) in enumerate(candidates):
-        a = atoms.copy()
-        a.set_constraint()  # remove any dihedral constraints
-        energy, a = relax_structure(a, calc, relaxCalc, steps=None)
-        rel = energy - state.start_energy
-        if rel >= FAILURE_ENERGY_EV:  # relative cutoff, as in candidate selection
-            continue
-        optimized.append((a, rel))
-        if state.add_entry is not None:
-            state.add_entry(
-                np.array([d.get_angle(a) for d in dihedrals]), a, energy
-            )
-        logger.info(f"Tight opt {k+1}/{len(candidates)}: E-E0 = {rel:12.6f} eV")
-
-    if not optimized:
-        return []
-
-    # Post-optimization dedup: pre-opt duplicates can split, distinct points merge.
-    optimized.sort(key=lambda t: t[1])
-    unique = _dedup(optimized, rmsd_thr=ENSEMBLE_RMSD_THRESHOLD, e_tol_eV=e_tol_eV)
-
-    # Final reporting cut + Boltzmann populations on the deduped set.
-    e_min = min(e for _, e in unique)
-    unique = [(a, e) for a, e in unique if (e - e_min) <= window_eV]
-    energies = np.array([e for _, e in unique])
-    weights = _boltzmann_weights(energies, ENSEMBLE_TEMPERATURE)
-
-    logger.info(
-        f"Final ensemble: {len(unique)} unique conformer(s) within "
-        f"{ENSEMBLE_WINDOW_KCAL} kcal/mol."
-    )
-    return [(a, e, float(w)) for (a, e), w in zip(unique, weights)]
-
-
-# ---------------------------------------------------------------------------
-# Active level-set exploration (ensemble mode)
-#
-# The passive harvest above can only report basins the minimum-seeking search
-# happened to visit. This phase runs AFTER the main loop: it fits the same
-# selection GP (energies in eV, minimization sense) and drives a level-set
-# acquisition -- P(E(x) <= E_min + delta) * sigma(x) -- to push the boundary of
-# the low-energy manifold outward and discover NEW basins. Each proposal is
-# evaluated with the same constrained relaxation as a normal BO step and
-# appended to ``state``; the passive harvest then finalizes the enriched set for
-# free (selection -> tight opt -> dedup -> Boltzmann).
-# ---------------------------------------------------------------------------
-
-
-def _valid_observation_idx(state: OptimizationState) -> torch.Tensor:
-    """Indices of observations that are not failure sentinels (rel E below the
-    ~1000 eV cutoff), which would otherwise wreck a GP fit or basin seeding."""
-    return torch.nonzero(
-        state.observed_energies < FAILURE_ENERGY_EV, as_tuple=False
-    ).flatten()
-
-
-def _fit_selection_gp_valid(
-    state: OptimizationState,
-) -> tuple[SingleTaskGP | None, float | None]:
-    """Fit the selection GP on valid (non-failed) observations.
-
-    Returns ``(gp, e_min_eV)`` or ``(None, None)`` when fewer than three valid
-    observations exist (too few for a meaningful posterior). Failure sentinels
-    are dropped exactly as in ``_select_ensemble_candidates``.
-    """
-    idx = _valid_observation_idx(state)
-    if idx.numel() < 3:
-        return None, None
-    e = state.observed_energies[idx]
-    with _suppress_fit_warnings():
-        gp = _build_selection_gp(state.observed_coords[idx], e)
-    gp.eval()
-    return gp, float(e.min())
-
-
-def _max_posterior_sigma(
-    gp: SingleTaskGP, num_dims: int, dtype: torch.dtype, device: torch.device
-) -> float:
-    """Max posterior sigma (eV) of the selection GP over the fixed Sobol pool.
-
-    Reuses the certificate's space-filling pool. The selection GP carries a
-    ``Standardize`` outcome transform, so the posterior variance is already in
-    natural (eV^2) units. Queried in ``dtype`` -- the dtype ``optimize_acqf`` used
-    -- so the GP's cached prediction strategy is not re-triggered at a mismatch.
-    """
-    pool = _cert_sobol_pool(num_dims, dtype, device).unsqueeze(1)  # (M, 1, d)
-    with torch.no_grad():
-        sd = gp.posterior(pool).variance.clamp_min(0).sqrt()
-    return float(sd.max())
-
-
-def _initial_basins(
-    state: OptimizationState, delta_eV: float, basin_deg: float
-) -> torch.Tensor:
-    """Seed known-basin torsion vectors from low-energy observations.
-
-    Takes the valid observations within ``delta`` of the best, orders them by
-    energy, and greedily keeps those at least ``basin_deg`` (wrapped RMS angular
-    distance) from an already-kept seed. Returns shape ``(m, d)`` in the coords'
-    dtype/device (``m`` may be 0).
-    """
-    coords = state.observed_coords
-    d = coords.shape[1]
-    idx = _valid_observation_idx(state)
-    if idx.numel() == 0:
-        return coords.new_zeros((0, d))
-    e = state.observed_energies[idx]
-    within = e <= (e.min() + delta_eV)
-    xw = coords[idx][within]
-    order = torch.argsort(e[within])
-    # Greedy dedup into a preallocated buffer (at most one seed per in-window
-    # observation), filling the first ``m`` rows -- avoids re-stacking the whole
-    # growing seed list on every iteration.
-    seeds = xw.new_zeros((xw.shape[0], d))
-    m = 0
-    for i in order.tolist():
-        c = xw[i]
-        if m == 0 or float(_periodic_min_dist(c, seeds[:m])) >= basin_deg:
-            seeds[m] = c
-            m += 1
-    return seeds[:m]
-
-
-def _select_exploration_point(
-    state: OptimizationState,
-    mode: str,
-    offset_eV: float,
-    kappa: float,
-    minima_deg: torch.Tensor,
-    diversity_lambda: float,
-    opts: RunOptions,
-) -> tuple[np.ndarray | None, SingleTaskGP | None]:
-    """Propose one exploration point by optimizing the exploration acquisition.
-
-    ``mode`` selects the acquisition: ``"levelset"`` (``P_in * sigma`` with
-    threshold ``E_min + offset``) or ``"boundary"`` (``-|mu - (E_min + offset)| +
-    kappa*sigma``). Returns ``(coords_deg, gp)`` -- the proposed torsion vector
-    (degrees) and the fitted selection GP (so the caller can read its posterior
-    sigma for the stop rule) -- or ``(None, None)`` when there are too few valid
-    points to fit.
-    """
-    gp, e_min = _fit_selection_gp_valid(state)
-    if gp is None:
-        return None, None
-    d = state.observed_coords.shape[1]
-    tx = state.observed_coords
-    if mode == "boundary":
-        acqf = _BoundaryAcquisition(
-            gp, e_min + offset_eV, kappa,
-            minima_deg=minima_deg, diversity_lambda=diversity_lambda,
-        )
-    else:
-        acqf = _LevelSetAcquisition(
-            gp, e_min + offset_eV,
-            minima_deg=minima_deg, diversity_lambda=diversity_lambda,
-        )
-    bounds = torch.zeros(2, d, dtype=tx.dtype, device=tx.device)
-    bounds[1, :] = 1.0
-    with _suppress_fit_warnings():
-        candidate, _ = optimize_acqf(
-            acqf,
-            bounds=bounds,
-            q=1,
-            num_restarts=opts.acq_num_restarts,
-            raw_samples=opts.acq_raw_samples,
-        )
-    coords_deg = candidate.detach().cpu().numpy()[0, :] * 360.0
-    return coords_deg, gp
-
-
-def _perform_ensemble_exploration(
-    state: OptimizationState,
-    dihedrals: list[DihedralInfo],
-    calc: Calculator,
-    relaxCalc: Calculator,
-    relax: bool,
-    opts: RunOptions,
-) -> None:
-    """Active exploration; enriches ``state`` in place with new basins.
-
-    Runs a hard budget of q=1 steps (auto-scaled by rotor count) following the
-    ``opts.ensemble_explore_mode`` schedule (see :func:`_exploration_plan`). Pure
-    ``levelset`` stops early once the search saturates -- no new basin for
-    ``ENSEMBLE_SATURATION_ITERS`` steps AND the posterior sigma has collapsed below
-    ``ENSEMBLE_SIGMA_STOP_KCAL``; ``boundary``/``hybrid`` run the full budget so the
-    annealed target marches through every energy shell. New observations are
-    appended exactly like the main loop, so the passive harvest picks them up.
-    """
-    n_dihedrals = state.observed_coords.shape[1]
-    budget = _resolve_ensemble_budget(opts.ensemble_steps, n_dihedrals)
-    if budget <= 0:
-        return
-
-    mode = opts.ensemble_explore_mode
-    delta_eV = ENSEMBLE_EXPLORE_KCAL * KCAL_TO_EV
-    sigma_stop_eV = ENSEMBLE_SIGMA_STOP_KCAL * KCAL_TO_EV
-    dtype = state.observed_coords.dtype
-    device = state.observed_coords.device
-
-    minima_deg = _initial_basins(state, delta_eV, ENSEMBLE_BASIN_DEG)
-    state.reserve(budget)  # loop appends at most one observation per step
-
-    plan = _exploration_plan(mode, budget, delta_eV)
-    # Only pure level-set exploration may stop early; boundary/hybrid run the full
-    # budget so the annealed target marches through every energy shell.
-    allow_early_stop = mode == "levelset"
-    if mode == "levelset":
-        logger.info(
-            f"Ensemble exploration: up to {budget} level-set step(s), "
-            f"delta = {ENSEMBLE_EXPLORE_KCAL} kcal/mol, "
-            f"{minima_deg.shape[0]} seed basin(s)."
-        )
-    else:
-        n_ls = sum(m == "levelset" for m, _, _ in plan)
-        pre = f"{n_ls} level-set + " if n_ls else ""
-        logger.info(
-            f"Ensemble exploration ({mode}): up to {budget} step(s) "
-            f"({pre}boundary target annealed {ENSEMBLE_BOUNDARY_LO_KCAL}->"
-            f"{ENSEMBLE_BOUNDARY_HI_KCAL} kcal/mol, kappa={ENSEMBLE_BOUNDARY_KAPPA}), "
-            f"{minima_deg.shape[0]} seed basin(s)."
-        )
-
-    no_new = 0
-    for step, (step_mode, offset_eV, kappa) in enumerate(plan):
-        coords_deg, gp = _select_exploration_point(
-            state, step_mode, offset_eV, kappa, minima_deg,
-            opts.ensemble_diversity, opts,
-        )
-        if coords_deg is None:
-            logger.info(
-                "Ensemble exploration: too few valid observations to fit the "
-                "selection GP; stopping."
-            )
-            break
-
-        energy, atoms, gradient = _evaluate_point(
-            state, coords_deg, dihedrals, calc, relaxCalc, relax
-        )
-        rel = energy - state.start_energy
-        if state.add_entry is not None:
-            state.add_entry(coords_deg, atoms, energy)
-        state.append_observation(coords_deg, rel, atoms, gradient)
-
-        # New-basin bookkeeping: only in-window, non-failed points can seed a
-        # basin, and only if far enough (in wrapped torsion space) from every
-        # known basin -- a coarse in-search analog of the final RMSD dedup.
-        e_min = state.observed_energies.min().item()
-        is_new = False
-        if rel < FAILURE_ENERGY_EV and rel <= e_min + delta_eV:
-            c = torch.as_tensor(coords_deg, dtype=dtype, device=device)
-            if minima_deg.shape[0] == 0 or (
-                float(_periodic_min_dist(c, minima_deg)) >= ENSEMBLE_BASIN_DEG
-            ):
-                minima_deg = torch.cat([minima_deg, c.unsqueeze(0)], dim=0)
-                is_new = True
-        no_new = 0 if is_new else no_new + 1
-
-        # The Sobol-pool sigma only gates the (level-set-only) early stop, so skip
-        # its 1024-point posterior solve entirely when it can't fire.
-        max_sigma = (
-            _max_posterior_sigma(gp, n_dihedrals, dtype, device)
-            if allow_early_stop else None
-        )
-        tgt = f"tgt = {offset_eV / KCAL_TO_EV:4.1f}  " if step_mode == "boundary" else ""
-        sig = (
-            f"  max_sigma = {max_sigma / KCAL_TO_EV:6.2f} kcal/mol"
-            if max_sigma is not None else ""
-        )
-        logger.info(
-            f"Explore {step+1: >3}/{budget}: {tgt}E-E0 = {rel:12.6f} eV  "
-            f"{'NEW basin ' if is_new else 'known     '}"
-            f"basins = {minima_deg.shape[0]: >3}{sig}"
-        )
-
-        if (
-            allow_early_stop
-            and no_new >= ENSEMBLE_SATURATION_ITERS
-            and max_sigma < sigma_stop_eV
-        ):
-            logger.info(
-                f"Ensemble exploration converged after {step+1} step(s) "
-                f"(no new basin for {no_new} step(s) and sigma collapsed)."
-            )
-            break
-
-    logger.info(
-        f"Ensemble exploration complete: {minima_deg.shape[0]} candidate basin(s)."
-    )
-
-
 def run_optimization(
     atoms: Atoms,
     dihedrals: list[DihedralInfo],
@@ -2130,11 +1110,6 @@ def run_optimization(
     # RunOptions.__post_init__ has already validated the gradient-windowing knobs.
     opts = opts if opts is not None else RunOptions()
 
-    # High-d auto defaults: unless explicitly overridden, turn on the dimensionality-
-    # scaled lengthscale prior and low-mode search once the dihedral count crosses the
-    # high-d threshold -- both help there (see the HDBO benchmarks) and are off at low d.
-    # An explicit prior name, or a concrete lowmode_prob, always wins over "auto"/None.
-    # Resolve into locals (the "auto"/None sentinels become concrete values used below).
     n_dihedrals = len(dihedrals)
 
     # No-rotor short-circuit: with zero dihedrals the BO machinery has nothing to
@@ -2177,34 +1152,21 @@ def run_optimization(
             return best_atoms, [(best_atoms, 0.0, 1.0)]
         return best_atoms
 
-    lengthscale_prior = opts.lengthscale_prior
-    if lengthscale_prior == "auto":
-        lengthscale_prior = (
-            "dim_scaled" if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else "none"
-        )
-    lowmode_prob = opts.lowmode_prob
-    if lowmode_prob is None:
-        lowmode_prob = 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
-
-    # Category-tied move auto default. Like low-mode it turns on at high d, but ALSO gated
-    # on repeat structure: the benchmark shows the win requires a real tie to exploit
-    # (max_spec = the largest tied SMARTS category), and that on large-but-irregular
-    # molecules (high d, low max_spec) the tie mildly HURTS -- so raw d is not enough.
-    # Categories come from torlib SMARTS (category_assignments), independent of the fitted
-    # priors; legacy callers that pass only a prior_module still work via its assignments.
-    # Build the groups once here and reuse them below. Explicit category_prob wins over auto.
+    # Resolve the "auto"/None search knobs now that the dihedral count is known
+    # (the detailed high-d rules live on the RunOptions.resolve_* methods). The
+    # category move also needs the SMARTS-category partition, built once here and
+    # reused for both its auto-enable decision and the move itself. Categories come
+    # from torlib SMARTS (category_assignments), independent of the fitted priors;
+    # legacy callers that pass only a prior_module still work via its assignments.
+    lengthscale_prior = opts.resolve_lengthscale_prior(n_dihedrals)
+    lowmode_prob = opts.resolve_lowmode_prob(n_dihedrals)
     if category_assignments is None and prior_module is not None:
         category_assignments = getattr(prior_module, "univariate_assignments", None)
     category_groups = (
         _build_category_groups(category_assignments, n_dihedrals)
         if category_assignments is not None else None
     )
-    category_prob = opts.category_prob
-    if category_prob is None:
-        max_spec = max((len(g) for g in category_groups), default=0) if category_groups else 0
-        category_prob = 0.5 if (
-            n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD
-        ) else 0.0
+    category_prob = opts.resolve_category_prob(n_dihedrals, category_groups)
 
     # A low-mode move is a kick followed by a constrained + UNCONSTRAINED relaxation
     # (see _low_mode_move); it is meaningless without relaxation and would silently
@@ -2242,36 +1204,17 @@ def run_optimization(
     state = _setup_initial_state(
         atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=opts.use_gradients
     )
-    state.gradient_steps = opts.gradient_steps
-    state.grad_refit_dense_until = opts.grad_refit_dense_until
-    state.grad_refit_every = opts.grad_refit_every
-    state.acq_num_restarts = opts.acq_num_restarts
-    state.acq_raw_samples = opts.acq_raw_samples
-    state.gradient_window = opts.gradient_window
-    state.gradient_keep = opts.gradient_keep
-    state.lengthscale_prior = lengthscale_prior
-    state.lowmode_prob = lowmode_prob
-    state.lowmode_warmup = opts.lowmode_warmup
-    state.lowmode_kick_deg = opts.lowmode_kick_deg
-    state.lowmode_modes = opts.lowmode_modes
-    state.lowmode_kick_dir = opts.lowmode_kick_dir
-    # Dedicated RNG for the low-mode-move coin/direction, offset from the global seed so
-    # it doesn't co-vary with the torch/numpy streams but stays reproducible (paired
-    # comparisons across arms at a fixed seed).
-    if lowmode_prob > 0:
-        state.lowmode_rng = np.random.default_rng(seed + 99991)
-
-    # Category-tied move setup: partition the dihedrals into SMARTS categories once, and
-    # give the move its own reproducible RNG (offset from the seed, distinct from the
-    # low-mode stream) for the move coin and prior-seeded warmup draws.
-    state.category_prob = category_prob
-    state.category_warmup = opts.category_warmup
-    state.category_min_moves = opts.category_min_moves
+    # Wire the resolved search/surrogate/move knobs onto the state and seed the
+    # collective-move RNGs (see OptimizationState.apply_run_options).
+    state.apply_run_options(
+        opts,
+        lengthscale_prior=lengthscale_prior,
+        lowmode_prob=lowmode_prob,
+        category_prob=category_prob,
+        category_groups=category_groups,
+        seed=seed,
+    )
     if category_prob > 0:
-        # Reuse the partition built for the auto-default decision above (category_assignments
-        # is non-empty here: category_prob > 0 was validated to require it).
-        state.category_groups = category_groups
-        state.category_rng = np.random.default_rng(seed + 88883)
         logger.info(
             f"Phase 3 category move enabled: {len(state.category_groups)} categor(y/ies) "
             f"for {len(dihedrals)} dihedrals (embedding dim "
