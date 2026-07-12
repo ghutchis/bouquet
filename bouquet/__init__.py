@@ -15,6 +15,7 @@ __lazy_modules__ = [
     "bouquet.assess",
     "bouquet.calculator",
     "bouquet.config",
+    "bouquet.ensemble",
     "bouquet.gradients",
     "bouquet.io",
     "bouquet.priors",
@@ -25,7 +26,17 @@ __lazy_modules__ = [
 _SUBMODULES = frozenset(name.split(".", 1)[1] for name in __lazy_modules__)
 
 if TYPE_CHECKING:  # keep static analyzers / IDEs aware of the attributes
-    from . import assess, calculator, config, gradients, io, priors, setup, solver
+    from . import (
+        assess,
+        calculator,
+        config,
+        ensemble,
+        gradients,
+        io,
+        priors,
+        setup,
+        solver,
+    )
 
 
 def __getattr__(name: str):

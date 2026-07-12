@@ -12,6 +12,10 @@ from bouquet.config import (
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
     DEFAULT_ENERGY_METHOD,
+    DEFAULT_ENSEMBLE_DIVERSITY,
+    DEFAULT_ENSEMBLE_EXPLORE_MODE,
+    DEFAULT_ENSEMBLE_STEPS,
+    ENSEMBLE_EXPLORE_MODES,
     DEFAULT_INIT_CONFORMER_CAP,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
@@ -344,6 +348,30 @@ def main():
         help="Select a Boltzmann ensemble of low-energy conformers, tightly "
         "optimize them all, and write ensemble_final.xyz + ensemble.csv",
     )
+    parser.add_argument(
+        "--ensemble-steps",
+        type=int,
+        default=DEFAULT_ENSEMBLE_STEPS,
+        help="With --ensemble: budget of active level-set exploration steps run "
+        "after the main search to discover additional basins. -1 = auto "
+        "(scale with rotor count), 0 = passive harvest only, >0 = fixed cap.",
+    )
+    # Torsion-space diversity penalty subtracted from the level-set acquisition
+    # during ensemble exploration (0 = off).
+    parser.add_argument(
+        "--ensemble-diversity",
+        type=float,
+        default=DEFAULT_ENSEMBLE_DIVERSITY,
+        help=SUPPRESS,
+    )
+    # Exploration mode: "levelset" (P_in*sigma, best low-energy recall) or
+    # "hybrid" (level-set then an annealed boundary sweep for the high-energy shell).
+    parser.add_argument(
+        "--ensemble-explore-mode",
+        choices=list(ENSEMBLE_EXPLORE_MODES),
+        default=DEFAULT_ENSEMBLE_EXPLORE_MODE,
+        help=SUPPRESS,
+    )
     # "Path to write a per-BO-step stopping-rule certificate CSV "
     # "(mu_min/lb/alpha_max + e_eval/e_best/n_calls/wall_s). Used by the "
     #"various benchmarks; off by default."
@@ -451,6 +479,9 @@ def main():
         cert_betas=parse_certificate_betas(args.certificate_betas),
         geom_log_path=Path(args.geometry_log) if args.geometry_log else None,
         retain_bonds=args.retain_bonds,
+        ensemble_steps=args.ensemble_steps,
+        ensemble_diversity=args.ensemble_diversity,
+        ensemble_explore_mode=args.ensemble_explore_mode,
     )
 
     # Create configuration from parsed arguments
