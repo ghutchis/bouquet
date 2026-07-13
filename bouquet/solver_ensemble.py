@@ -105,10 +105,25 @@ def _select_ensemble_candidates(
 ) -> list[tuple[np.ndarray, Atoms]]:
     """Select observed conformers to tightly optimize, ordered by predicted energy.
 
-    A conformer ``i`` is included iff its GP posterior gives
-    ``P(E_i <= E_min + window) >= p_threshold``. The posterior sigma supplies a
-    per-candidate, data-driven buffer: tight where the surface is well sampled,
-    wide where it is sparse. No candidate cap is applied.
+    A conformer ``i`` is included iff EITHER
+
+    * its own observed energy is already within the window
+      (``E_i <= E_min + window``), or
+    * its GP posterior gives ``P(E_i <= E_min + window) >= p_threshold``.
+
+    The first (observed-energy) clause is exact and guarantees no known-good
+    conformer is discarded: the candidates are all *observed* points, whose
+    energies we measured, and the subsequent tight optimization is unconstrained,
+    so it can only *lower* the energy -- a point at or below the window now is
+    certainly in-window after tight-opt. The GP clause only *adds* speculative
+    candidates whose posterior is uncertain; it must never *remove* an observed
+    in-window point, since the GP (smoothing + likelihood noise) regresses sharp
+    minima upward and the observed energies are the higher, constrained-relaxation
+    values -- both of which would otherwise drop genuine low-energy basins,
+    especially when the observed set is large (e.g. seeded from an RDKit pool).
+    The posterior sigma supplies a per-candidate, data-driven buffer for the GP
+    clause: tight where the surface is well sampled, wide where it is sparse. No
+    candidate cap is applied.
     """
     assert len(state.observed_atoms) == state.observed_energies.shape[0], (
         "observed_atoms is misaligned with observed_energies"
@@ -140,18 +155,24 @@ def _select_ensemble_candidates(
         sigma = post.variance.clamp_min(0.0).sqrt().flatten()
     sigma = sigma.clamp_min(sigma_floor_eV)
 
-    # Probabilistic inclusion: P(E_i <= E_min + window) >= p_threshold.
+    # Inclusion = observed-in-window (exact) OR probabilistic GP inclusion.
     e_min = e.min()
+    keep_obs = e <= e_min + window_eV
     z = (e_min + window_eV - mu) / sigma
-    keep = torch.special.ndtr(z) >= p_threshold  # standard-normal CDF
+    keep_gp = torch.special.ndtr(z) >= p_threshold  # standard-normal CDF
+    keep = keep_obs | keep_gp
 
-    # Map survivors back to global indices, ordered by predicted energy
-    # (no cap on the number kept).
-    sel_global = idx[keep][torch.argsort(mu[keep])]
+    # Map survivors back to global indices, ordered by the best available energy
+    # estimate (observed vs predicted), so the cheapest-looking basins are tight-
+    # optimized first. No cap on the number kept.
+    order_key = torch.minimum(mu, e)
+    sel_global = idx[keep][torch.argsort(order_key[keep])]
 
     logger.info(
         f"Ensemble selection: {sel_global.numel()} candidates "
-        f"(from {idx.numel()} valid observations)."
+        f"(from {idx.numel()} valid observations; "
+        f"{int(keep_obs.sum())} observed-in-window, "
+        f"{int((keep_gp & ~keep_obs).sum())} GP-only)."
     )
     return [
         (coords[i].cpu().numpy(), state.observed_atoms[i])
