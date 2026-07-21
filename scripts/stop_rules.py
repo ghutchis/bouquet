@@ -87,6 +87,160 @@ def load_reference(path: Path) -> dict:
     return out
 
 
+def crest_coverage(path: Path) -> tuple[int, int]:
+    """(# molecules whose reference E* is CREST-backed, # total references) from
+    reference.py output. Surfaces partial-CREST coverage -- with the CREST fill still
+    running on the high-d tail (d18-20), the reference E* there falls back to the
+    orthogonal/BO pool, which is weaker; this makes that gap visible at a glance.
+    Returns (0, n) for a pre-CREST reference (no E_star_crest column/field)."""
+    path = Path(path)
+    n_total = n_crest = 0
+    if path.is_dir():
+        import json
+        for f in path.glob("*.json"):
+            o = json.loads(f.read_text())
+            if o.get("ok") and o.get("E_star") is not None:
+                n_total += 1
+                n_crest += int(o.get("E_star_crest") is not None)
+    else:
+        ref = pd.read_csv(path)
+        has_col = "E_star_crest" in ref.columns
+        for _, r in ref.iterrows():
+            if pd.notna(r.get("E_star")):
+                n_total += 1
+                n_crest += int(has_col and pd.notna(r.get("E_star_crest")))
+    return n_crest, n_total
+
+
+def load_reference_abs(path: Path) -> dict:
+    """Map mol_id -> E* in ABSOLUTE eV (E_star + E_start_eV) from reference.py output.
+
+    The energy criterion compares bouquet's found minima to E*. Both the reference E*
+    and (with --reopt) the re-optimized trajectory geometries are UNCONSTRAINED minima,
+    but the cert's ``e_best`` is the CONSTRAINED search energy -- ~1 kcal/mol higher --
+    so the naive ``e_best - E* <= eps`` undercounts basin hits ~2x. --reopt re-optimizes
+    the trajectory geometries and compares on the absolute scale, where the per-molecule
+    e_e0 anchor cancels; this returns that absolute E* (E_star is stored relative-eV,
+    E_start_eV is the anchor, so their sum is the absolute minimum energy in eV)."""
+    path = Path(path)
+    out = {}
+    if path.is_dir():
+        import json
+        for f in path.glob("*.json"):
+            o = json.loads(f.read_text())
+            if o.get("ok") and o.get("E_star") is not None and o.get("E_start_eV") is not None:
+                out[o["mol_id"]] = float(o["E_star"]) + float(o["E_start_eV"])
+    else:
+        ref = pd.read_csv(path)
+        if "E_start_eV" in ref.columns:
+            for _, r in ref.iterrows():
+                if pd.notna(r.get("E_star")) and pd.notna(r.get("E_start_eV")):
+                    out[r["mol_id"]] = float(r["E_star"]) + float(r["E_start_eV"])
+    return out
+
+
+def _reopt_curve_worker(task: dict):
+    """Re-optimize a trial's best-so-far trajectory geometries UNCONSTRAINED and return
+    the anytime running-min ABSOLUTE energy curve: (name, seed, d, [(n_calls, e_abs_eV)]).
+
+    Each improvement frame is a constrained best-so-far geometry; releasing it (tight
+    unconstrained opt) gives the true basin energy the reference is built on. Frames whose
+    unconstrained optimum changed connectivity (formed/broke a bond -> different species)
+    are dropped, mirroring the reference build and the solver's final-relax guard."""
+    import reference as ref  # same scripts/ dir; reuses the reference build machinery
+    from rdkit import Chem
+    from bouquet.setup import connectivity_changed
+
+    name = task["name"]; seed = task["seed"]
+    out = {"name": name, "seed": seed, "d": task["d"], "curve": []}
+    frames = _trail_full(Path(task["geom_dir"]), task["config"], name, seed)
+    if not frames:
+        return out
+    try:
+        mol = Chem.MolFromSmiles(task["smiles"])
+        if mol is None:
+            return out
+        charge = Chem.GetFormalCharge(mol)
+        molh = Chem.AddHs(mol)
+        calc = ref._gfnff_calc(task["method"], molh, charge)
+        curve = []
+        for n_calls, _e_e0, atoms in frames:
+            r = ref._optimize(atoms, calc)
+            if r is None:
+                continue
+            if connectivity_changed(r[0], molh, task["conn_tol"]):
+                continue
+            curve.append((n_calls, float(r[1])))  # (n_calls, absolute eV)
+        out["curve"] = curve
+    except Exception as e:  # keep the batch alive; a failed trial just has no curve
+        out["error"] = repr(e)
+    return out
+
+
+def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
+    """Energy-criterion events using UNCONSTRAINED re-optimized trajectory geometries
+    (the ``--reopt`` path). Same schema as :func:`build_events`, but the hitting time is
+    the first n_calls at which the running-min *unconstrained* energy comes within eps of
+    the absolute reference E*. Requires --manifest (SMILES) and --geom-dir."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    cache = out_cache = getattr(args, "reopt_cache", None)
+    if cache and Path(cache).exists() and not getattr(args, "reopt_refresh", False):
+        print(f"Reusing cached reopt curves: {cache}")
+        curves = pd.read_csv(cache)
+    else:
+        if not args.manifest:
+            sys.exit("--reopt needs --manifest (SMILES) and --geom-dir")
+        man = pd.read_csv(args.manifest).set_index("mol_id")
+        ref_abs = load_reference_abs(args.reference)
+        tasks = []
+        for (name, seed), _g in df.groupby(["name", "seed"]):
+            if name not in man.index or name not in ref_abs:
+                continue
+            tasks.append({
+                "name": name, "seed": int(seed), "d": int(_g["d"].iloc[0]),
+                "config": _g["config"].iloc[0], "smiles": man.loc[name, "raw_smiles"],
+                "geom_dir": str(args.geom_dir), "method": args.reopt_method,
+                "conn_tol": args.conn_tol,
+            })
+        print(f"Re-optimizing trajectory geometries for {len(tasks)} trials "
+              f"({args.reopt_method}, {args.workers} workers)...")
+        rows = []
+        with ProcessPoolExecutor(max_workers=args.workers) as ex:
+            for o in ex.map(_reopt_curve_worker, tasks):
+                for n_calls, e_abs in o["curve"]:
+                    rows.append({"name": o["name"], "seed": o["seed"], "d": o["d"],
+                                 "n_calls": n_calls, "e_abs": e_abs})
+        curves = pd.DataFrame(rows)
+        if out_cache:
+            curves.to_csv(out_cache, index=False)
+            print(f"wrote reopt curves -> {out_cache}")
+
+    ref_abs = load_reference_abs(args.reference)
+    eps_eV = args.eps / KCAL
+    # censoring horizon per trial = last logged cert call
+    horizon = df.groupby(["name", "seed"])["n_calls"].last()
+    cens = df.groupby(["name", "seed"])["censored"].last()
+    rows = []
+    for (name, seed), g in curves.groupby(["name", "seed"]):
+        estar_abs = ref_abs.get(name)
+        if estar_abs is None:
+            continue
+        g = g.sort_values("n_calls")
+        running = np.minimum.accumulate(g["e_abs"].to_numpy())
+        hit_mask = (running - estar_abs) <= eps_eV
+        hit = bool(hit_mask.any())
+        ncalls_hit = int(g["n_calls"].to_numpy()[hit_mask][0]) if hit else np.nan
+        key = (name, seed)
+        rows.append({
+            "name": name, "seed": seed, "d": int(g["d"].iloc[0]),
+            "estar": estar_abs * KCAL, "hit": hit, "ncalls_hit": ncalls_hit,
+            "ncalls_max": int(horizon.get(key, g["n_calls"].max())),
+            "run_censored": int(cens.get(key, 0)),
+        })
+    return pd.DataFrame(rows)
+
+
 def add_estar(df: pd.DataFrame, ref_map: dict | None = None) -> pd.DataFrame:
     """Add per-molecule E*. Default: min e_best over all seeds (within-data pool;
     circular -> reliability ~1). With ``ref_map`` (from reference.py), use the
@@ -324,10 +478,60 @@ def cmd_summary(df, args, out: Path):
     return ev
 
 
+def reliability_by_class(ev: pd.DataFrame, classes: dict | None, out: Path,
+                         fname: str = "reliability_by_class.csv") -> None:
+    """Print + write hit reliability stratified by ring-flexibility class
+    (acyclic = straight-chain, flexible-ring = puckerable, aromatic = rigid rings).
+    The stratification the ring-pucker story needs: flexible-ring misses are
+    embedding/seed-gated (BO can't change pucker), acyclic/aromatic are BO-reachable
+    so their misses are search/budget-limited."""
+    if not classes:
+        print("\n(reliability-by-class needs --manifest for ring classes)")
+        return
+    ev = ev.copy()
+    ev["ring_class"] = ev["name"].map(classes).fillna("?")
+    print("\nreliability by ring class (acyclic=straight-chain, "
+          "flexible-ring=puckerable, aromatic=rigid):")
+    overall = ev.groupby("ring_class").agg(
+        n_trials=("hit", "size"), n_mols=("name", "nunique"),
+        n_hit=("hit", "sum"), reliability=("hit", "mean"))
+    with pd.option_context("display.width", 200):
+        print(overall.round(3).to_string())
+    # class x d grid of reliability (the ring-pucker signal is d-dependent)
+    grid = ev.pivot_table(index="ring_class", columns="d", values="hit", aggfunc="mean")
+    print("\nreliability by ring class x d:")
+    with pd.option_context("display.width", 250):
+        print(grid.round(2).to_string())
+    overall.to_csv(out / fname)
+    print(f"wrote {out / fname}")
+
+
 def cmd_nstar(df, args, out: Path):
-    df = add_estar(df, getattr(args, 'ref_map', None))
-    ev = build_events(df, args.eps)
+    if getattr(args, "reopt", False):
+        # Unconstrained-reopt energy criterion (correct: matches the reference scale).
+        ev = build_events_reopt(df, args)
+        ev.to_csv(out / "events_nstar_reopt.csv", index=False)
+    else:
+        df = add_estar(df, getattr(args, 'ref_map', None))
+        ev = build_events(df, args.eps)
+
+    # AUTO_STEPS calibration discipline: the step budget is a SEARCH-DEPTH lever, but
+    # flexible-ring misses are an EMBEDDING/pucker lever (BO never moves ring bonds), so
+    # they plateau below reliability 1 no matter the budget -- including them inflates
+    # the fitted step formula futilely. --fit-classes restricts the SCALING FIT (not the
+    # reliability report) to the BO-reachable classes; default keeps all for compatibility.
+    ev_fit = ev
+    fit_classes = getattr(args, "fit_classes", None)
+    classes = getattr(args, "classes", None)
+    if fit_classes and classes:
+        keep = set(fit_classes.split(","))
+        cls = ev["name"].map(classes)
+        ev_fit = ev[cls.isin(keep)]
+        print(f"[fit restricted to ring classes {sorted(keep)}: "
+              f"{len(ev_fit)}/{len(ev)} trials feed the n*(d) scaling]")
+
     tab = nstar_table(ev, args.bootstrap, args.seed)
+    tab_fit = nstar_table(ev_fit, args.bootstrap, args.seed) if ev_fit is not ev else tab
     tab.to_csv(out / "nstar.csv", index=False)
     print("n*(d; rho) [xTB calls], censoring-aware (nan = censoring prevents rho):")
     with pd.option_context("display.width", 200):
@@ -335,7 +539,7 @@ def cmd_nstar(df, args, out: Path):
                    "nstar_90", "nstar_95", "nstar_99"]].to_string(index=False))
     # Fit only on adequately-populated d-bins; a single-molecule bin is an outlier
     # that distorts the scaling law (and drove the earlier negative intercept).
-    ft = tab[tab.n_trials >= args.min_fit_trials]
+    ft = tab_fit[tab_fit.n_trials >= args.min_fit_trials]
     origin = not args.free_intercept
     fits = {}
     for r in RHOS:
@@ -351,6 +555,7 @@ def cmd_nstar(df, args, out: Path):
          "scaling": {str(r): {"a": f[0], "b": f[1], "p": f[2], "rmse": f[3]}
                      for r, f in fits.items()}}, indent=2))
     print(f"wrote {out/'nstar.csv'}, {out/'nstar.pdf'}, {out/'fitted.json'}")
+    reliability_by_class(ev, getattr(args, "classes", None), out)
     return tab
 
 
@@ -473,7 +678,7 @@ def cmd_rmsd(df, args, out: Path):
     vs the energy criterion. Resolves the 'lower energy but same/wrong basin' issue:
     a run can be energy-close yet a distinct conformer, or in the right basin but
     not energy-converged. Reuses bouquet's symmetry-aware iRMSD (_rmsd)."""
-    from bouquet.solver import _rmsd
+    from bouquet.ensemble import _rmsd
     if not args.geom_dir or not args.reference:
         sys.exit("rmsd needs --geom-dir (trails) and --reference (reference dir)")
     ref_dir = Path(args.reference)
@@ -555,9 +760,16 @@ def ring_class(smiles: str) -> str:
         return "acyclic"
     for ring in ri.AtomRings():
         atoms = [mol.GetAtomWithIdx(i) for i in ring]
-        if not all(a.GetIsAromatic() for a in atoms) and any(
-            a.GetHybridization() == Chem.HybridizationType.SP3 for a in atoms
-        ):
+        if all(a.GetIsAromatic() for a in atoms):
+            continue
+        # A single sp3 apex in an otherwise sp2/aromatic-fused ring (e.g. fluorene's
+        # C9, an N-alkyl carbazole bridge) is RIGID -- it cannot pucker -- so it is a
+        # BO-reachable aromatic-backbone case, not an embedding-gated one. Require >=2
+        # sp3 ring atoms before calling a non-aromatic ring puckerable; saturated rings
+        # (cyclohexane, piperidine, THF, ...) all have >=2 and stay flexible-ring.
+        n_sp3 = sum(1 for a in atoms
+                    if a.GetHybridization() == Chem.HybridizationType.SP3)
+        if n_sp3 >= 2:
             return "flexible-ring"
     return "aromatic"
 
@@ -591,7 +803,7 @@ def cmd_basin(df, args, out: Path):
     budget the CAP should target -- it ignores the post-basin energy creep that
     inflates the 'step with best energy'. n*(d) here is identifiable (every run
     enters its own best basin -> reliability 1)."""
-    from bouquet.solver import _rmsd
+    from bouquet.ensemble import _rmsd
     if not args.geom_dir:
         sys.exit("basin needs --geom-dir (geometry trails)")
     thr = args.rmsd_identity
@@ -826,6 +1038,31 @@ def main():
     p.add_argument("--min-fit-trials", type=int, default=5,
                    help="Exclude d-bins with fewer trials from the scaling-law fit "
                    "(under-populated bins are outliers; default 5).")
+    p.add_argument("--reopt", action="store_true",
+                   help="Energy criterion: re-optimize each trajectory best-so-far "
+                   "geometry UNCONSTRAINED (on --reopt-method) and score vs the absolute "
+                   "reference E*, instead of the constrained cert e_best. Fixes the ~2x "
+                   "undercount from the constrained/unconstrained scale mismatch. Needs "
+                   "--manifest (SMILES), --geom-dir, and --reference with E_start_eV.")
+    p.add_argument("--reopt-method", default="gfn2",
+                   help="Calculator for --reopt (match the benchmark surface; default gfn2)")
+    p.add_argument("--reopt-cache", type=Path, default=None,
+                   help="CSV to cache/reuse the re-optimized (n_calls, e_abs) curves so "
+                   "the expensive xTB replay runs once (default <out-dir>/reopt_curves.csv)")
+    p.add_argument("--reopt-refresh", action="store_true",
+                   help="Ignore any --reopt-cache and re-run the re-optimization")
+    p.add_argument("--workers", "-w", type=int, default=8,
+                   help="Parallel workers for the --reopt re-optimization (default 8)")
+    p.add_argument("--conn-tol", type=float, default=1.3,
+                   help="--reopt: bond-perception tolerance for the connectivity guard "
+                   "that drops species-changed frames (default 1.3)")
+    p.add_argument("--fit-classes", default=None,
+                   help="Restrict the n*(d) SCALING FIT (the AUTO_STEPS calibration) to "
+                   "these comma-separated ring classes, e.g. 'acyclic,aromatic' -- the "
+                   "BO-reachable set. Flexible-ring reliability is embedding-gated (a "
+                   "different lever) and plateaus below 1, so including it inflates the "
+                   "step budget. Reliability is still reported for ALL classes. Needs "
+                   "--manifest for the class map.")
     p.add_argument("--free-intercept", action="store_true",
                    help="Let the scaling fit have a free intercept; default forces "
                    "n*(d)=b*d^p through the origin (a molecule with no dihedrals "
@@ -833,10 +1070,13 @@ def main():
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "reopt", False) and args.reopt_cache is None:
+        args.reopt_cache = args.out_dir / "reopt_curves.csv"
     args.ref_map = load_reference(args.reference) if args.reference else None
     if args.ref_map:
+        n_crest, n_total = crest_coverage(args.reference)
         print(f"Loaded reference E* for {len(args.ref_map)} molecules "
-              f"(non-circular success criterion).")
+              f"(non-circular success criterion); {n_crest}/{n_total} CREST-backed.")
     args.classes = load_classes(args.manifest) if args.manifest else None
     if args.classes:
         print(f"Loaded ring-flexibility classes for {len(args.classes)} molecules.")

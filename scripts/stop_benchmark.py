@@ -12,10 +12,19 @@ candidate stopping rule can be evaluated offline by replaying the logged
 trajectory (no re-running). See the design notes in the project for the rule
 catalogue (GP certificate, log-EI, stall) and the survival/Pareto analysis.
 
-The single arm is the production-candidate surrogate: the gradient-enhanced GP
-with the default freeze schedule (``--use-gradients``). The certificate logs
-mu_min, alpha_max, and a beta-grid of lower bounds lb_b<beta> per step, plus
-e_best/n_calls/wall_s -- everything the offline rules need.
+The single arm is the production-candidate surrogate: the gradient-enhanced GP with
+the default freeze schedule plus PiBO priors (``--use-gradients --priors``), searching
+on **GFN2/GFN2** to match the CREST reference PES. Low-mode (``--lowmode-prob``) and
+category-tied (``--category-prob``) collective moves stay at their auto defaults, so
+they self-enable at high d as in production -- that auto behavior is exactly what this
+calibrates. The certificate logs mu_min, alpha_max, and a beta-grid of lower bounds
+lb_b<beta> per step, plus e_best/n_calls/wall_s -- everything the offline rules need.
+
+Success (in the offline replay, scripts/stop_rules.py) is scored against an
+INDEPENDENT reference: the CREST iMTD-GC global minima, ingested via
+``scripts/reference.py --crest-dir`` on the same GFN2 surface -- both the energy
+criterion (e_best - E*_CREST <= eps) and the RMSD-identity criterion (best-so-far
+geometry within iRMSD of the CREST global-min conformer).
 
 Ceiling (upper envelope on hitting time, NOT a budget): anchored to the auto
 table's 25 at d=3, grown with a conservative global-best exponent and a safety
@@ -100,7 +109,13 @@ def run(args: argparse.Namespace) -> None:
         d = d_of(smiles)
         return d is not None and d > args.max_dihedrals
 
-    sc.run_sweep(args, {"grad": ["--use-gradients"]},
+    # Production arm: gradient-enhanced GP + PiBO priors. Priors are REQUIRED for the
+    # category-tied collective moves, and both low-mode (--lowmode-prob) and category
+    # (--category-prob) moves stay at their auto defaults (None) so they self-enable at
+    # high d exactly as production does -- that auto behavior is what we are calibrating,
+    # so we must NOT pin them here. Surface defaults to gfn2/gfn2 (see main()) to match
+    # the CREST reference; --priors bare uses the bundled gfn2_priors.json.
+    sc.run_sweep(args, {"grad": ["--use-gradients", "--priors"]},
                  num_steps_fn=num_steps_fn, mol_skip_fn=mol_skip_fn)
 
 
@@ -112,6 +127,10 @@ def main() -> None:
 
     r = sub.add_parser("run", help="Run the certificate sweep at the ceiling C(d)")
     sc.add_run_args(r, CONFIG_NAMES)
+    # This benchmark scores against the GFN2 CREST reference, so the search must run on
+    # GFN2 too (minima on the same PES). Override sweep_common's gfnff default; still
+    # CLI-overridable and still a single surface (energy == optimizer under --relax).
+    r.set_defaults(energy="gfn2", optimizer="gfn2")
     r.add_argument("--ceiling-anchor", type=float, default=25.0,
                    help="C(d) anchor: BO steps at d=3 before the margin (default 25, "
                    "the auto-table value).")
