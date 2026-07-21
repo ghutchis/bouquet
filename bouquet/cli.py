@@ -135,16 +135,25 @@ def main():
         "input.",
     )
     parser.add_argument(
+        "--method",
+        choices=CalculatorFactory.available_methods(),
+        default=None,
+        help="Shorthand that sets both --energy and --optimizer to the same "
+        "method. An explicit --energy or --optimizer overrides it for that role.",
+    )
+    parser.add_argument(
         "--energy",
         choices=CalculatorFactory.available_methods(),
-        default=DEFAULT_ENERGY_METHOD,
-        help="Energy method (only methods whose dependencies are installed are listed)",
+        default=None,
+        help="Energy method (only methods whose dependencies are installed are "
+        f"listed). Default: {DEFAULT_ENERGY_METHOD}, or --method if given.",
     )
     parser.add_argument(
         "--optimizer",
         choices=CalculatorFactory.available_methods(),
-        default=DEFAULT_OPTIMIZER_METHOD,
-        help="Optimizer method (only methods whose dependencies are installed are listed)",
+        default=None,
+        help="Optimizer method (only methods whose dependencies are installed "
+        f"are listed). Default: {DEFAULT_OPTIMIZER_METHOD}, or --method if given.",
     )
     parser.add_argument(
         "--charge",
@@ -440,6 +449,16 @@ def main():
         "reverts to the constrained best.",
     )
     args = parser.parse_args()
+
+    # --method is shorthand for setting both roles at once. An explicit
+    # --energy/--optimizer wins for its role; otherwise fall back to --method,
+    # then to the per-role default.
+    if args.energy is None:
+        args.energy = args.method if args.method is not None else DEFAULT_ENERGY_METHOD
+    if args.optimizer is None:
+        args.optimizer = (
+            args.method if args.method is not None else DEFAULT_OPTIMIZER_METHOD
+        )
 
     # Multiplicity (2S+1) must be a positive integer; anything <= 0 yields an
     # invalid unpaired-electron count (uhf = multiplicity - 1) when stamped onto
