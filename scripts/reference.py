@@ -481,8 +481,12 @@ def cmd_build(args):
             tag = "ok" if out.get("ok") else f"FAIL {out.get('error','')[:50]}"
             if out.get("ok") and out.get("E_star") is None:
                 # connectivity guard rejected every candidate -> no valid conformer
-                tag = (f"E*=None EXCLUDED (rejected {out.get('n_rej_orth',0)}"
-                       f"+{out.get('n_rej_bo',0)})")
+                tag = (f"E*=None EXCLUDED (rejected "
+                       f"{out.get('n_rej_orth',0)}+{out.get('n_rej_crest',0)}"
+                       f"+{out.get('n_rej_bo',0)} conn, "
+                       f"{out.get('n_species_rej_orth',0)}"
+                       f"+{out.get('n_species_rej_crest',0)}"
+                       f"+{out.get('n_species_rej_bo',0)} species)")
             elif out.get("ok"):
                 gap = (out["E_star_BO"] - out["E_star_nonBO"]) * KCAL \
                     if out["E_star_BO"] is not None and out["E_star_nonBO"] is not None else float("nan")

@@ -86,6 +86,7 @@ from bouquet.solver_ensemble import (
     _select_ensemble_candidates,
     _select_exploration_point,
     _valid_observation_idx,
+    tight_optimize_and_weight,
 )
 
 logger = logging.getLogger(__name__)
@@ -1148,6 +1149,21 @@ def run_optimization(
             except Exception:
                 energy = RELAX_FAILURE_ENERGY_EV
         logger.info(f"Energy (no rotatable dihedrals): {energy}")
+        # Ring-pucker seeds are the ONLY conformational diversity a zero-rotor
+        # molecule has: the BO loop turns rotors and there are none, so the seed
+        # full geometries (distinct ring puckers from ETKDG / --conformer-file) are
+        # the sole source of an ensemble. Tight-optimize/dedup/weight them just as
+        # the normal path does; with no seeds we keep the singleton behavior below.
+        ensemble = None
+        if return_ensemble and ensemble_seed_geometries:
+            ensemble = tight_optimize_and_weight(
+                [best_atoms] + list(ensemble_seed_geometries),
+                calc, relaxCalc, start_energy=energy,
+            )
+            if ensemble:
+                # ensemble[0] is the lowest-energy pucker; adopt it as the best.
+                best_atoms, best_e_e0, _weight = ensemble[0]
+                energy = energy + best_e_e0  # absolute energy of the new best
         # Produce the same artifacts a normal run would. There is a single
         # (zero-dihedral) structure, so it is both the start and the best: mirror
         # _setup_initial_state's relaxed.xyz + structure log and the final
@@ -1170,7 +1186,8 @@ def run_optimization(
                 geom_log_path, best_atoms, "n_calls=1 e_e0_eV=0.000000 kind=final"
             )
         if return_ensemble:
-            return best_atoms, [(best_atoms, 0.0, 1.0)]
+            # Singleton fallback when no seeds were supplied (or all seeds failed).
+            return best_atoms, ensemble if ensemble else [(best_atoms, 0.0, 1.0)]
         return best_atoms
 
     # Resolve the "auto"/None search knobs now that the dihedral count is known

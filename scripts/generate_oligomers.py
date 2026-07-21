@@ -37,7 +37,7 @@ FAMILIES: dict[str, tuple[str, str, str]] = {
     # ODD d (1,3,5,7,9,11); the side chains give large per-unit increments for high-d
     # anchors (P3HT +7/unit, 3-(2-ethylhexyl) +10, MEH-PPV +13). All 'aromatic' class.
     "P3HT": ("", "c1cc(CCCCCC)c(s1)", ""),               # poly(3-hexylthiophene)
-    "P3EHT": ("", "c1cc(CCC(CC)CCCC)c(s1)", ""),         # 3-(2-ethylhexyl)thiophene (branched)
+    "P3EHT": ("", "c1cc(CC(CC)CCCC)c(s1)", ""),         # 3-(2-ethylhexyl)thiophene (branched)
     "PPV": ("", "C=Cc1ccc(cc1)", ""),                    # poly(phenylene-vinylene)
     "MEH_PPV": ("", "C=Cc1cc(OC)c(OCC(CC)CCCC)cc1", ""),  # 2-methoxy-5-(2-ethylhexyloxy)-PPV
     "polyaniline": ("", "Nc1ccc(cc1)", "N"),             # leucoemeraldine (aryl-NH-); EVEN d 2..12
@@ -51,9 +51,15 @@ FAMILIES: dict[str, tuple[str, str, str]] = {
     # in a FUSED 5-ring that is rigid (not puckerable) -> 'aromatic' class via the ring_class
     # single-sp3-apex rule. High-d anchors with real chemistry.
     "polycarbonate": ("", "Oc1ccc(cc1)C(C)(C)c1ccc(cc1)OC(=O)", "O"),  # bisphenol-A PC
-    "polyfluorene": ("", "CC1(C)c2cc(ccc2-c2ccc(cc21))", ""),          # poly(9,9-dimethylfluorene), 2,7
-    "PF_hexyl": ("", "C(CCCCC)C1(CCCCCC)c2cc(ccc2-c2ccc(cc21))", ""),  # 9,9-dihexylfluorene (alkyl)
-    "polycarbazole": ("", "Cn1c2cc(ccc2c2ccc(cc21))", ""),            # poly(N-methylcarbazole), 3,6
+    # These conjugated units must repeat at the aromatic BACKBONE positions
+    # (fluorene 2,7; carbazole 3,6). The repeat string therefore begins and ends at
+    # those aromatic carbons -- the sp3/N bridge and its methyl/alkyl substituents sit
+    # in branches -- so plain concatenation forms the intended aryl-aryl backbone bond
+    # (verified vs the 2,7'/3,6'-coupled dibromide), not a bond into the next unit's
+    # C9-methyl / N-methyl / alkyl carbon.
+    "polyfluorene": ("", "c1ccc2c(c1)C(C)(C)c1cc(ccc12)", ""),                     # poly(9,9-dimethylfluorene), 2,7
+    "PF_hexyl": ("", "c1ccc2c(c1)C(CCCCCC)(CCCCCC)c1cc(ccc12)", ""),              # 9,9-dihexylfluorene (alkyl), 2,7
+    "polycarbazole": ("", "c1ccc2c(c1)n(C)c1cc(ccc12)", ""),                       # poly(N-methylcarbazole), 3,6
     # Foldamers: gas-phase helices driven by intramolecular H-bonds / sterics.
     # Aib (alpha-aminoisobutyric acid) -> 3_10/alpha helix (gem-dimethyl funnel).
     # beta3-homoalanine -> 14-helix. Both verified to fold under MMFF (n>=4).

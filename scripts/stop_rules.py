@@ -151,7 +151,8 @@ def _reopt_curve_worker(task: dict):
     from rdkit import Chem
     from bouquet.setup import connectivity_changed
 
-    name = task["name"]; seed = task["seed"]
+    name = task["name"]
+    seed = task["seed"]
     out = {"name": name, "seed": seed, "d": task["d"], "curve": []}
     frames = _trail_full(Path(task["geom_dir"]), task["config"], name, seed)
     if not frames:
@@ -184,13 +185,30 @@ def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
     the absolute reference E*. Requires --manifest (SMILES) and --geom-dir."""
     from concurrent.futures import ProcessPoolExecutor
 
+    # All three inputs are consumed below (reference even on the cache path, via
+    # load_reference_abs), so validate up front for a clear message rather than a
+    # raw crash inside load_reference_abs / _trail_full.
+    missing_opts = [
+        opt for opt, val in (("--manifest", args.manifest),
+                             ("--geom-dir", args.geom_dir),
+                             ("--reference", args.reference)) if not val
+    ]
+    if missing_opts:
+        sys.exit(f"--reopt needs {', '.join(missing_opts)} "
+                 "(--manifest SMILES, --geom-dir trajectories, --reference with E_start_eV)")
+
     cache = out_cache = getattr(args, "reopt_cache", None)
     if cache and Path(cache).exists() and not getattr(args, "reopt_refresh", False):
         print(f"Reusing cached reopt curves: {cache}")
         curves = pd.read_csv(cache)
+        df_pairs = set(zip(df["name"].astype(str), df["seed"].astype(int)))
+        cache_pairs = set(zip(curves["name"].astype(str), curves["seed"].astype(int)))
+        missing = df_pairs - cache_pairs
+        if missing:
+            print(f"WARNING: {len(missing)} current trial(s) from {args.cert} are "
+                  f"missing from cached reopt curves {cache} and will be dropped; "
+                  f"re-run with --reopt-refresh to rebuild the cache.")
     else:
-        if not args.manifest:
-            sys.exit("--reopt needs --manifest (SMILES) and --geom-dir")
         man = pd.read_csv(args.manifest).set_index("mol_id")
         ref_abs = load_reference_abs(args.reference)
         tasks = []
@@ -523,7 +541,10 @@ def cmd_nstar(df, args, out: Path):
     ev_fit = ev
     fit_classes = getattr(args, "fit_classes", None)
     classes = getattr(args, "classes", None)
-    if fit_classes and classes:
+    if fit_classes:
+        if not classes:
+            sys.exit("--fit-classes needs per-molecule ring classes, which come from "
+                     "--manifest; pass --manifest so the ring-flexibility classes load.")
         keep = set(fit_classes.split(","))
         cls = ev["name"].map(classes)
         ev_fit = ev[cls.isin(keep)]
@@ -745,11 +766,15 @@ def cmd_rmsd(df, args, out: Path):
 def ring_class(smiles: str) -> str:
     """Classify a molecule by ring flexibility -- the key reliability covariate.
 
-    'acyclic' and 'aromatic' (rings all aromatic) are BO-REACHABLE: every flexible
-    DOF is a rotatable dihedral, so BO can in principle reach the global min and
-    failures are search-limited. 'flexible-ring' has a non-aromatic ring with an
-    sp3 atom (puckerable): BO cannot change ring pucker from a fixed embedding, so
-    reliability is gated by embedding/seed diversity, not BO budget.
+    'acyclic' and 'aromatic' are BO-REACHABLE: every flexible DOF is a rotatable
+    dihedral, so BO can in principle reach the global min and failures are
+    search-limited. 'aromatic' is the BO-reachable fit class -- it covers both
+    fully aromatic rings AND non-fully-aromatic rings with fewer than two sp3 ring
+    atoms (e.g. fused aromatic-backbone cases like fluorene's C9 apex or an
+    N-alkyl carbazole bridge), which are rigid and cannot pucker. 'flexible-ring'
+    has a non-aromatic ring with >=2 sp3 atoms (puckerable): BO cannot change ring
+    pucker from a fixed embedding, so reliability is gated by embedding/seed
+    diversity, not BO budget.
     """
     from rdkit import Chem
     mol = Chem.MolFromSmiles(smiles)

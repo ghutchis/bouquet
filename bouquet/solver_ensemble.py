@@ -63,7 +63,7 @@ from bouquet.ensemble import (
     _periodic_min_dist,
     _resolve_ensemble_budget,
 )
-from bouquet.setup import DihedralInfo
+from bouquet.setup import DihedralInfo, geometry_bond_set
 from bouquet.surrogate import (
     _cert_sobol_pool,
     _fit_value_gp,
@@ -217,20 +217,57 @@ def _perform_ensemble_relaxation(
     )
 
     # GP-selected observed points (dihedral basins) + the seed full geometries (ring
-    # puckers). Tight, UNCONSTRAINED optimization of each (no step limit).
+    # puckers). Tight, UNCONSTRAINED optimization of each, then dedup + weight.
     to_optimize = list(extra_candidates or []) + [atoms for _, atoms in candidates]
+    return tight_optimize_and_weight(
+        to_optimize, calc, relaxCalc, state.start_energy,
+        dihedrals=dihedrals, add_entry=state.add_entry,
+    )
+
+
+def tight_optimize_and_weight(
+    to_optimize: list[Atoms],
+    calc: Calculator,
+    relaxCalc: Calculator,
+    start_energy: float,
+    dihedrals: list[DihedralInfo] | None = None,
+    add_entry=None,
+) -> list[tuple[Atoms, float, float]]:
+    """Tight (unconstrained) optimize each candidate -> dedup -> Boltzmann weight.
+
+    The shared tail of the ensemble path. Takes an explicit candidate list --
+    GP-selected observed points plus seed geometries in the normal run, or (for a
+    zero-rotor molecule, where the BO loop has nothing to search) just the seed ring
+    puckers -- and returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy
+    ascending, with energies relative to ``start_energy``. Candidates whose
+    unconstrained relaxation exceeds the failure cutoff or changes connectivity are
+    dropped. ``add_entry`` (if given) records each surviving optimum in the run state.
+    """
+    window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
+    e_tol_eV = ENSEMBLE_ENERGY_TOL_KCAL * KCAL_TO_EV
+
     optimized: list[tuple[Atoms, float]] = []
     for k, atoms in enumerate(to_optimize):
         a = atoms.copy()
         a.set_constraint()  # remove any dihedral constraints
+        bonds_before = geometry_bond_set(a)  # connectivity before unconstrained opt
         energy, a = relax_structure(a, calc, relaxCalc, steps=None)
-        rel = energy - state.start_energy
+        rel = energy - start_energy
         if rel >= FAILURE_ENERGY_EV:  # relative cutoff, as in candidate selection
             continue
+        # A tight, unconstrained opt that formed/broke a bond is a different species,
+        # not a conformer of the input candidate -- discard it (cf. the final-relax
+        # connectivity guard in solver.py).
+        if geometry_bond_set(a) != bonds_before:
+            logger.info(
+                f"Tight opt {k+1}/{len(to_optimize)}: connectivity changed "
+                f"(formed/broke a bond); discarding."
+            )
+            continue
         optimized.append((a, rel))
-        if state.add_entry is not None:
-            state.add_entry(
-                np.array([d.get_angle(a) for d in dihedrals]), a, energy
+        if add_entry is not None:
+            add_entry(
+                np.array([d.get_angle(a) for d in (dihedrals or [])]), a, energy
             )
         logger.info(f"Tight opt {k+1}/{len(to_optimize)}: E-E0 = {rel:12.6f} eV")
 
