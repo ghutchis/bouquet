@@ -49,6 +49,36 @@ def test_final_relaxation_reverts_to_constrained(populated_state, monkeypatch):
     assert rel_energy + state.start_energy < RELAX_FAILURE_ENERGY_EV
 
 
+def test_final_relaxation_reverts_on_formed_bond(populated_state, monkeypatch):
+    """If the UNCONSTRAINED relax changes connectivity (a formed/broken bond) and
+    lands on a bogusly low energy -- a different species, e.g. ring closure -- the
+    function must revert to the constrained best rather than emit the transmuted
+    structure as a spurious global minimum."""
+    import numpy as np
+    from bouquet.setup import geometry_bond_set
+
+    state, dihedrals, calc = populated_state
+
+    # Patch only the unconstrained relax (solver.relax_structure): return a geometry
+    # with a NEW bond (collapse the two terminal carbons together) at an absurdly low
+    # energy. The constrained relax (assess.evaluate_energy) is left real and valid.
+    def transmuting_relax(atoms, energyCalc, relaxCalc, steps):
+        bad = atoms.copy()
+        pos = bad.get_positions()
+        pos[3] = pos[0] + np.array([0.5, 0.0, 0.0])  # C3 onto C0 -> forms a bond
+        bad.set_positions(pos)
+        return -500.0, bad  # bogusly low "energy" of the wrong species
+
+    monkeypatch.setattr(solver, "relax_structure", transmuting_relax)
+
+    best_atoms, rel_energy = solver._perform_final_relaxation(state, dihedrals, calc, calc)
+
+    # Reverted: energy is the (valid, physical) constrained result, not the -500 species.
+    assert rel_energy + state.start_energy > -100.0
+    # And the returned geometry keeps the original connectivity (no formed bond).
+    assert geometry_bond_set(best_atoms) == geometry_bond_set(state.start_atoms)
+
+
 def test_final_relaxation_reverts_to_best_observed(populated_state, monkeypatch):
     """If BOTH constrained and unconstrained relaxes fail, keep the best observed."""
     state, dihedrals, calc = populated_state

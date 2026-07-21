@@ -30,6 +30,36 @@ FAMILIES: dict[str, tuple[str, str, str]] = {
     "polyalanine": ("CC(=O)", "N[C@@H](C)C(=O)", "NC"),
     "polyserine": ("CC(=O)", "N[C@@H](CO)C(=O)", "NC"),
     "nylon6": ("", "NCCCCCC(=O)", "O"),
+    # Conjugated side-chain polymers (organic electronics): a rigid aromatic backbone
+    # (planar-preferring 2-fold inter-ring/aryl-vinyl dihedrals) carrying FLEXIBLE alkyl/
+    # alkoxy side chains -- a distinct torsional regime (chain torsions dominate the DOF
+    # count) and real chemistry. They gap-fill d-values the plain backbones miss: PPV hits
+    # ODD d (1,3,5,7,9,11); the side chains give large per-unit increments for high-d
+    # anchors (P3HT +7/unit, 3-(2-ethylhexyl) +10, MEH-PPV +13). All 'aromatic' class.
+    "P3HT": ("", "c1cc(CCCCCC)c(s1)", ""),               # poly(3-hexylthiophene)
+    "P3EHT": ("", "c1cc(CC(CC)CCCC)c(s1)", ""),         # 3-(2-ethylhexyl)thiophene (branched)
+    "PPV": ("", "C=Cc1ccc(cc1)", ""),                    # poly(phenylene-vinylene)
+    "MEH_PPV": ("", "C=Cc1cc(OC)c(OCC(CC)CCCC)cc1", ""),  # 2-methoxy-5-(2-ethylhexyloxy)-PPV
+    "polyaniline": ("", "Nc1ccc(cc1)", "N"),             # leucoemeraldine (aryl-NH-); EVEN d 2..12
+    # Polystyrene + derivatives: flexible sp3 -CH2-CH(Ar)- backbone with PENDANT aromatic
+    # rings (aromatic class, but the difficulty is backbone + phenyl-rotation torsions --
+    # a distinct regime from the rigid conjugated backbones above).
+    "polystyrene": ("", "CC(c1ccccc1)", "C"),            # atactic, d 3,6,9,12
+    "PS_4Me": ("", "CC(c1ccc(C)cc1)", "C"),              # poly(4-methylstyrene)
+    "PS_4OMe": ("", "CC(c1ccc(OC)cc1)", "C"),            # poly(4-methoxystyrene)
+    # Rigid engineering/optoelectronic backbones. Fluorene/carbazole have an sp3/N bridge
+    # in a FUSED 5-ring that is rigid (not puckerable) -> 'aromatic' class via the ring_class
+    # single-sp3-apex rule. High-d anchors with real chemistry.
+    "polycarbonate": ("", "Oc1ccc(cc1)C(C)(C)c1ccc(cc1)OC(=O)", "O"),  # bisphenol-A PC
+    # These conjugated units must repeat at the aromatic BACKBONE positions
+    # (fluorene 2,7; carbazole 3,6). The repeat string therefore begins and ends at
+    # those aromatic carbons -- the sp3/N bridge and its methyl/alkyl substituents sit
+    # in branches -- so plain concatenation forms the intended aryl-aryl backbone bond
+    # (verified vs the 2,7'/3,6'-coupled dibromide), not a bond into the next unit's
+    # C9-methyl / N-methyl / alkyl carbon.
+    "polyfluorene": ("", "c1ccc2c(c1)C(C)(C)c1cc(ccc12)", ""),                     # poly(9,9-dimethylfluorene), 2,7
+    "PF_hexyl": ("", "c1ccc2c(c1)C(CCCCCC)(CCCCCC)c1cc(ccc12)", ""),              # 9,9-dihexylfluorene (alkyl), 2,7
+    "polycarbazole": ("", "c1ccc2c(c1)n(C)c1cc(ccc12)", ""),                       # poly(N-methylcarbazole), 3,6
     # Foldamers: gas-phase helices driven by intramolecular H-bonds / sterics.
     # Aib (alpha-aminoisobutyric acid) -> 3_10/alpha helix (gem-dimethyl funnel).
     # beta3-homoalanine -> 14-helix. Both verified to fold under MMFF (n>=4).
@@ -44,16 +74,15 @@ def build_smiles(pre: str, unit: str, post: str, n: int) -> str:
 
 
 def count_dihedrals(smiles: str) -> int | None:
-    """Number of rotatable dihedrals bouquet would search, or None if invalid."""
+    """Number of rotatable dihedrals bouquet would search, or None if invalid.
+
+    ``detect_dihedrals`` is a pure graph property (no conformer needed), so we skip
+    3D embedding -- embedding large fused oligomers (polyfluorene, MEH-PPV) is slow
+    enough to stall a full --nmax sweep."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    mol = Chem.AddHs(mol)
-    if AllChem.EmbedMolecule(mol, randomSeed=0xF00D) != 0:
-        # embedding failure doesn't change topology-based detection, but
-        # detect_dihedrals expects a conformer-bearing mol downstream
-        AllChem.EmbedMolecule(mol, AllChem.EmbedParameters())
-    return len(detect_dihedrals(mol))
+    return len(detect_dihedrals(Chem.AddHs(mol)))
 
 
 def main() -> None:

@@ -734,6 +734,16 @@ def main():
     # earlier to score the initial-structure candidates).
     relaxCalc = CalculatorFactory.from_config(config, for_optimizer=True, mol=mol)
 
+    # Full geometries whose RING PUCKERS should be able to enter the ensemble: the
+    # BO loop turns rotatable bonds only, so every evaluated point inherits the start
+    # structure's ring geometry -- ring conformations can only come from these
+    # initial full structures. Feed the scored ETKDG embeddings (all of them, not
+    # just the lowest-energy start we keep) plus any --conformer-file set into the
+    # harvest's tight-opt (see _perform_ensemble_relaxation). Only used in --ensemble.
+    ensemble_seed_geometries = list(candidates)
+    if initial_conformers is not None:
+        ensemble_seed_geometries += initial_conformers
+
     result = run_optimization(
         init_atoms,
         dihedrals,
@@ -749,6 +759,7 @@ def main():
         prior_module=prior_module,
         category_assignments=category_assignments,
         return_ensemble=config.ensemble,
+        ensemble_seed_geometries=ensemble_seed_geometries,
         opts=config.run,
     )
 
