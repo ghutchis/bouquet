@@ -1012,6 +1012,26 @@ def _perform_final_relaxation(
             # the E/E-E0 bookkeeping below (return, add_entry, logging) stays consistent.
             best_energy = state.observed_energies[best_idx].item() + state.start_energy
 
+    # Species guard (always on): if releasing the dihedral constraints let the
+    # geometry FORM or BREAK any bond relative to the constrained final geometry
+    # (same fold, trusted species), the released structure is a different chemical
+    # species -- proton transfer, ring closure, H2 collapse -- which xTB can place
+    # hundreds of kcal below the true conformers, so it would be recorded as a bogus
+    # global minimum (and poison any reference anchored on this trail). Revert to the
+    # constrained best. This is broader than the --retain-bonds check below (that only
+    # catches BROKEN bonds, vs the START structure, and only when requested); a
+    # formed-bond species is never a valid conformer answer, so this is unconditional.
+    if (
+        best_energy < RELAX_FAILURE_ENERGY_EV
+        and constrained_energy < RELAX_FAILURE_ENERGY_EV
+        and geometry_bond_set(best_atoms) != geometry_bond_set(constrained_atoms)
+    ):
+        logger.warning(
+            "Final unconstrained relaxation changed connectivity (formed/broke a "
+            "bond) vs the constrained geometry; reverting to the constrained best."
+        )
+        best_atoms, best_energy = constrained_atoms, constrained_energy
+
     # --retain-bonds: if releasing the dihedral constraints let the geometry
     # rearrange, keep the constrained (bond-preserving) result instead.
     if state.required_bonds is not None and bonds_broken(
@@ -1062,6 +1082,7 @@ def run_optimization(
     prior_module: DihedralPriorModule | None = None,
     category_assignments: dict | None = None,
     return_ensemble: bool = False,
+    ensemble_seed_geometries: list[Atoms] | None = None,
     opts: RunOptions | None = None,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
@@ -1270,7 +1291,10 @@ def run_optimization(
         # Select and tightly optimize the low-energy ensemble. The best member
         # is the lowest-energy conformer; fall back to single-best relaxation if
         # the ensemble comes back empty (e.g. all evaluations failed).
-        ensemble = _perform_ensemble_relaxation(state, dihedrals, calc, relaxCalc)
+        ensemble = _perform_ensemble_relaxation(
+            state, dihedrals, calc, relaxCalc,
+            extra_candidates=ensemble_seed_geometries,
+        )
         if ensemble:
             best_atoms, best_e_e0, _weight = ensemble[0]
         else:

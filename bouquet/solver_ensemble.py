@@ -185,11 +185,24 @@ def _perform_ensemble_relaxation(
     dihedrals: list[DihedralInfo],
     calc: Calculator,
     relaxCalc: Calculator,
+    extra_candidates: list[Atoms] | None = None,
 ) -> list[tuple[Atoms, float, float]]:
     """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
 
     Returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy ascending,
     where ``relative_energy_eV`` is measured against the run's start energy.
+
+    ``extra_candidates`` are full geometries (the initial ETKDG embeddings, and any
+    ``--conformer-file`` structures) tight-optimized alongside the GP-selected
+    observed points. They carry distinct RING PUCKERS -- which the BO loop can never
+    reach, since it turns rotatable bonds only and every evaluated point inherits the
+    single start structure's ring geometry -- so injecting their full geometries here
+    (not their dihedral angles, which is all the BO path keeps) is the only way those
+    ring conformations enter the ensemble. Unconstrained tight-opt keeps each in its
+    own basin; the dedup below merges any that collapse together.
+
+    TODO(longer-term): systematically enumerate ring conformers rather than relying
+    on whatever ETKDG happened to embed -- see the ensemble ring-coverage plan.
     """
     window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
     sigma_floor_eV = ENSEMBLE_SIGMA_FLOOR_KCAL * KCAL_TO_EV
@@ -203,9 +216,11 @@ def _perform_ensemble_relaxation(
         failure_energy_eV=FAILURE_ENERGY_EV,
     )
 
-    # Tight, UNCONSTRAINED optimization of each candidate (no step limit).
+    # GP-selected observed points (dihedral basins) + the seed full geometries (ring
+    # puckers). Tight, UNCONSTRAINED optimization of each (no step limit).
+    to_optimize = list(extra_candidates or []) + [atoms for _, atoms in candidates]
     optimized: list[tuple[Atoms, float]] = []
-    for k, (coords, atoms) in enumerate(candidates):
+    for k, atoms in enumerate(to_optimize):
         a = atoms.copy()
         a.set_constraint()  # remove any dihedral constraints
         energy, a = relax_structure(a, calc, relaxCalc, steps=None)
@@ -217,7 +232,7 @@ def _perform_ensemble_relaxation(
             state.add_entry(
                 np.array([d.get_angle(a) for d in dihedrals]), a, energy
             )
-        logger.info(f"Tight opt {k+1}/{len(candidates)}: E-E0 = {rel:12.6f} eV")
+        logger.info(f"Tight opt {k+1}/{len(to_optimize)}: E-E0 = {rel:12.6f} eV")
 
     if not optimized:
         return []

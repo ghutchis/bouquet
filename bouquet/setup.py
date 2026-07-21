@@ -166,7 +166,7 @@ def num_initial_embeddings(mol: Chem.Mol, cap: int) -> int:
 
 
 def get_initial_candidates(
-    smiles: str, seed: int = 42, max_confs: int = 16
+    smiles: str, seed: int = 42, max_confs: int = 32
 ) -> tuple[list[Atoms], Chem.Mol]:
     """Generate several ETKDG conformers as initial-structure candidates.
 
@@ -197,6 +197,8 @@ def get_initial_candidates(
     # ETKDG embedding (seed-dependent). EmbedMultipleConfs returns the IDs of the
     # conformers it managed to embed (may be fewer than requested).
     params = AllChem.ETKDGv3()
+    params.useSmallRingTorsions = True
+    params.useMacrocycleTorsions = True
     params.randomSeed = seed
     conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=params))
 
