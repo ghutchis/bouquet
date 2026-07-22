@@ -69,9 +69,9 @@ def main(argv=None) -> int:
     result = run_ring_mtd(mol, cfg)
     wall = time.time() - t0
 
-    from bouquet.rings.systems import perceive_ring_systems
-    systems = perceive_ring_systems(Chem.AddHs(mol))
-    write_seeds(args.out, mol, systems, result, cfg, wall_seconds=wall)
+    # Reuse the systems run_ring_mtd perceived (on its canonical ordering) so the seed file's
+    # ring indices match its coordinates; re-perceiving here from `mol` could disagree on order.
+    write_seeds(args.out, mol, result.systems, result, cfg, wall_seconds=wall)
 
     if not args.quiet:
         d = result.diagnostics

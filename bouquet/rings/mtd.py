@@ -203,7 +203,13 @@ def run_ring_mtd(mol_or_smiles, cfg: RingMTDConfig | None = None) -> HarvestResu
 
     cfg = cfg or RingMTDConfig()
     mol = Chem.MolFromSmiles(mol_or_smiles) if isinstance(mol_or_smiles, str) else mol_or_smiles
+    # Canonicalize the atom order up front: every downstream molecule -- systems (dedup_idx),
+    # the walker rebuilds, and harvest -- is (re)built from this canonical SMILES, so they all
+    # share one ordering. Without this, `systems` come from AddHs(mol) while the walkers run
+    # in AddHs(MolFromSmiles(canonical)) order, which differ for many molecules (e.g.
+    # OC1CCC(N)CC1) -- silently applying ring indices to the wrong atoms.
     smiles = Chem.MolToSmiles(mol)
+    mol = Chem.MolFromSmiles(smiles)
     molh = Chem.AddHs(mol)
     charge = Chem.GetFormalCharge(mol)
 
@@ -241,4 +247,5 @@ def run_ring_mtd(mol_or_smiles, cfg: RingMTDConfig | None = None) -> HarvestResu
         fmax=cfg.quench_fmax, steps=cfg.quench_maxsteps, topology_check=cfg.topology_check,
     )
     result.diagnostics.update(n_walkers=len(starts), n_ring_systems=len(systems))
+    result.systems = systems
     return result

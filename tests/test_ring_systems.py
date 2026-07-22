@@ -1,9 +1,8 @@
 """Tests for bouquet.rings.systems (§11.2 of RING_MTD_v2).
 
 Covers ring-system perception (fused/bridged/spiro/aromatic handling) and the
-automorphism-aware, stereo-correct ``ring_state_distance`` -- in particular the
-first-shell regression guard: methylcyclohexane's axial and equatorial chairs must NOT
-collapse to the same state.
+iRMSD-based ``ring_state_distance`` -- in particular the first-shell regression guard:
+methylcyclohexane's axial and equatorial chairs must NOT collapse to the same state.
 """
 
 from __future__ import annotations
@@ -56,8 +55,8 @@ def test_cyclohexane_one_system_six_ring_atoms():
     assert len(systems[0].ring_idx) == 6
     # dedup includes the ring hydrogens (mandatory first shell).
     assert len(systems[0].dedup_idx) > 6
-    # cyclohexane is symmetric: more than just the identity automorphism survives.
-    assert len(systems[0].automorphisms) > 1
+    # dedup carries its atomic numbers so ring_state_distance can build the iRMSD subset.
+    assert len(systems[0].dedup_numbers) == len(systems[0].dedup_idx)
 
 
 def test_decalin_fused_is_one_system():
@@ -96,28 +95,42 @@ def test_distance_self_and_rigid_motion_are_zero():
     mol = _molh("C1CCCCC1")
     sysm = perceive_ring_systems(mol)[0]
     coords = _coords(mol)
-    assert ring_state_distance(sysm, coords, coords) < 1e-6
+    # iRMSD has a ~1e-6 A numerical alignment floor; well below any real ring difference.
+    assert ring_state_distance(sysm, coords, coords) < 1e-3
     moved = coords @ np.linalg.qr(np.random.default_rng(0).standard_normal((3, 3)))[0].T
     moved += np.array([2.0, -1.0, 0.5])
-    assert ring_state_distance(sysm, coords, moved) < 1e-6
+    assert ring_state_distance(sysm, coords, moved) < 1e-3
 
 
-def test_automorphism_merges_equivalent_relabeling():
-    """Applying a graph automorphism to a conformer is a no-op for the ring-state metric.
+def test_mirror_image_embedding_merges():
+    """A conformer and its mirror image are the same ring state (reflection invariance).
 
-    This is what makes first-shell inclusion safe: symmetry-equivalent atoms (e.g.
-    cyclohexane's ring hydrogens) relabel onto each other, so the two chairs merge."""
+    Distance geometry emits achiral conformers as either mirror form; a proper-rotation
+    RMSD cannot align them and over-splits locked systems. iRMSD merges them -- the fix for
+    the trans-decalin over-counting the physics gate caught."""
     mol = _molh("C1CCCCC1")
     sysm = perceive_ring_systems(mol)[0]
     coords = _coords(mol)
-    # pick a non-identity automorphism and permute the dedup atoms by it
-    amap = next((m for m in sysm.automorphisms
-                 if list(m) != list(range(len(sysm.dedup_idx)))), None)
-    assert amap is not None, "cyclohexane should have a non-trivial automorphism"
-    permuted = coords.copy()
-    for pos_from, pos_to in enumerate(amap):
-        permuted[sysm.dedup_idx[pos_to]] = coords[sysm.dedup_idx[pos_from]]
-    assert ring_state_distance(sysm, coords, permuted) < 1e-6
+    mirror = coords.copy(); mirror[:, 0] *= -1
+    assert ring_state_distance(sysm, coords, mirror) < 1e-3
+
+
+def test_locked_ring_gives_single_state():
+    """trans-decalin is conformationally locked: its ground-state embeddings must NOT
+    over-split. (With proper-rotation RMSD they split into ~7; iRMSD merges them to 1.)"""
+    mol = Chem.AddHs(Chem.MolFromSmiles("C1CC[C@H]2CCCC[C@H]2C1"))
+    p = AllChem.ETKDGv3(); p.randomSeed = 7
+    cids = AllChem.EmbedMultipleConfs(mol, numConfs=30, params=p)
+    energies = [e for _, e in AllChem.MMFFOptimizeMoleculeConfs(mol)]
+    emin = min(energies)
+    ground = [mol.GetConformer(c).GetPositions()
+              for i, c in enumerate(cids) if energies[i] - emin < 0.5]
+    sysm = perceive_ring_systems(mol)[0]
+    reps = []
+    for cf in ground:
+        if all(ring_state_distance(sysm, cf, r) >= 0.20 for r in reps):
+            reps.append(cf)
+    assert len(reps) == 1
 
 
 def test_first_shell_detects_substituent_placement():

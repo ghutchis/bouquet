@@ -35,20 +35,28 @@ def _fake_result(molh, cids):
 
 
 def test_seed_roundtrip(tmp_path):
-    mol = Chem.MolFromSmiles("CC1CCCCC1")
-    molh = Chem.AddHs(mol)
+    # 4-aminocyclohexanol: AddHs(mol) order differs from AddHs(MolFromSmiles(canonical)),
+    # so this exercises that readback uses the STORED atom order, not the input mol's.
+    mol = Chem.MolFromSmiles("OC1CCC(N)CC1")
+    canon = Chem.AddHs(Chem.MolFromSmiles(Chem.MolToSmiles(mol)))  # the order run_ring_mtd uses
+    order_a = [a.GetAtomicNum() for a in Chem.AddHs(mol).GetAtoms()]
+    order_b = [a.GetAtomicNum() for a in canon.GetAtoms()]
+    assert order_a != order_b, "pick a molecule whose canonical AddHs order actually differs"
+
     p = AllChem.ETKDGv3(); p.randomSeed = 1
-    cids = AllChem.EmbedMultipleConfs(molh, numConfs=2, params=p)
-    AllChem.MMFFOptimizeMoleculeConfs(molh)
-    systems = perceive_ring_systems(molh)
-    result = _fake_result(molh, cids)
+    cids = AllChem.EmbedMultipleConfs(canon, numConfs=2, params=p)
+    AllChem.MMFFOptimizeMoleculeConfs(canon)
+    systems = perceive_ring_systems(canon)
+    result = _fake_result(canon, cids)          # seed coords are in canonical (order B)
 
     out = tmp_path / "seeds.json"
-    write_seeds(out, mol, systems, result, RingMTDConfig(), wall_seconds=1.2)
+    write_seeds(out, mol, systems, result, RingMTDConfig(), wall_seconds=1.2)  # pass order-A mol
 
     data = json.loads(out.read_text())
     assert data["schema_version"] == SCHEMA_VERSION
-    assert data["molecule"]["n_atoms"] == molh.GetNumAtoms()
+    assert data["molecule"]["n_atoms"] == canon.GetNumAtoms()
+    # stored atomic_numbers track the coordinate (canonical) order, NOT the input mol's order
+    assert data["molecule"]["atomic_numbers"] == order_b
     assert data["ring_systems"][0]["n_states_found"] == 2      # states 0 and 1 seen
     assert data["seeds"][0]["boltzmann_weight_298K"] == 0.7
     assert data["method"]["wall_seconds"] == 1.2
@@ -58,8 +66,9 @@ def test_seed_roundtrip(tmp_path):
     assert rs.ring_states() == [{0: 0}, {0: 1}]
     confs = rs.conformers()
     assert len(confs) == 2
-    assert len(confs[0]) == molh.GetNumAtoms()
-    # coords survive the round trip in input-atom order (bouquet indexes torsions off this)
+    assert len(confs[0]) == canon.GetNumAtoms()
+    # atom identities and coords both come back in the stored (coordinate) order
+    assert list(confs[0].get_atomic_numbers()) == order_b
     np.testing.assert_allclose(confs[0].get_positions(),
                                result.seeds[0].atoms.get_positions(), atol=1e-6)
 

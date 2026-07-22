@@ -38,7 +38,15 @@ def seeds_to_dict(mol, systems, result, config, wall_seconds: float | None = Non
     """Build the ``ring_seeds/1.0`` dictionary from a run's molecule, systems, and result."""
     from rdkit import Chem
 
-    molh = Chem.AddHs(mol)
+    # Atom identities come straight off the seed geometries -- those Atoms ARE the serialized
+    # coords, so their order matches `coords` by construction and cannot drift. Stored
+    # explicitly so readback needn't re-derive the order from the SMILES (which would couple
+    # correctness to RDKit's AddHs order being reproducible across versions/machines). With no
+    # seeds there are no coords to align to, so atom order is moot -- read a count off `mol`.
+    if result.seeds:
+        atomic_numbers = [int(z) for z in result.seeds[0].atoms.get_atomic_numbers()]
+    else:
+        atomic_numbers = [a.GetAtomicNum() for a in Chem.AddHs(mol).GetAtoms()]
     n_states = {s.id: 0 for s in systems}
     for seed in result.seeds:
         for sid, st in seed.ring_state.items():
@@ -50,7 +58,8 @@ def seeds_to_dict(mol, systems, result, config, wall_seconds: float | None = Non
             "smiles": Chem.MolToSmiles(mol),
             "inchikey": Chem.MolToInchiKey(mol),
             "charge": Chem.GetFormalCharge(mol),
-            "n_atoms": molh.GetNumAtoms(),
+            "n_atoms": len(atomic_numbers),
+            "atomic_numbers": atomic_numbers,
         },
         "method": {
             "engine": config.engine,
@@ -105,12 +114,14 @@ class RingSeeds:
         return [{int(k): v for k, v in s["ring_state"].items()} for s in self.seeds]
 
     def conformers(self):
-        """Seed geometries as ASE ``Atoms`` in input-atom order, ready for bouquet."""
-        from ase import Atoms
-        from rdkit import Chem
+        """Seed geometries as ASE ``Atoms`` in input-atom order, ready for bouquet.
 
-        molh = Chem.AddHs(Chem.MolFromSmiles(self.smiles))
-        numbers = [a.GetAtomicNum() for a in molh.GetAtoms()]
+        Atom identities come from the stored ``atomic_numbers``, which match the coordinate
+        order exactly (both are written from the same seed geometry).
+        """
+        from ase import Atoms
+
+        numbers = self.data["molecule"]["atomic_numbers"]
         return [Atoms(numbers=numbers, positions=np.array(s["coords"], dtype=float))
                 for s in self.seeds]
 

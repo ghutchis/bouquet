@@ -9,26 +9,27 @@ for each system exposes:
   The first shell is mandatory: methylcyclohexane's axial and equatorial chairs have
   identical ring-atom geometries and differ only in where the methyl points; deduplicating
   on ring atoms alone silently merges them.
-* ``automorphisms`` -- graph symmetries that map ``dedup_idx`` onto itself, as index maps
-  into ``dedup_idx``. These let the graph, not hand-coded chemistry, decide identity:
-  cyclohexane's ring hydrogens are graph-equivalent so an automorphism merges its two
-  chairs, while methylcyclohexane has none swapping methyl<->H so axial/equatorial stay
-  distinct.
 
-``ring_state_distance`` uses those automorphisms with PROPER-rotation Kabsch, so it keeps
-enantiomeric ring states apart (unlike the reflection-invariant whole-molecule iRMSD used
-for ensemble dedup elsewhere in bouquet).
+``ring_state_distance`` is the iRMSD (rotation-, permutation-, AND reflection-invariant)
+over ``dedup_idx``. Reflection invariance matters: distance geometry emits achiral
+conformers as either mirror form, and a proper-rotation RMSD cannot align a conformer to
+its own mirror image -- it over-splits locked systems (e.g. trans-decalin, which has an
+inversion centre). It is safe here because the harvest stereo filter runs BEFORE any
+dedup, so every compared structure already shares the start's stereochemistry -- no two of
+them are mirror images -- while the first-shell atoms keep axial vs equatorial distinct.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 
+from bouquet.ensemble import _HAVE_IRMSD, _rmsd
 from bouquet.rings.bias import kabsch_rotation
 
-_MAX_AUTOMORPHISMS = 1000
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class RingSystem:
     ring_idx: np.ndarray          # ring-system atom indices (into the full molecule)
     bias_idx: np.ndarray          # == ring_idx; the RMSD-bias coordinate set
     dedup_idx: np.ndarray         # ring_idx + first-shell neighbours (incl. H)
-    automorphisms: np.ndarray     # (n_auto, len(dedup_idx)) index maps INTO dedup_idx
+    dedup_numbers: np.ndarray     # atomic numbers of dedup_idx atoms (for iRMSD)
     is_spiro_member: bool
     spiro_partners: tuple[int, ...]
 
@@ -107,8 +108,6 @@ def perceive_ring_systems(mol, spiro_split: bool = True,
                 spiro_pairs[i].add(j)
                 spiro_pairs[j].add(i)
 
-    automorphisms = _molecule_automorphisms(mol)
-
     systems = []
     for sid, atomset in enumerate(kept):
         ring_idx = np.array(sorted(atomset), dtype=int)
@@ -117,43 +116,22 @@ def perceive_ring_systems(mol, spiro_split: bool = True,
             for nb in mol.GetAtomWithIdx(int(a)).GetNeighbors():
                 dedup.add(nb.GetIdx())
         dedup_idx = np.array(sorted(dedup), dtype=int)
-        auto_maps = _restrict_automorphisms(automorphisms, dedup_idx)
+        dedup_numbers = np.array(
+            [mol.GetAtomWithIdx(int(i)).GetAtomicNum() for i in dedup_idx], dtype=int)
         systems.append(RingSystem(
             id=sid, ring_idx=ring_idx, bias_idx=ring_idx.copy(), dedup_idx=dedup_idx,
-            automorphisms=auto_maps, is_spiro_member=bool(spiro_pairs[sid]),
+            dedup_numbers=dedup_numbers, is_spiro_member=bool(spiro_pairs[sid]),
             spiro_partners=tuple(sorted(spiro_pairs[sid])),
         ))
     return systems
 
 
-def _molecule_automorphisms(mol) -> list[tuple[int, ...]]:
-    """Graph automorphisms as full-molecule index permutations (ignoring 3D/chirality)."""
-    matches = mol.GetSubstructMatches(mol, uniquify=False, useChirality=False,
-                                      maxMatches=_MAX_AUTOMORPHISMS)
-    return list(matches)
-
-
-def _restrict_automorphisms(automorphisms, dedup_idx: np.ndarray) -> np.ndarray:
-    """Keep permutations that map ``dedup_idx`` onto itself; return index maps into it.
-
-    Result row ``a`` gives, for each position ``p`` in (sorted) ``dedup_idx``, the position
-    the automorphism sends it to. The identity map is always present.
-    """
-    dedup_set = {int(i) for i in dedup_idx}
-    pos = {int(a): p for p, a in enumerate(dedup_idx)}
-    maps = []
-    for perm in automorphisms:
-        if all(perm[a] in dedup_set for a in dedup_idx):
-            maps.append([pos[perm[a]] for a in dedup_idx])
-    if not maps:  # perm may not cover dedup if graph asymmetric; identity always valid
-        maps = [list(range(len(dedup_idx)))]
-    # De-duplicate identical maps (GetSubstructMatches can repeat).
-    uniq = {tuple(m) for m in maps}
-    return np.array(sorted(uniq), dtype=int)
-
-
 def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
-    """Proper-rotation Kabsch RMSD between two (n,3) sets (centered internally)."""
+    """Proper-rotation Kabsch RMSD between two (n,3) sets (centered internally).
+
+    Used for the cheap coarse pre-dedup in harvest (where over-splitting is harmless) and
+    as the iRMSD fallback when the wheel is absent.
+    """
     Pc = P - P.mean(axis=0)
     Qc = Q - Q.mean(axis=0)
     R, _ = kabsch_rotation(Pc, Qc)
@@ -163,13 +141,20 @@ def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
 
 def ring_state_distance(system: RingSystem, coords_a: np.ndarray,
                         coords_b: np.ndarray) -> float:
-    """Automorphism-minimized ring-state RMSD between two full-molecule geometries.
+    """iRMSD over the ring + first-shell atoms of two full-molecule geometries.
 
-    ``D = min over Aut  RMSD(A_dedup, pi(B_dedup))`` with proper-rotation Kabsch. Small
-    => same ring conformer (including the same axial/equatorial substituent placement);
-    large => a genuinely different ring state. Proper rotations + graph automorphisms keep
-    mirror-image (enantiomeric) ring states distinct.
+    Small => the same ring conformer (including the same axial/equatorial substituent
+    placement); large => a genuinely different ring state. Rotation/permutation/reflection
+    invariant, so two embeddings of one conformer merge even when distance geometry emitted
+    them as mirror images -- see the module docstring for why reflection invariance is safe
+    given the upstream stereo filter.
     """
-    A = coords_a[system.dedup_idx]
-    B = coords_b[system.dedup_idx]
-    return min(_kabsch_rmsd(A, B[amap]) for amap in system.automorphisms)
+    idx = system.dedup_idx
+    if _HAVE_IRMSD:
+        from ase import Atoms
+        a = Atoms(numbers=system.dedup_numbers, positions=coords_a[idx])
+        b = Atoms(numbers=system.dedup_numbers, positions=coords_b[idx])
+        return _rmsd(a, b)  # reuse ensemble's iRMSD wrapper (same backend used elsewhere)
+    logger.warning("irmsd unavailable; ring_state_distance falls back to proper-rotation "
+                   "Kabsch, which over-splits mirror-image embeddings")
+    return _kabsch_rmsd(coords_a[idx], coords_b[idx])

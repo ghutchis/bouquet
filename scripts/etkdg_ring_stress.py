@@ -124,6 +124,10 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
+    for name, val in (("--n-confs", args.n_confs), ("--gfn2-cap", args.gfn2_cap),
+                      ("--workers", args.workers), ("--ring-rmsd", args.ring_rmsd)):
+        if val <= 0:
+            ap.error(f"{name} must be positive, got {val}")
 
     import pandas as pd
     man = pd.read_csv(args.manifest).set_index("mol_id")

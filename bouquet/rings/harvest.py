@@ -16,6 +16,7 @@ from 3D and require every harvested state to match it.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,6 +25,8 @@ from ase import Atoms
 from bouquet.ensemble import _boltzmann_weights
 from bouquet.rings.systems import RingSystem, _kabsch_rmsd, ring_state_distance
 from bouquet.setup import connectivity_changed
+
+logger = logging.getLogger(__name__)
 
 KCAL_TO_EV = 0.0433641153
 StereoSignature = tuple  # (atom_idx -> "R"/"S", (i, j) -> "E"/"Z"), both dicts
@@ -93,6 +96,7 @@ def quench(atoms: Atoms, calc, fmax: float = 0.02, steps: int = 300):
         LBFGS(a, logfile=None).run(fmax=fmax, steps=steps)
         energy = float(a.get_potential_energy())
     except Exception:
+        logger.debug("quench failed; dropping snapshot", exc_info=True)
         return None
     return a, energy
 
@@ -116,6 +120,7 @@ class RingStateSeed:
 class HarvestResult:
     seeds: list[RingStateSeed]
     diagnostics: dict = field(default_factory=dict)
+    systems: list[RingSystem] = field(default_factory=list)  # perceived on the run's ordering
 
 
 def _ring_union(systems: list[RingSystem]) -> np.ndarray:
@@ -126,7 +131,7 @@ def cluster_ring_states(entries, systems: list[RingSystem], tol: float):
     """Group ``(atoms, energy)`` entries into distinct ring states, labelled per system.
 
     Two entries share a ring state iff, for EVERY ring system, their geometries are within
-    ``tol`` by :func:`ring_state_distance` (automorphism-minimized, stereo-correct). Each
+    ``tol`` by :func:`ring_state_distance` (iRMSD over ring + first shell). Each
     system gets its own greedy state-id list, so a seed's ``ring_state`` is
     ``{system_id: state_id}`` and the overall state is the tuple of those -- which is what
     lets a later categorical GP transfer torsion info across states.
