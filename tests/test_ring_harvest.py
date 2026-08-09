@@ -15,10 +15,10 @@ from rdkit import Chem  # noqa: E402
 from rdkit.Chem import AllChem  # noqa: E402
 
 from bouquet.rings.harvest import (  # noqa: E402
-    cluster_ring_states, rank_and_window, stereo_retained, stereo_signature,
-    topology_retained,
+    cluster_ring_states, coarse_prefilter, harvest, rank_and_window, stereo_retained,
+    stereo_signature, topology_retained,
 )
-from bouquet.rings.systems import perceive_ring_systems  # noqa: E402
+from bouquet.rings.systems import _kabsch_rmsd, perceive_ring_systems  # noqa: E402
 from bouquet.setup import mol_to_ase_atoms  # noqa: E402
 
 
@@ -119,3 +119,55 @@ def test_cluster_ring_states_labels_and_ranks():
     assert seeds
     assert seeds[0].rel_energy_kcal == pytest.approx(0.0, abs=1e-9)  # sorted, min first
     assert abs(sum(s.weight for s in seeds) - 1.0) < 1e-9            # Boltzmann normalised
+
+
+
+# --- coarse pre-dedup: tolerance is correctness, budget is cost -------------------
+
+def test_coarse_tol_stays_below_fine_tol():
+    """The pre-filter may only discard what the classifier would certainly merge.
+
+    Its metric (ring heavy atoms, proper-Kabsch) is strictly weaker than the classifier's
+    (ring + first shell incl. H, iRMSD), so an inverted pair silently destroys ring states
+    before they are classified. Regression for RING_MTD_BENCH §9.7: at the old 0.5 vs
+    0.20 A the 5-ring molecules harvested ONE state from 404 frames.
+    """
+    from inspect import signature
+    from bouquet.rings.mtd import RingMTDConfig
+
+    cfg = RingMTDConfig()
+    assert cfg.coarse_dedup_A < cfg.fine_dedup_A
+    p = signature(harvest).parameters
+    assert p["coarse_tol"].default < p["fine_tol"].default
+
+
+def test_coarse_prefilter_tolerance_separates_close_frames():
+    """A tolerance below the separation must keep both frames; above it, merge them."""
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(6, 3))
+    b = a.copy()
+    b[0] += 0.30                       # one atom displaced -> ~0.12 A ring RMSD
+    ring_idx = np.arange(6)
+    sep = _kabsch_rmsd(a[ring_idx], b[ring_idx])
+    assert len(coarse_prefilter([a, b], ring_idx, coarse_tol=sep * 0.5)) == 2
+    assert len(coarse_prefilter([a, b], ring_idx, coarse_tol=sep * 2.0)) == 1
+
+
+def test_coarse_prefilter_budget_keeps_the_spread_not_a_prefix():
+    """max_coarse must farthest-point sample, so the extremes survive the budget."""
+    rng = np.random.default_rng(0)
+    base = rng.normal(size=(6, 3))
+    ring_idx = np.arange(6)
+    # 20 near-duplicates followed by two far-apart outliers: a prefix cut keeps only
+    # near-duplicates, farthest-point sampling has to keep the outliers.
+    frames = [base + 1e-3 * rng.normal(size=(6, 3)) for _ in range(20)]
+    frames += [base * 4.0, base * -4.0]
+    kept = coarse_prefilter(frames, ring_idx, coarse_tol=1e-9, max_coarse=4)
+    assert len(kept) == 4
+    spread = max(_kabsch_rmsd(x[ring_idx], y[ring_idx]) for x in kept for y in kept)
+    allspread = max(_kabsch_rmsd(x[ring_idx], y[ring_idx]) for x in frames for y in frames)
+    prefix = coarse_prefilter(frames, ring_idx, coarse_tol=1e-9)[:4]
+    prefix_spread = max(_kabsch_rmsd(x[ring_idx], y[ring_idx]) for x in prefix for y in prefix)
+    # Farthest-point keeps essentially the whole spread; a prefix cut keeps ~none of it.
+    assert spread > 0.9 * allspread, "budget dropped the extremes"
+    assert prefix_spread < 0.01 * allspread, "test setup no longer discriminates"

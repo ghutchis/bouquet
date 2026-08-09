@@ -13,7 +13,7 @@ import argparse
 import sys
 import time
 
-from bouquet.rings.mtd import RingMTDConfig, run_ring_mtd
+from bouquet.rings.mtd import RingMTDConfig, RingMTDError, run_ring_mtd
 from bouquet.rings.seeds import write_seeds
 
 
@@ -66,7 +66,14 @@ def main(argv=None) -> int:
         return 2
 
     t0 = time.time()
-    result = run_ring_mtd(mol, cfg)
+    try:
+        result = run_ring_mtd(mol, cfg)
+    except RingMTDError as e:
+        # No seed file: an empty one is indistinguishable downstream from "this molecule
+        # needs no ring seeding", which is exactly how a 100%-stereo-reject run used to
+        # read as a success.
+        print(f"error: {e}", file=sys.stderr)
+        return 3
     wall = time.time() - t0
 
     # Reuse the systems run_ring_mtd perceived (on its canonical ordering) so the seed file's
@@ -79,9 +86,12 @@ def main(argv=None) -> int:
             print(f"{args.smiles}: gate declined ({d['skipped']}); wrote empty seed set -> {args.out}")
         else:
             alarm = " [STEREO-REJECT ALARM: k_hill too high]" if d.get("stereo_reject_alarm") else ""
+            rounds = d.get("bias_rounds") or []
+            adapted = (f", k_hill {d.get('k_hill_final')} after {len(rounds)} round(s) "
+                       f"[{' -> '.join(r['verdict'] for r in rounds)}]") if len(rounds) > 1 else ""
             print(f"{args.smiles}: {len(result.seeds)} ring-state seed(s) from "
                   f"{d.get('n_walkers')} walker(s), {d.get('n_clusters')} clusters, "
-                  f"{wall:.1f}s -> {args.out}{alarm}")
+                  f"{wall:.1f}s{adapted} -> {args.out}{alarm}")
     return 0
 
 

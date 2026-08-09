@@ -192,27 +192,65 @@ def rank_and_window(clusters, temperature: float, energy_window_kcal: float
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+def coarse_prefilter(frames, ring_idx, coarse_tol: float, max_coarse: int = 0):
+    """Cheap ring-atom pre-dedup of raw MD frames, so quench never sees near-duplicates.
+
+    Two independent controls, for two different jobs:
+
+    ``coarse_tol`` is CORRECTNESS. This filter must only discard frames that
+    :func:`cluster_ring_states` would certainly merge, and its metric is strictly weaker
+    than that classifier's -- proper-Kabsch over ring HEAVY atoms here, versus iRMSD over
+    ring + first shell INCLUDING H there. It therefore systematically understates the
+    distance that actually decides a ring state, and the gap widens as the ring shrinks: a
+    5-ring's envelope and twist forms barely move the heavy atoms while their substituents
+    swing right through axial/equatorial. Measured on m009_d01, whose frames sit a median
+    0.466 A apart *by the classifier*, a 0.5 A tolerance here kept 2 of 404 -- so the
+    molecule harvested ONE ring state and the metadynamics looked like it had failed
+    (RING_MTD_BENCH §9.7). Keep ``coarse_tol`` well below ``fine_tol``, never above it.
+
+    ``max_coarse`` is COST. A tolerance tight enough to be safe leaves hundreds of frames on
+    a floppy molecule and quench is the dominant expense (Stage-0 molecules ran up to 50
+    min). Farthest-point sampling then keeps the most geometrically spread frames, which is
+    what the classifier needs, rather than an arbitrary prefix. 0 disables the budget.
+    """
+    coarse: list[np.ndarray] = []
+    for pos in frames:
+        if all(_kabsch_rmsd(pos[ring_idx], c[ring_idx]) >= coarse_tol for c in coarse):
+            coarse.append(pos)
+
+    if not max_coarse or len(coarse) <= max_coarse:
+        return coarse
+
+    picked = [coarse[0]]
+    dist = [_kabsch_rmsd(p[ring_idx], coarse[0][ring_idx]) for p in coarse]
+    while len(picked) < max_coarse:
+        i = int(np.argmax(dist))
+        picked.append(coarse[i])
+        dist = [min(d, _kabsch_rmsd(p[ring_idx], coarse[i][ring_idx]))
+                for d, p in zip(dist, coarse)]
+    return picked
+
+
 def harvest(frames, ref_mol, systems: list[RingSystem], calc, *,
             start_signature: StereoSignature,
-            coarse_tol: float = 0.5, fine_tol: float = 0.20,
+            coarse_tol: float = 0.10, fine_tol: float = 0.20, max_coarse: int = 180,
             temperature: float = 298.15, energy_window_kcal: float = 12.0,
             fmax: float = 0.02, steps: int = 300, conn_tol: float = 1.3,
             topology_check: bool = False) -> HarvestResult:
     """Frames -> ranked ring-state seeds.
 
-    Steps: coarse ring-RMSD dedup of raw frames (cheap, cuts the quench count roughly in
-    half) -> quench -> stereo filter (always) + topology filter (``topology_check``, needed
-    only for bond-breaking engines) -> per-system ring-state clustering at ``fine_tol`` ->
-    rank within ``energy_window_kcal``. ``start_signature`` is the walker start's
-    :func:`stereo_signature`; a reject rate >5% means the bias (``k_hill``) is too strong.
+    Steps: coarse ring-RMSD dedup of raw frames (cheap; ``coarse_tol`` for correctness,
+    ``max_coarse`` farthest-point frames for cost) -> quench -> stereo filter (always) +
+    topology filter (``topology_check``, needed only for bond-breaking engines) -> per-system
+    ring-state clustering at ``fine_tol`` -> rank within ``energy_window_kcal``.
+    ``start_signature`` is the walker start's :func:`stereo_signature`; a reject rate >5%
+    means the bias (``k_hill``) is too strong.
+
+    ``coarse_tol`` must stay below ``fine_tol`` -- see the comment on the pre-dedup below;
+    an inverted pair silently destroys ring states before they are ever classified.
     """
     ring_idx = _ring_union(systems)
-
-    # Coarse pre-dedup on ring atoms (fast proper-Kabsch) so we don't quench near-duplicates.
-    coarse: list[np.ndarray] = []
-    for pos in frames:
-        if all(_kabsch_rmsd(pos[ring_idx], c[ring_idx]) >= coarse_tol for c in coarse):
-            coarse.append(pos)
+    coarse = coarse_prefilter(frames, ring_idx, coarse_tol, max_coarse)
 
     n_stereo_rej = n_topo_rej = n_quench_fail = 0
     survivors = []
@@ -239,6 +277,7 @@ def harvest(frames, ref_mol, systems: list[RingSystem], calc, *,
     diagnostics = {
         "n_frames_raw": n_frames,
         "n_after_coarse_dedup": len(coarse),
+        "coarse_tol": coarse_tol,
         "n_quench_failed": n_quench_fail,
         "n_stereo_rejects": n_stereo_rej,
         "n_topology_rejects": n_topo_rej,

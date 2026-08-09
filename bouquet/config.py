@@ -24,13 +24,32 @@ DEFAULT_RELAXATION_STEPS = 10
 DEFAULT_FMAX = 5e-2
 TIGHT_FMAX = 1e-3
 
-# Auto-scaling thresholds for optimization steps based on dihedral count
-AUTO_STEPS_THRESHOLDS = {
-    3: 25,  # <= 3 dihedrals
-    5: 50,  # <= 5 dihedrals
-    7: 100,  # <= 7 dihedrals
-}
-AUTO_STEPS_DEFAULT = 200  # > 7 dihedrals
+# Auto-scaling of the --auto evaluation budget with dihedral count d. Calibrated as
+# n*_95 -- the budget at which 95% of BO-reachable (acyclic/aromatic) molecules reach
+# their CREST global minimum -- on the merged stopbench+autosteps benchmark, fit over the
+# well-sampled d2-7 range and extrapolated with a floor and a cap:
+#
+#     auto_total(d) = min(AUTO_STEPS_CAP, max(AUTO_STEPS_FLOOR,
+#                         round(AUTO_STEPS_COEF * d**AUTO_STEPS_POWER)))
+#
+# d=1 carries a fixed init/search overhead (the floor) a through-origin power law can't
+# capture; the cap reflects the high-d regime where collective/low-mode moves and
+# flexible-ring sampling take over from torsion-space BO. Ring-conformer blind spots are
+# excluded from the fit -- they are a sampling problem, not a budget one. See
+# scripts/nstar_merged.sh and the nstar_strip_clean_floor analysis for the derivation.
+AUTO_STEPS_FLOOR = 7        # d<=1 budget (fixed overhead)
+AUTO_STEPS_COEF = 1.95      # n* ~ coef * d**power
+AUTO_STEPS_POWER = 3.0
+AUTO_STEPS_CAP = 2000       # high-d ceiling (binds ~d>=10)
+
+
+def auto_total_budget(num_dihedrals: int) -> int:
+    """The --auto total evaluation budget (initial guesses + BO steps) for a molecule
+    with ``num_dihedrals`` rotatable dihedrals: the calibrated n*_95 power law with a
+    d=1 floor and a high-d cap."""
+    d = max(0, num_dihedrals)
+    return int(min(AUTO_STEPS_CAP,
+                   max(AUTO_STEPS_FLOOR, round(AUTO_STEPS_COEF * d ** AUTO_STEPS_POWER))))
 
 # Default confidence-multiplier grid for the stopping-rule certificate lower bound
 # (mu - beta*sigma). Logged per step (one lb_b<beta> column each) so the offline
@@ -380,6 +399,11 @@ class Configuration:
     smiles: Optional[str] = None
     input_file: Optional[Path] = None
     conformer_file: Optional[Path] = None
+    # One BO runs per conformer taken from conformer_file, so this cap IS the search budget
+    # (0 = take them all). A ring-seed .json is cut with max_conformer_rule; other formats,
+    # having no ranking to select on, are truncated.
+    max_conformers: int = 0
+    max_conformer_rule: str = "energy"
 
     # Output name
     name: Optional[str] = None
@@ -459,14 +483,10 @@ class Configuration:
             num_dihedrals: Number of dihedral angles detected
 
         Returns:
-            The tiered total evaluation budget for this dihedral count.
+            The calibrated n*_95 budget for this dihedral count (see
+            :func:`auto_total_budget`).
         """
-        total = AUTO_STEPS_DEFAULT
-        for threshold, steps in sorted(AUTO_STEPS_THRESHOLDS.items()):
-            if num_dihedrals <= threshold:
-                total = steps
-                break
-        return total
+        return auto_total_budget(num_dihedrals)
 
     def compute_auto_steps(self, num_dihedrals: int, num_initial: int) -> int:
         """Compute the number of optimization steps based on dihedral count.

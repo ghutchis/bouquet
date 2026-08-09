@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from bouquet.rings.bias import RMSDBias, kabsch_rotation, rmsd_sq_and_grad
 from bouquet.rings.harvest import HarvestResult, RingStateSeed, harvest
-from bouquet.rings.mtd import RingMTDConfig, run_ring_mtd, should_run
+from bouquet.rings.mtd import RingMTDConfig, RingMTDError, run_ring_mtd, should_run
 from bouquet.rings.seeds import RingSeeds, read_seeds, write_seeds
 from bouquet.rings.systems import (
     RingSystem,
@@ -37,6 +37,7 @@ __all__ = [
     "RingStateSeed",
     "run_ring_mtd",
     "RingMTDConfig",
+    "RingMTDError",
     "should_run",
     "read_seeds",
     "write_seeds",

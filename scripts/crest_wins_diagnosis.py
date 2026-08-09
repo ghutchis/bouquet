@@ -273,16 +273,35 @@ def diagnose(task: dict) -> dict:
                 out["note"] = "no CREST minimum survived"; return out
             crest_min, _crest_e = min(crest_opt, key=lambda t: t[1])
 
-        # -- bouquet's best: relax the trail 'final' frame(s), take the min --------
-        # A 'final' frame marks a COMPLETED run (bouquet's final unconstrained
-        # relaxation). Right-censored runs (killed by the wall clock before finishing,
-        # common at high d) have none; those are pre-filtered out in the driver so we
-        # never compare against an unfinished search.
+        # -- bouquet's best: relax the trail's best frame(s), take the min ---------
+        # A 'final' frame marks a COMPLETED run (bouquet's final unconstrained relaxation).
+        # Right-censored runs -- killed by the wall clock -- have none, and at d>=8 that is
+        # EVERY run (measured: 100% of d>=8 trials stopped exactly at the 35 h timeout, at
+        # 22-60% of their step ceiling), which left 55 of 82 CREST wins unclassified.
+        #
+        # Excluding them is over-strict for this diagnostic. What it decides -- ring miss vs
+        # dihedral miss -- rests on the OPERATIONAL test, which dials ETKDG embeddings to the
+        # CREST minimum and never consults the BO's endpoint. The BO best is used only for
+        # the reported dih_*/bo_best_* columns. A censored run's last 'improvement' frame is
+        # its best-so-far, a valid lower bound on what the search found, so it serves that
+        # role; the row is flagged `bo_censored` so a truncated best is never mistaken for a
+        # converged one.
         finals = [a for tp in task["trail_files"]
                   for a, _e, k in ref._read_trail(tp) if k == "final"]
+        censored = not finals
+        if censored:
+            # Best-so-far per trail: trails are written in improvement order, so the last
+            # improvement frame of each is that seed's best.
+            for tp in task["trail_files"]:
+                improvements = [a for a, _e, k in ref._read_trail(tp)
+                                if k in ("improvement", "init_best")]
+                if improvements:
+                    finals.append(improvements[-1])
+        out["bo_censored"] = censored
         bo_opt = _relax_pool(stamp(finals), calc, molh, conn_tol)
         if not bo_opt:
-            out["note"] = "run incomplete (no final frame) / relaxation failed"; return out
+            out["note"] = "no usable bouquet frame (no final or improvement) / relaxation failed"
+            return out
         bo_best, _bo_e = min(bo_opt, key=lambda t: t[1])
 
         # -- rotatable-dihedral difference bouquet-best vs CREST-min ---------------
@@ -457,6 +476,13 @@ def main() -> None:
                     help="expanded-capability probe: ETKDG seeds 1..N (default 5)")
     ap.add_argument("--cap-confs", type=int, default=16,
                     help="max ETKDG embeddings per seed (default 16, = production cap)")
+    ap.add_argument("--no-allow-censored", dest="allow_censored", action="store_false",
+                    help="require a completed run ('final' frame). OFF by default: at d>=8 "
+                         "every benchmark run is wall-censored, and excluding them left 55 "
+                         "of 82 CREST wins undiagnosed. The classification rests on the "
+                         "operational test over ETKDG embeddings, not on the BO endpoint, so "
+                         "a censored run's best-so-far serves fine -- rows are flagged "
+                         "bo_censored so a truncated best is never read as converged.")
     ap.add_argument("--crest-max", type=int, default=60,
                     help="cap on CREST cell minima to re-optimize per molecule")
     ap.add_argument("--no-operational", dest="operational", action="store_false",
@@ -489,14 +515,22 @@ def main() -> None:
     want = set(args.mols.split(",")) if args.mols else None
 
     def _run_completed(trail_paths) -> bool:
-        """A completed bouquet run wrote a 'final' frame (its final unconstrained
-        relaxation). Censored/killed runs (common at high d, not yet finished) have
-        none -- exclude them so we never diagnose an unfinished search."""
+        """Does this molecule have a trail we can diagnose from?
+
+        A completed run wrote a 'final' frame. With ``--allow-censored`` (default) a
+        right-censored run also qualifies on its last 'improvement' frame -- at d>=8 every
+        run is censored, so requiring 'final' silently drops the entire high-d band, which
+        is exactly where the ring question is most interesting. See the note in diagnose().
+        """
         for tp in trail_paths:
             try:
                 with open(tp) as fh:
-                    if any("kind=final" in ln for ln in fh):
-                        return True
+                    text = fh.read()
+                if "kind=final" in text:
+                    return True
+                if args.allow_censored and ("kind=improvement" in text
+                                            or "kind=init_best" in text):
+                    return True
             except OSError:
                 pass
         return False
@@ -569,7 +603,7 @@ def main() -> None:
     if args.operational:
         cols += ["op_start_ok", "op_start_irmsd_min", "op_seed_pool_hit",
                  "op_seed_pool_irmsd", "op_capability_hit", "op_capability_irmsd"]
-    cols += ["dih_max_deg", "dih_mean_deg", "note"]
+    cols += ["dih_max_deg", "dih_mean_deg", "bo_censored", "note"]
     rows = []
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         for r in ex.map(diagnose, tasks):

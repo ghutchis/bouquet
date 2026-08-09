@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bouquet.config import AUTO_STEPS_DEFAULT, AUTO_STEPS_THRESHOLDS  # noqa: E402
+from bouquet.config import auto_total_budget  # noqa: E402
 
 KCAL = 23.060541945  # eV -> kcal/mol
 RHOS = (0.90, 0.95, 0.99)
@@ -178,11 +178,58 @@ def _reopt_curve_worker(task: dict):
     return out
 
 
+def _reopt_curves_for(df: pd.DataFrame, args) -> pd.DataFrame:
+    """Re-optimize trajectory geometries for the (name, seed) trials present in ``df``
+    and return their curves (name, seed, d, n_calls, e_abs). Trials whose molecule lacks
+    a manifest row or a reference E* are skipped (they cannot be scored). Prints a
+    progress line at ~5% increments with a running ETA."""
+    from concurrent.futures import ProcessPoolExecutor
+    import time
+
+    man = pd.read_csv(args.manifest).set_index("mol_id")
+    ref_abs = load_reference_abs(args.reference)
+    tasks = []
+    for (name, seed), _g in df.groupby(["name", "seed"]):
+        if name not in man.index or name not in ref_abs:
+            continue
+        tasks.append({
+            "name": name, "seed": int(seed), "d": int(_g["d"].iloc[0]),
+            "config": _g["config"].iloc[0], "smiles": man.loc[name, "raw_smiles"],
+            "geom_dir": str(args.geom_dir), "method": args.reopt_method,
+            "conn_tol": args.conn_tol,
+        })
+    cols = ["name", "seed", "d", "n_calls", "e_abs"]
+    ntask = len(tasks)
+    if ntask == 0:
+        return pd.DataFrame(columns=cols)
+    print(f"Re-optimizing trajectory geometries for {ntask} trials "
+          f"({args.reopt_method}, {args.workers} workers)...", flush=True)
+    rows = []
+    t0 = time.time()
+    step = max(1, ntask // 20)              # ~5% increments (log-friendly, no \r)
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        for i, o in enumerate(ex.map(_reopt_curve_worker, tasks), 1):
+            for n_calls, e_abs in o["curve"]:
+                rows.append({"name": o["name"], "seed": o["seed"], "d": o["d"],
+                             "n_calls": n_calls, "e_abs": e_abs})
+            if i % step == 0 or i == ntask:
+                el = time.time() - t0
+                eta = el / i * (ntask - i)
+                print(f"  reopt {i}/{ntask} ({100*i//ntask}%)  "
+                      f"elapsed {el:.0f}s  eta ~{eta:.0f}s", flush=True)
+    return pd.DataFrame(rows, columns=cols)
+
+
 def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
     """Energy-criterion events using UNCONSTRAINED re-optimized trajectory geometries
     (the ``--reopt`` path). Same schema as :func:`build_events`, but the hitting time is
     the first n_calls at which the running-min *unconstrained* energy comes within eps of
-    the absolute reference E*. Requires --manifest (SMILES) and --geom-dir."""
+    the absolute reference E*. Requires --manifest (SMILES) and --geom-dir.
+
+    Caching (``--reopt-cache``): three modes. ``--reopt-refresh`` recomputes everything.
+    ``--reopt-incremental`` reuses the cache and computes only the (name, seed) trials
+    missing from it, appending them (ideal as the benchmark grows). The default reuses
+    the cache and DROPS any trial missing from it (fast, for a frozen cache)."""
     from concurrent.futures import ProcessPoolExecutor
 
     # All three inputs are consumed below (reference even on the cache path, via
@@ -198,38 +245,35 @@ def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
                  "(--manifest SMILES, --geom-dir trajectories, --reference with E_start_eV)")
 
     cache = out_cache = getattr(args, "reopt_cache", None)
-    if cache and Path(cache).exists() and not getattr(args, "reopt_refresh", False):
-        print(f"Reusing cached reopt curves: {cache}")
-        curves = pd.read_csv(cache)
+    refresh = getattr(args, "reopt_refresh", False)
+    incremental = getattr(args, "reopt_incremental", False)
+
+    if cache and Path(cache).exists() and not refresh:
+        cached = pd.read_csv(cache)
         df_pairs = set(zip(df["name"].astype(str), df["seed"].astype(int)))
-        cache_pairs = set(zip(curves["name"].astype(str), curves["seed"].astype(int)))
+        cache_pairs = set(zip(cached["name"].astype(str), cached["seed"].astype(int)))
         missing = df_pairs - cache_pairs
-        if missing:
-            print(f"WARNING: {len(missing)} current trial(s) from {args.cert} are "
-                  f"missing from cached reopt curves {cache} and will be dropped; "
-                  f"re-run with --reopt-refresh to rebuild the cache.")
+        if incremental and missing:
+            # Compute ONLY the trials absent from the cache, then append them.
+            key = list(zip(df["name"].astype(str), df["seed"].astype(int)))
+            miss_df = df[pd.Series([k in missing for k in key], index=df.index)]
+            print(f"Incremental reopt: {len(cache_pairs)} trial(s) reused from cache, "
+                  f"{len(missing)} new to compute.", flush=True)
+            new = _reopt_curves_for(miss_df, args)
+            curves = pd.concat([cached, new], ignore_index=True)
+            if out_cache:
+                curves.to_csv(out_cache, index=False)
+                print(f"updated reopt cache -> {out_cache} ({len(curves)} rows)")
+        else:
+            print(f"Reusing cached reopt curves: {cache}")
+            curves = cached
+            if missing:
+                print(f"WARNING: {len(missing)} current trial(s) from {args.cert} are "
+                      f"missing from cached reopt curves {cache} and will be dropped; "
+                      f"re-run with --reopt-incremental (compute+append the new trials) "
+                      f"or --reopt-refresh (rebuild from scratch).")
     else:
-        man = pd.read_csv(args.manifest).set_index("mol_id")
-        ref_abs = load_reference_abs(args.reference)
-        tasks = []
-        for (name, seed), _g in df.groupby(["name", "seed"]):
-            if name not in man.index or name not in ref_abs:
-                continue
-            tasks.append({
-                "name": name, "seed": int(seed), "d": int(_g["d"].iloc[0]),
-                "config": _g["config"].iloc[0], "smiles": man.loc[name, "raw_smiles"],
-                "geom_dir": str(args.geom_dir), "method": args.reopt_method,
-                "conn_tol": args.conn_tol,
-            })
-        print(f"Re-optimizing trajectory geometries for {len(tasks)} trials "
-              f"({args.reopt_method}, {args.workers} workers)...")
-        rows = []
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            for o in ex.map(_reopt_curve_worker, tasks):
-                for n_calls, e_abs in o["curve"]:
-                    rows.append({"name": o["name"], "seed": o["seed"], "d": o["d"],
-                                 "n_calls": n_calls, "e_abs": e_abs})
-        curves = pd.DataFrame(rows)
+        curves = _reopt_curves_for(df, args)
         if out_cache:
             curves.to_csv(out_cache, index=False)
             print(f"wrote reopt curves -> {out_cache}")
@@ -314,11 +358,9 @@ def build_events(df: pd.DataFrame, eps: float) -> pd.DataFrame:
 
 
 def auto_total(d: int) -> int:
-    """Current --auto total evaluation budget for dihedral count d (baseline)."""
-    for thr, steps in sorted(AUTO_STEPS_THRESHOLDS.items()):
-        if d <= thr:
-            return steps
-    return AUTO_STEPS_DEFAULT
+    """Current --auto total evaluation budget for dihedral count d (baseline). Delegates
+    to bouquet.config so this baseline always tracks the shipped AUTO_STEPS formula."""
+    return auto_total_budget(d)
 
 
 def _first_true(mask: np.ndarray):
@@ -1076,6 +1118,10 @@ def main():
                    "the expensive xTB replay runs once (default <out-dir>/reopt_curves.csv)")
     p.add_argument("--reopt-refresh", action="store_true",
                    help="Ignore any --reopt-cache and re-run the re-optimization")
+    p.add_argument("--reopt-incremental", action="store_true",
+                   help="Reuse --reopt-cache and compute ONLY the (name,seed) trials "
+                   "missing from it, appending them to the cache. Ideal for re-runs as "
+                   "the benchmark grows (pays only for new molecules).")
     p.add_argument("--workers", "-w", type=int, default=8,
                    help="Parallel workers for the --reopt re-optimization (default 8)")
     p.add_argument("--conn-tol", type=float, default=1.3,

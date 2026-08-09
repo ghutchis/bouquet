@@ -113,17 +113,47 @@ class RingSeeds:
         """Per-seed ``{ring_system_id: state_id}`` (JSON string keys cast back to int)."""
         return [{int(k): v for k, v in s["ring_state"].items()} for s in self.seeds]
 
+    @property
+    def ring_idx(self) -> list[int]:
+        """Union of every ring system's atom indices (the geometric selection rules' subset)."""
+        return sorted({i for s in self.data["ring_systems"] for i in s["ring_idx"]})
+
     def conformers(self):
-        """Seed geometries as ASE ``Atoms`` in input-atom order, ready for bouquet.
+        """ALL seed geometries as ASE ``Atoms`` in input-atom order, energy-ranked.
 
         Atom identities come from the stored ``atomic_numbers``, which match the coordinate
         order exactly (both are written from the same seed geometry).
+
+        This deliberately returns the whole set: the file is the complete record, so any
+        selection rule stays scorable against it offline (`scripts/ring_seed_selection.py`).
+        Callers that must respect a BO budget want :meth:`select`.
         """
         from ase import Atoms
 
         numbers = self.data["molecule"]["atomic_numbers"]
         return [Atoms(numbers=numbers, positions=np.array(s["coords"], dtype=float))
                 for s in self.seeds]
+
+    def select(self, k: int, rule: str = "energy"):
+        """The ``k`` seed geometries to actually start a BO from, in selection order.
+
+        Bouquet runs one BO per seed handed to it, and the metadynamics returns the product
+        of per-ring-system states -- up to ~100 seeds -- so the set has to be cut.
+
+        The default is plain energy rank, and that is an empirical result, not an oversight.
+        On the 166-molecule Stage-1 population the hit-carrying seed is the LOWEST-energy one
+        far more often than not (median energy rank 0; 77 of 81 hits inside a k=8 energy
+        prefix), so the geometry-aware rules displace good seeds and lose ground: `hybrid`
+        keeps 74/81 and `geometry` 73/81 where `energy` keeps 77/81. The opposite conclusion
+        from the Stage-0 hard core (RING_MTD_BENCH §9.10) did not generalize -- that subset
+        was selected for the very pathology that puts hits at deep energy ranks. See §9.12
+        and :func:`bouquet.rings.select.select_seeds`.
+        """
+        from bouquet.rings.select import select_seeds
+
+        all_confs = self.conformers()
+        idx = select_seeds(self.seeds, k, rule, self.ring_idx)
+        return [all_confs[i] for i in idx]
 
 
 def read_seeds(path) -> RingSeeds:

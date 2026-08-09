@@ -358,12 +358,19 @@ def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:
     return atoms, mol
 
 
-def get_conformers_from_file(filename: str) -> list[Atoms]:
+def get_conformers_from_file(
+    filename: str, max_conformers: int = 0, select_rule: str = "energy"
+) -> list[Atoms]:
     """Read multiple conformers from a file.
 
     Args:
         filename: Path to a file containing multiple structures
                   (e.g., multi-frame XYZ or multi-molecule SDF)
+        max_conformers: Cap on how many conformers to return (0 = all). Only the
+                  ring-seed ``.json`` format selects intelligently under a cap -- the
+                  other formats have no ranking to select on and are simply truncated.
+        select_rule: Selection rule for ring-seed files under ``max_conformers``; see
+                  :func:`bouquet.rings.select.select_seeds`.
 
     Returns:
         List of Atoms objects, one for each conformer
@@ -402,8 +409,42 @@ def get_conformers_from_file(filename: str) -> list[Atoms]:
         atoms, _ = get_initial_structure_from_file(filename)
         conformers = [atoms]
 
+    elif ext == ".json":
+        # Ring-MTD seed file (ring_seeds schema). The seed geometries are in
+        # AddHs(MolFromSmiles(smiles)) order -- the same order bouquet builds its molecule in
+        # -- so they line up atom-for-atom. Charge/spin are (re)stamped by the caller,
+        # matching the other branches.
+        #
+        # CAUTION: conformers loaded here do NOT carry their ring pucker into the search.
+        # `solver._evaluate_point` reads each conformer's DIHEDRAL ANGLES and applies them to
+        # the single `state.start_atoms` geometry, so only torsions transfer; the geometries
+        # themselves reach `ensemble_seed_geometries`, which feeds the returned ensemble and
+        # only under --ensemble. To actually start a search FROM a ring state, make it the
+        # start structure (`--file`). See RING_MTD_BENCH §9.17.
+        #
+        # The file holds every ring state the metadynamics found (up to ~100 on a spiro
+        # product) and bouquet runs one BO per conformer, so a cap is applied HERE rather
+        # than when the file is written: the file stays the complete, energy-ranked record
+        # that any selection rule can be re-scored against offline.
+        from bouquet.rings.seeds import read_seeds
+        seeds = read_seeds(str(filepath))
+        conformers = (seeds.select(max_conformers, select_rule) if max_conformers
+                      else seeds.conformers())
+        for atoms in conformers:
+            atoms.charge = 0
+            atoms.info["charge"] = 0
+            atoms.set_initial_charges([0] * len(atoms))
+
     else:
         raise ValueError(f"Unsupported file format for conformers: {ext}")
+
+    # Formats without a ranking get a plain truncation; the ring-seed branch above has
+    # already applied its rule and is left alone.
+    if max_conformers and ext != ".json" and len(conformers) > max_conformers:
+        logger.info(
+            "Truncating %d conformers from %s to %d", len(conformers), filepath, max_conformers
+        )
+        conformers = conformers[:max_conformers]
 
     if len(conformers) == 0:
         raise ValueError(f"No conformers found in file: {filepath}")
