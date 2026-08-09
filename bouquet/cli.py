@@ -90,6 +90,21 @@ def main():
         "(instead of random sampling). Overrides --init-steps.",
     )
     parser.add_argument(
+        "--max-conformers",
+        type=int,
+        default=0,
+        help="Cap on conformers taken from --conformer-file (0 = all). One BO runs per "
+        "conformer, so this is the search budget; a ring-seed .json is cut with "
+        "--select-rule, other formats are truncated.",
+    )
+    parser.add_argument(
+        "--select-rule",
+        default="energy",
+        help="How to choose which ring-seed conformers to keep under --max-conformers "
+        "(ring-seed .json only): energy, coverage, novelty, diversity, population, "
+        "geometry, hybrid. Default hybrid (half by energy, half by ring-geometry spread).",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Set the number of steps based on the number of dihedrals",
@@ -509,6 +524,8 @@ def main():
         input_file=Path(args.file) if args.file else None,
         name=args.name,
         conformer_file=Path(args.conformer_file) if args.conformer_file else None,
+        max_conformers=args.max_conformers,
+        max_conformer_rule=args.select_rule,
         energy_method=args.energy,
         optimizer_method=args.optimizer,
         num_steps=args.num_steps,
@@ -629,9 +646,15 @@ def main():
     # Load conformers if provided
     initial_conformers = None
     if config.conformer_file is not None:
-        initial_conformers = get_conformers_from_file(str(config.conformer_file))
+        initial_conformers = get_conformers_from_file(
+            str(config.conformer_file),
+            max_conformers=config.max_conformers,
+            select_rule=config.max_conformer_rule,
+        )
+        picked = (f" (capped at {config.max_conformers} by '{config.max_conformer_rule}')"
+                  if config.max_conformers else "")
         logger.info(
-            f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}"
+            f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}{picked}"
         )
         # Stamp charge/spin on conformer atoms too, so xtb reads them per-eval.
         for conf in initial_conformers:

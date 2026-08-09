@@ -223,6 +223,56 @@ def _bond_fingerprint(atoms, mult: float = CONNECTIVITY_MULT):
     return frozenset(counts.items())
 
 
+def _drop_stereoisomers(pools: dict, molh, rejected: dict | None = None):
+    """Drop pool members that are a different STEREOISOMER of the input molecule.
+
+    The connectivity guards above cannot see this: E/Z isomers and epimers have identical
+    bond graphs, so an isomerised structure passes every fingerprint check and can become
+    the reference global minimum. CREST's iMTD-GC runs hot with an RMSD bias and will cross
+    a conjugated C=N or C=C isomerisation barrier, so this is not hypothetical -- measured on
+    stopbench-500, 5 of the 30 molecules with a stereo-specified double bond had a FLIPPED
+    reference minimum, and 3 of those were scored as CREST wins bouquet could not win by
+    construction (m105_d05 was even diagnosed as a dihedral search failure when no dihedral
+    value could close it; correcting the reference takes its 1.93 kcal gap to 0.00).
+
+    This is a CONFORMER benchmark: the reference must be the same stereoisomer as the input.
+    A structure-search comparison would want the opposite policy and a bouquet move that can
+    flip a double bond -- neither exists today.
+
+    Reference stereochemistry comes from the input SMILES via ``molh``, not from a pool
+    member, so a pool that is entirely isomerised (it happens -- m276_d12) is emptied rather
+    than silently re-baselined onto the wrong isomer.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import rdCIPLabeler
+
+    from bouquet.rings.harvest import stereo_signature
+
+    # Reference signature comes from the SMILES-derived graph, not from a pool member.
+
+    ref_mol = Chem.Mol(molh)
+    Chem.AssignStereochemistry(ref_mol, cleanIt=True, force=True)
+    rdCIPLabeler.AssignCIPLabels(ref_mol)
+    want = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))): b.GetProp("_CIPCode")
+            for b in ref_mol.GetBonds() if b.HasProp("_CIPCode")}
+    if not want:                       # nothing stereo-specified -> nothing to enforce
+        return pools, {src: 0 for src in pools}
+
+    n_rej = {src: 0 for src in pools}
+    out: dict = {src: [] for src in pools}
+    for src, res in pools.items():
+        for a, e in res:
+            got = stereo_signature(molh, a)[1]      # (atom_cip, bond_cip) -> bonds
+            if all(got.get(k) is None or got[k] == v for k, v in want.items()):
+                out[src].append((a, e))
+            else:
+                n_rej[src] += 1
+    if rejected is not None:
+        for src, n in n_rej.items():
+            rejected[src] = rejected.get(src, 0) + n
+    return out, n_rej
+
+
 def _drop_off_species(pools: dict, mult: float = CONNECTIVITY_MULT):
     """Drop pool members that are not the same SPECIES as the pool majority.
 
@@ -384,6 +434,9 @@ def build_one(task):
         # this a single proton-transferred/ring-closed structure can sit thousands of
         # kcal below the real conformers and become a spurious E*.
         raw, species_rej = _drop_off_species(raw)
+        # Third guard: a different STEREOISOMER has the same bond graph, so neither check
+        # above can see it. Conformer benchmark -> the reference must match the input.
+        raw, stereo_rej = _drop_stereoisomers(raw, molh)
         opt = {src: _dedup(res, task["rmsd_thr"], task["e_tol"] / KCAL)
                for src, res in raw.items()}
 
