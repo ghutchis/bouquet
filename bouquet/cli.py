@@ -332,6 +332,15 @@ def main():
         help="Enable PiBO priors. Bare --priors uses the bundled fitted priors "
         "(gfn2_priors.json); pass a path for a custom JSON. Omit to leave priors off.",
     )
+    parser.add_argument(
+        "--bivariate-priors",
+        type=str,
+        default=None,
+        help="Path to a JSON file of correlated (2D) dihedral priors. Each entry "
+        "carries a SMARTS pattern, a topology, and a bivariate von Mises mixture; "
+        "matched dihedral pairs are steered jointly instead of independently. "
+        "May be given with or without --priors.",
+    )
     # Initial prior exponent for PiBO (0 to disable, default is 0.5)
     parser.add_argument(
         "--prior-exponent",
@@ -538,6 +547,9 @@ def main():
         solvent=args.solvent,
         seed=args.seed,
         priors_file=_resolve_priors_arg(args.priors),
+        bivariate_priors_file=(
+            Path(args.bivariate_priors) if args.bivariate_priors else None
+        ),
         prior_max_concentration=args.prior_max_concentration,
         prior_background_weight=args.prior_background_weight,
         ensemble=args.ensemble,
@@ -669,7 +681,7 @@ def main():
     # Create prior module if priors file provided. This drives PiBO acquisition
     # steering and is only built when --priors is given.
     prior_module = None
-    if config.priors_file is not None:
+    if config.priors_file is not None or config.bivariate_priors_file is not None:
         from bouquet.priors import create_prior_module
 
         # Get dihedral atom tuples
@@ -684,10 +696,16 @@ def main():
             mol=mol,
             dihedrals=dihedral_tuples,
             univariate_file=config.priors_file,
+            bivariate_file=config.bivariate_priors_file,
             max_concentration=max_conc,
             background_weight=config.prior_background_weight,
         )
-        logger.info(f"Created prior module from {config.priors_file}")
+        sources = [
+            str(f)
+            for f in (config.priors_file, config.bivariate_priors_file)
+            if f is not None
+        ]
+        logger.info(f"Created prior module from {', '.join(sources)}")
         logger.info(prior_module.describe())
 
     # Assign torsion-library SMARTS categories to every dihedral. This ties chemically-

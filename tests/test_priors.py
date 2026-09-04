@@ -16,6 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bouquet.priors import (
+    BivariateAssignment,
     BivariateSMARTS,
     BivariateTopology,
     BivariateVonMisesMixture,
@@ -213,7 +214,8 @@ def test_pair_order_follows_topology_not_dihedral_index():
     dihedrals = [dih2, dih1]
     result = matcher.match_bivariate(mol, dihedrals)
 
-    assert result == {(1, 0): "p"}, "orientation must survive the dihedral ordering"
+    assert set(result) == {(1, 0)}, "orientation must survive the dihedral ordering"
+    assert result[(1, 0)].prior_type == "p"
 
 
 def test_pair_claimed_once_per_orientation():
@@ -277,3 +279,126 @@ def test_max_concentration_clamps_bivariate_kappa():
     )
     assert float(mixture.kappa1[0]) == pytest.approx(50.0)
     assert float(mixture.kappa2[0]) == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------- terminal offset
+
+
+def _embedded(smiles: str, seed: int = 3):
+    from rdkit.Chem import AllChem
+
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    AllChem.EmbedMolecule(mol, randomSeed=seed)
+    AllChem.MMFFOptimizeMolecule(mol)
+    return mol
+
+
+def test_offset_is_invariant_under_rotation():
+    """The offset between two terminal choices is fixed by rigid local geometry.
+
+    This is what makes the correction exact rather than an approximation: the
+    four atoms of a quartet are joined by direct bonds, so no rotatable bond
+    lies between them and no torsion can change their relative arrangement.
+    """
+    from rdkit.Chem import rdMolTransforms as rmt
+
+    from bouquet.setup import detect_dihedrals
+
+    mol = _embedded("CC(c1ccccc1)c1ccccc1")
+    conf = mol.GetConformer()
+    smarts = "[a:1][c:2]!@[C&X4&H1:3]([a:4][a:5])[#1:6]"  # y1665
+    match = mol.GetSubstructMatches(Chem.MolFromSmarts(smarts))[0]
+    q_hist = tuple(match[i] for i in (0, 1, 2, 3))
+
+    dihedrals = [tuple(d.chain) for d in detect_dihedrals(mol)]
+    q_bq = next(d for d in dihedrals if set(d[1:3]) == set(q_hist[1:3]))
+
+    offsets = []
+    for angle in range(0, 360, 20):
+        rmt.SetDihedralDeg(conf, *q_bq, float(angle))
+        raw = rmt.GetDihedralDeg(conf, *q_bq) - rmt.GetDihedralDeg(conf, *q_hist)
+        offsets.append((raw + 180.0) % 360.0 - 180.0)  # wrap, as the code does
+    spread = max(offsets) - min(offsets)
+    assert spread < 1e-6, f"offset drifted by {spread} deg under rotation"
+
+
+def test_hydrogen_terminal_pattern_still_matches():
+    """A prior whose SMARTS ends on H must still find a pair.
+
+    bouquet's rotor list is heavy-atom only, so requiring an exact quartet made
+    this whole class of fitted priors unable to fire.
+    """
+    from bouquet.setup import detect_dihedrals
+
+    mol = _embedded("CC(c1ccccc1)c1ccccc1")
+    smarts = "[a:1][c:2]!@[C&X4&H1:3]([a:4][a:5])[#1:6]"  # y1665
+    matcher = _matcher(BivariateTopology.Y_SHAPE, smarts)
+
+    dihedrals = [tuple(d.chain) for d in detect_dihedrals(mol)]
+    result = matcher.match_bivariate(mol, dihedrals)
+
+    assert result, "a hydrogen-terminated quartet must still match its rotor"
+    assignment = next(iter(result.values()))
+    assert isinstance(assignment, BivariateAssignment)
+    assert assignment.offset1_deg != 0.0 or assignment.offset2_deg != 0.0
+
+
+def test_offset_puts_the_mode_where_the_prior_expects_it():
+    """Scoring must peak at the fitted mean expressed in bouquet's own frame."""
+    from rdkit.Chem import rdMolTransforms as rmt
+
+    from bouquet.setup import detect_dihedrals
+
+    mol = _embedded("CC(c1ccccc1)c1ccccc1")
+    conf = mol.GetConformer()
+    smarts = "[a:1][c:2]!@[C&X4&H1:3]([a:4][a:5])[#1:6]"
+    matcher = _matcher(BivariateTopology.Y_SHAPE, smarts)
+    dihedrals = [tuple(d.chain) for d in detect_dihedrals(mol)]
+    assignments = matcher.match_bivariate(mol, dihedrals)
+    (d1, d2), assignment = next(iter(assignments.items()))
+
+    priors = {
+        "p": {
+            "components": [
+                {
+                    "mu1_deg": 75.0,
+                    "mu2_deg": 200.0,
+                    "kappa1": 30.0,
+                    "kappa2": 30.0,
+                    "correlation": 0.0,
+                }
+            ],
+            "weights": [1.0],
+        }
+    }
+    module = DihedralPriorModule(
+        dim=len(dihedrals),
+        univariate_assignments={},
+        bivariate_assignments=assignments,
+        univariate_priors={},
+        bivariate_priors=priors,
+        fallback_type="uniform",
+        max_concentration=None,
+    )
+
+    # Drive the molecule to the geometry the prior calls its mode, then read the
+    # search coordinates off that geometry.
+    match = mol.GetSubstructMatches(Chem.MolFromSmarts(smarts))[0]
+    _m, i1, i2 = TOPOLOGY_DEFINITIONS[BivariateTopology.Y_SHAPE]
+    q1 = tuple(match[i] for i in i1)
+    q2 = tuple(match[i] for i in i2)
+    rmt.SetDihedralDeg(conf, *q1, 75.0)
+    rmt.SetDihedralDeg(conf, *q2, 200.0)
+
+    X = torch.zeros(1, len(dihedrals), dtype=torch.float64)
+    for k, q in enumerate(dihedrals):
+        X[0, k] = rmt.GetDihedralDeg(conf, *q) % 360.0
+
+    at_mode = module(X)
+    for delta in (-40.0, 40.0):
+        off = X.clone()
+        off[0, d1] = (off[0, d1] + delta) % 360.0
+        assert at_mode > module(off), f"prior did not peak at its mode ({delta=})"
+
+    # And the offsets are what carried it there.
+    assert abs(assignment.offset1_deg) > 1.0

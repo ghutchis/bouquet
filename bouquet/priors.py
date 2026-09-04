@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 try:
     from rdkit import Chem
+    from rdkit.Chem import rdMolTransforms
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -94,8 +95,33 @@ def _try_int(value: Any) -> PriorTypeId:
 
 
 def _matches_dihedral(match: Tuple, dihedral: Tuple) -> bool:
-    """Check if match equals dihedral in either direction."""
+    """Check if match equals dihedral in either direction.
+
+    Reversing a quartet leaves the dihedral angle unchanged, so both directions
+    describe the same coordinate.
+    """
     return match == dihedral or match[::-1] == dihedral
+
+
+@dataclass(frozen=True)
+class BivariateAssignment:
+    """A matched correlated pair, with the offsets that put it in bouquet's frame.
+
+    A fitted prior is measured on the quartets its SMARTS names, but bouquet
+    searches over one canonical quartet per rotatable bond -- usually a
+    *different* terminal atom, and never a hydrogen. The two choices differ by a
+    constant: the four atoms of a quartet are joined by direct bonds, so no
+    rotatable bond lies between them and torsional motion cannot change their
+    relative geometry. Measured over a full rotation of the bond, the offset
+    holds to ~1e-14 deg.
+
+    ``offset_deg`` is ``angle(bouquet quartet) - angle(SMARTS quartet)``, so the
+    angle the prior was fitted on is ``X[dim] - offset_deg``.
+    """
+
+    prior_type: PriorTypeId
+    offset1_deg: float = 0.0
+    offset2_deg: float = 0.0
 
 
 # ============================================================================
@@ -305,7 +331,21 @@ class DihedralPriorModule(nn.Module):
         self.max_concentration = max_concentration
         self.background_weight = background_weight
         self.univariate_assignments = univariate_assignments
-        self.bivariate_assignments = bivariate_assignments
+        # Values may be a bare prior id or a BivariateAssignment carrying the
+        # terminal-atom offsets; normalise to (prior_id, offsets) once here so
+        # forward() and peak_modes() do not each have to branch.
+        self.bivariate_assignments = {
+            dims: (a.prior_type if isinstance(a, BivariateAssignment) else a)
+            for dims, a in bivariate_assignments.items()
+        }
+        self.bivariate_offsets: Dict[Tuple[int, int], Tuple[float, float]] = {
+            dims: (
+                (a.offset1_deg, a.offset2_deg)
+                if isinstance(a, BivariateAssignment)
+                else (0.0, 0.0)
+            )
+            for dims, a in bivariate_assignments.items()
+        }
 
         # Merge built-in with custom priors. There are no built-in bivariate
         # priors, but the dict still has to be stored: _build_bivariate and
@@ -464,8 +504,11 @@ class DihedralPriorModule(nn.Module):
         # background (which needs a normalized density to mix against) is not applied
         # here; they keep the hard clamp below as their floor.
         for (d1, d2), dist in self.bivariate_dists.items():
-            angle1 = self._to_radians(X[..., d1])
-            angle2 = self._to_radians(X[..., d2])
+            # The prior was fitted on the SMARTS pattern's own quartets; subtract
+            # the constant offset to bouquet's quartet before scoring.
+            off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
+            angle1 = self._to_radians(X[..., d1] - off1)
+            angle2 = self._to_radians(X[..., d2] - off2)
             log_prob = log_prob + dist.log_prob(angle1, angle2)
 
         # Average over informative dihedrals (mean, not sum) so the prior's
@@ -528,11 +571,15 @@ class DihedralPriorModule(nn.Module):
             mu1 = dist.mu1.detach().cpu().numpy()
             mu2 = dist.mu2.detach().cpu().numpy()
             probs = dist.weights.detach().cpu().numpy()
+            # Peaks are reported in X's frame, so the offset that forward()
+            # subtracts has to be added back here -- otherwise seeding and
+            # scoring would disagree.
+            off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
             candidates = [
                 (
                     (
-                        float(math.degrees(m1) % 360.0),
-                        float(math.degrees(m2) % 360.0),
+                        float((math.degrees(m1) + off1) % 360.0),
+                        float((math.degrees(m2) + off2) % 360.0),
                     ),
                     float(w),
                 )
@@ -626,11 +673,49 @@ class DihedralPriorMatcher:
 
         return None
 
+    @staticmethod
+    def _dihedral_on_bond(
+        dihedrals: List[Tuple[int, int, int, int]],
+        quartet: Tuple[int, ...],
+    ) -> Optional[int]:
+        """Index of the dihedral rotating the same bond as ``quartet``, if any."""
+        bond = frozenset(quartet[1:3])
+        for i, dih in enumerate(dihedrals):
+            if frozenset(dih[1:3]) == bond:
+                return i
+        return None
+
+    @staticmethod
+    def _terminal_offset(
+        conf, quartet: Tuple[int, ...], bouquet_quartet: Tuple[int, ...]
+    ) -> Optional[float]:
+        """``angle(bouquet quartet) - angle(SMARTS quartet)``, in degrees.
+
+        Both quartets turn about the same bond, so this is fixed by the rigid
+        local geometry and is invariant to every torsion in the molecule.
+        """
+        if _matches_dihedral(tuple(bouquet_quartet), tuple(quartet)):
+            return 0.0
+        if conf is None:
+            return None
+        try:
+            a_bq = rdMolTransforms.GetDihedralDeg(conf, *bouquet_quartet)
+            a_hist = rdMolTransforms.GetDihedralDeg(conf, *quartet)
+        except (ValueError, RuntimeError):
+            # A planar inner angle leaves the torsion undefined; there is no
+            # offset to measure, so decline the match rather than guess one.
+            return None
+        offset = a_bq - a_hist
+        if offset != offset:  # NaN from a degenerate geometry
+            return None
+        return (offset + 180.0) % 360.0 - 180.0
+
     def match_bivariate(
         self,
         mol: Chem.Mol,
         dihedrals: List[Tuple[int, int, int, int]],
-    ) -> Dict[Tuple[int, int], PriorTypeId]:
+        conf_id: int = -1,
+    ) -> Dict[Tuple[int, int], BivariateAssignment]:
         """Find correlated pairs among dihedrals.
 
         Keys are ``(dim_of_dihedral1, dim_of_dihedral2)`` in the topology's own
@@ -640,8 +725,22 @@ class DihedralPriorMatcher:
         are usually chemically distinct). Sorting the key here silently applied
         the transposed prior whenever the second dihedral happened to come first
         in ``dihedrals``.
+
+        A pattern is matched on the *central bond* of each of its two dihedrals,
+        not on the exact quartet. The fitted priors name particular terminal
+        atoms -- often a hydrogen -- while bouquet searches one canonical quartet
+        per rotatable bond, so requiring an exact quartet left most priors unable
+        to fire at all (on 150 ZINC leads: 22% of dihedral slots matched exactly,
+        while a further 64% were the right rotor with a different terminal). The
+        constant difference between the two terminal choices is measured off the
+        conformer and carried on the assignment; see ``BivariateAssignment``.
+
+        Without a conformer only exact-quartet matches can be resolved, since
+        there is no geometry to measure the offset from.
         """
-        results = {}
+        conf = mol.GetConformer(conf_id) if mol.GetNumConformers() else None
+
+        results: Dict[Tuple[int, int], BivariateAssignment] = {}
         # Dedup is on the unordered pair: one physical pair must not be claimed
         # twice (once per orientation) by two different matches.
         seen: Set[frozenset] = set()
@@ -662,19 +761,24 @@ class DihedralPriorMatcher:
                 dih1 = tuple(match[i] for i in dih1_indices)
                 dih2 = tuple(match[i] for i in dih2_indices)
 
-                # Find indices in our dihedral list
-                idx1 = idx2 = None
-                for i, dih in enumerate(dihedrals):
-                    if _matches_dihedral(dih, dih1):
-                        idx1 = i
-                    if _matches_dihedral(dih, dih2):
-                        idx2 = i
+                idx1 = self._dihedral_on_bond(dihedrals, dih1)
+                idx2 = self._dihedral_on_bond(dihedrals, dih2)
+                if idx1 is None or idx2 is None or idx1 == idx2:
+                    continue
 
-                if idx1 is not None and idx2 is not None and idx1 != idx2:
-                    key = frozenset((idx1, idx2))
-                    if key not in seen:
-                        seen.add(key)
-                        results[(idx1, idx2)] = pattern.prior_type
+                off1 = self._terminal_offset(conf, dih1, dihedrals[idx1])
+                off2 = self._terminal_offset(conf, dih2, dihedrals[idx2])
+                if off1 is None or off2 is None:
+                    continue
+
+                key = frozenset((idx1, idx2))
+                if key not in seen:
+                    seen.add(key)
+                    results[(idx1, idx2)] = BivariateAssignment(
+                        prior_type=pattern.prior_type,
+                        offset1_deg=off1,
+                        offset2_deg=off2,
+                    )
 
         return results
 

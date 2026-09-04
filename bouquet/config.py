@@ -432,6 +432,11 @@ class Configuration:
     # prior_module in the CLI; the exponent/decay that weight it at search time
     # live on ``run`` (initial_prior_exponent / prior_exponent_decay).
     priors_file: Optional[Path] = None
+    # Correlated (2D) priors, matched by SMARTS + topology and applied to a pair
+    # of dihedrals jointly. Independent of priors_file: either may be given
+    # alone, and a dihedral claimed by a bivariate pair is skipped by the 1D
+    # factors so the pair is not counted twice.
+    bivariate_priors_file: Optional[Path] = None
     prior_max_concentration: float = DEFAULT_PRIOR_MAX_CONCENTRATION
     prior_background_weight: float = DEFAULT_PRIOR_BACKGROUND_WEIGHT
 
@@ -467,6 +472,8 @@ class Configuration:
             self.out_dir = Path(self.out_dir)
         if isinstance(self.priors_file, str):
             self.priors_file = Path(self.priors_file)
+        if isinstance(self.bivariate_priors_file, str):
+            self.bivariate_priors_file = Path(self.bivariate_priors_file)
 
         # Derive a run name from the input if one wasn't provided: prefer the
         # SMILES string, otherwise fall back to the input file's stem.
