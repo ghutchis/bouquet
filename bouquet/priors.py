@@ -59,18 +59,28 @@ class BivariateTopology(Enum):
         ADJACENT: 5 atoms, dihedrals share 3 atoms (1-2-3-4 and 2-3-4-5)
         SKIP_ONE: 6 atoms, dihedrals share central bond only (1-2-3-4 and 3-4-5-6)
         W_SHAPE: 6 atoms, branched/W pattern (1-2-3-4 and 4-3-5-6)
+        Y_SHAPE: 6 atoms, adjacent bonds off a branch point (1-2-3-4 and 5-4-3-6)
+
+    The order of the two dihedrals is part of the topology: a fitted bivariate
+    mixture is generally not symmetric under swapping phi1 and phi2, so
+    ``match_bivariate`` preserves this orientation rather than sorting.
     """
 
     ADJACENT = "adjacent"
     SKIP_ONE = "skip_one"
     W_SHAPE = "w_shape"
+    Y_SHAPE = "y_shape"
 
 
-# Mapping from topology to (min_atoms, dihedral1_indices, dihedral2_indices)
+# Mapping from topology to (min_atoms, dihedral1_indices, dihedral2_indices).
+# These mirror the PAIRS table in the torsion-library generator
+# (~/torsions/rdtorsion2d-parallel.py) that the fitted priors are measured with,
+# so the atom ordering here must not be "tidied".
 TOPOLOGY_DEFINITIONS: Dict[BivariateTopology, Tuple[int, Tuple[int, ...], Tuple[int, ...]]] = {
     BivariateTopology.ADJACENT: (5, (0, 1, 2, 3), (1, 2, 3, 4)),
     BivariateTopology.SKIP_ONE: (6, (0, 1, 2, 3), (2, 3, 4, 5)),
     BivariateTopology.W_SHAPE: (6, (0, 1, 2, 3), (3, 2, 4, 5)),
+    BivariateTopology.Y_SHAPE: (6, (0, 1, 2, 3), (4, 3, 2, 5)),
 }
 
 
@@ -297,8 +307,12 @@ class DihedralPriorModule(nn.Module):
         self.univariate_assignments = univariate_assignments
         self.bivariate_assignments = bivariate_assignments
 
-        # Merge built-in with custom priors
+        # Merge built-in with custom priors. There are no built-in bivariate
+        # priors, but the dict still has to be stored: _build_bivariate and
+        # describe() both read it, so without this any non-empty
+        # bivariate_assignments raised AttributeError at construction.
         self.univariate_priors = {**BUILTIN_UNIVARIATE_PRIORS, **univariate_priors}
+        self.bivariate_priors = dict(bivariate_priors)
 
         # Build distributions
         self._build_univariate()
@@ -373,13 +387,27 @@ class DihedralPriorModule(nn.Module):
             )
 
     def _to_radians(self, x: Tensor) -> Tensor:
-        """Convert input to radians in [-π, π]."""
+        """Convert a dihedral value to radians, wrapped to [-π, π).
+
+        The input is the *dihedral angle itself* -- the same value that is handed
+        to ``set_dihedral`` when the geometry is built -- so 0 in must map to 0
+        radians. This previously computed ``(x / 180 - 1) * pi``, i.e.
+        ``radians(x) - pi``, while the component means went in unshifted via
+        ``math.radians(mu)``: every prior mode was therefore scored 180 deg away
+        from where it was declared (the built-in sp3_sp3 means 60/180/300 peaked
+        at 240/0/120, putting gauche minima on eclipsed positions), and
+        ``peak_modes`` -- which reports ``degrees(mu)`` unshifted -- disagreed
+        with ``forward`` by half a turn.
+        """
         if self.input_in_degrees:
             # Input is [0, 360) degrees
-            return (x / 180.0 - 1.0) * math.pi
+            theta = x * (math.pi / 180.0)
         else:
             # Input is [0, 1) normalized
-            return (x * 2.0 - 1.0) * math.pi
+            theta = x * (2.0 * math.pi)
+        # Only cosine differences are used downstream, so wrapping is cosmetic --
+        # but it keeps the documented range honest.
+        return torch.remainder(theta + math.pi, 2.0 * math.pi) - math.pi
 
     def forward(self, X: Tensor) -> Tensor:
         """
@@ -603,8 +631,20 @@ class DihedralPriorMatcher:
         mol: Chem.Mol,
         dihedrals: List[Tuple[int, int, int, int]],
     ) -> Dict[Tuple[int, int], PriorTypeId]:
-        """Find correlated pairs among dihedrals."""
+        """Find correlated pairs among dihedrals.
+
+        Keys are ``(dim_of_dihedral1, dim_of_dihedral2)`` in the topology's own
+        order, *not* sorted: ``DihedralPriorModule.forward`` feeds ``X[..., d1]``
+        to the mixture as phi1, and a fitted mixture is not in general symmetric
+        under transposing phi1/phi2 (the two arms of a w_shape or y_shape pattern
+        are usually chemically distinct). Sorting the key here silently applied
+        the transposed prior whenever the second dihedral happened to come first
+        in ``dihedrals``.
+        """
         results = {}
+        # Dedup is on the unordered pair: one physical pair must not be claimed
+        # twice (once per orientation) by two different matches.
+        seen: Set[frozenset] = set()
 
         for pattern in self.bivariate_patterns:
             smarts_mol = self._compiled_bi.get(pattern.smarts)
@@ -630,10 +670,11 @@ class DihedralPriorMatcher:
                     if _matches_dihedral(dih, dih2):
                         idx2 = i
 
-                if idx1 is not None and idx2 is not None:
-                    pair = (min(idx1, idx2), max(idx1, idx2))
-                    if pair not in results:
-                        results[pair] = pattern.prior_type
+                if idx1 is not None and idx2 is not None and idx1 != idx2:
+                    key = frozenset((idx1, idx2))
+                    if key not in seen:
+                        seen.add(key)
+                        results[(idx1, idx2)] = pattern.prior_type
 
         return results
 
