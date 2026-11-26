@@ -527,6 +527,7 @@ class Configuration:
     init_conformer_cap: int = DEFAULT_INIT_CONFORMER_CAP
     auto_steps: bool = False
     relax: bool = True
+    drop_h_c3: bool = True
     seed: int = field(default_factory=lambda: secrets.randbelow(2**31))
 
     # Search / surrogate / benchmark tuning knobs handed to run_optimization.

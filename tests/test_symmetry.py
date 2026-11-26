@@ -326,3 +326,48 @@ class TestSymmetryLengthscaleCompensation:
             torch.diagonal(K_b, dim1=-2, dim2=-1),
             atol=1e-9,
         )
+
+
+class TestDropTrivialHC3Rotors:
+    def _kept_orders(self, smiles: str) -> list[int]:
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        return sorted(d.symmetry_order for d in detect_dihedrals(mol, drop_h_c3=True))
+
+    def test_drops_h_only_c3_and_preserves_heavy_and_c2_rotors(self):
+        assert self._kept_orders("CCCC") == [1]                  # 2 -CH3 dropped
+        assert self._kept_orders("Cc1ccccc1") == []              # toluene -> 0D
+        assert self._kept_orders("CC[NH3+]") == []               # -CH3 and -NH3+ dropped
+        assert self._kept_orders("CCO") == [1]                   # -CH3 dropped, -OH kept
+        assert self._kept_orders("CC(C)(C)c1ccccc1") == [2]      # 3 -CH3 dropped, Ph C2 kept
+        assert self._kept_orders("FC(F)(F)c1ccccc1") == [6]      # -CF3 is heavy -> kept
+        assert self._kept_orders("Nc1ccccc1") == [2]             # -NH2 is not C3 -> kept
+        assert self._kept_orders("C([C@@H](C(=O)[O-])[NH3+])S") == [1, 1, 2]  # -NH3+ dropped, -CO2- C2 kept
+
+    def test_mixed_isotope_methyl_not_dropped(self):
+        # -CH2D is NOT C3-symmetric and must be kept; -CD3 IS C3-symmetric
+        mol_ch2d = Chem.AddHs(Chem.MolFromSmiles("[2H]CC(F)(F)F"))
+        assert len(detect_dihedrals(mol_ch2d, drop_h_c3=True)) == 1
+        mol_cd3 = Chem.AddHs(Chem.MolFromSmiles("[2H]C([2H])([2H])C(F)(F)F"))
+        assert len(detect_dihedrals(mol_cd3, drop_h_c3=True)) == 0
+
+    def test_cli_flag_default_and_opt_out(self):
+        from bouquet.cli import build_parser
+
+        parser = build_parser()
+        assert parser.parse_args(["--smiles", "CCCC"]).drop_h_c3 is True
+        assert parser.parse_args(["--smiles", "CCCC", "--drop-h-rotors"]).drop_h_c3 is True
+        assert parser.parse_args(["--smiles", "CCCC", "--no-drop-h-rotors"]).drop_h_c3 is False
+
+    def test_zero_active_rotors_runs_cleanly(self):
+        from bouquet.setup import get_initial_structure
+        from bouquet.solver import run_optimization
+
+        atoms, mol = get_initial_structure("Cc1ccccc1", seed=1)
+        dihs = detect_dihedrals(mol, drop_h_c3=True)
+        assert dihs == []
+        calc = RDKitMMFFCalculator(mol)
+        final_atoms = run_optimization(
+            atoms, dihs, n_steps=5, calc=calc, relaxCalc=calc,
+            init_steps=2, out_dir=None, relax=True, seed=1, mol=mol,
+        )
+        assert len(final_atoms) == len(atoms)

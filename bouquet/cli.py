@@ -194,6 +194,16 @@ def build_parser() -> ArgumentParser:
         "(default: on; pass --no-relax for rigid torsion scans)",
     )
     parser.add_argument(
+        "--drop-h-rotors",
+        dest="drop_h_c3",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Exclude trivial terminal H-only C3 rotors (-CH3, -NH3+, -SiH3) "
+        "from the BO dihedral search when --relax is active so local relaxation "
+        "places them instead of spending BO dimensions on methyl hydrogens "
+        "(default: on; pass --no-drop-h-rotors to include all rotatable bonds).",
+    )
+    parser.add_argument(
         "--solvent",
         type=str,
         default=None,
@@ -630,6 +640,7 @@ def main(argv=None):
             init_conformer_cap=args.init_conformers,
             auto_steps=args.auto,
             relax=args.relax,
+            drop_h_c3=args.drop_h_c3,
             solvent=args.solvent,
             seed=args.seed,
             priors_file=_resolve_priors_arg(args.priors),
@@ -766,9 +777,10 @@ def main(argv=None):
     # Pick the lowest-energy ETKDG embedding as the starting structure.
     init_atoms, _ = select_initial_structure(candidates, calc)
 
-    # Detect the dihedral angles
-    dihedrals = detect_dihedrals(mol)
-    logger.info(f"Detected {len(dihedrals)} dihedral angles")
+    # Detect the dihedral angles (drop trivial H-only C3 tops when relaxing
+    # unless opted out via --no-drop-h-rotors).
+    dihedrals = detect_dihedrals(mol, drop_h_c3=config.drop_h_c3 and config.relax)
+    logger.info(f"Detected {len(dihedrals)} active dihedral angles")
 
     # Load conformers if provided
     initial_conformers = None
@@ -796,7 +808,9 @@ def main(argv=None):
     # Create prior module if priors file provided. This drives PiBO acquisition
     # steering and is only built when --priors is given.
     prior_module = None
-    if config.priors_file is not None or config.bivariate_priors_file is not None:
+    if dihedrals and (
+        config.priors_file is not None or config.bivariate_priors_file is not None
+    ):
         from bouquet.priors import create_prior_module
 
         # Get dihedral atom tuples
@@ -840,7 +854,7 @@ def main(argv=None):
     # acquisition: when no --priors file is given we build a built-ins-only
     # module purely for seeding, leaving acquisition steering off.
     initial_dihedrals = None
-    if config.init_method == "peaks" and initial_conformers is None:
+    if dihedrals and config.init_method == "peaks" and initial_conformers is None:
         from bouquet.priors import create_prior_module
 
         planning_module = prior_module

@@ -782,7 +782,33 @@ def assign_dihedral_symmetries(
         d.symmetry_order = math.lcm(mu, mv)
 
 
-def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
+def is_trivial_h_c3_rotor(mol: Chem.Mol, dihedral: DihedralInfo) -> bool:
+    """Return True if either side of the rotatable bond is a terminal tetrahedral
+    sp3 hydrogen-only C3 top (e.g. ``-CH3``, ``-NH3+``, ``-SiH3``).
+
+    All three staggered orientations of such a top are symmetry-identical and
+    separated by a low barrier, so local relaxation (``--relax``) places the
+    hydrogens without needing a dedicated BO dimension. Mixed-isotope tops
+    (e.g. ``-CH2D``) and heavy tops (e.g. ``-CF3``) return False.
+    """
+    u, v = dihedral.chain[1], dihedral.chain[2]
+    for anchor_idx, other_idx in ((u, v), (v, u)):
+        anchor = mol.GetAtomWithIdx(anchor_idx)
+        if anchor.GetHybridization() != Chem.HybridizationType.SP3:
+            continue
+        nbrs = [n for n in anchor.GetNeighbors() if n.GetIdx() != other_idx]
+        if (
+            len(nbrs) == 3
+            and all(n.GetAtomicNum() == 1 and n.GetDegree() == 1 for n in nbrs)
+            and len({n.GetIsotope() for n in nbrs}) == 1
+        ):
+            return True
+    return False
+
+
+def detect_dihedrals(
+    mol: Chem.Mol, *, drop_h_c3: bool = False
+) -> list[DihedralInfo]:
     """Detect the bonds to be treated as rotors.
 
     Uses the RDKit definition of rotatable bonds:
@@ -791,6 +817,10 @@ def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
 
     Args:
         mol: RDKit Mol object
+        drop_h_c3: If True, exclude trivial terminal H-only C3 tops
+            (``-CH3``, ``-NH3+``, ``-SiH3``; see :func:`is_trivial_h_c3_rotor`)
+            from the returned list, reducing BO dimensionality when local
+            relaxation is enabled.
 
     Returns:
         List of DihedralInfo objects describing each rotatable dihedral
@@ -820,13 +850,23 @@ def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
             dihedrals.append(info)
 
     assign_dihedral_symmetries(mol, dihedrals)
+    n_total = len(dihedrals)
+    n_dropped = 0
+    if drop_h_c3:
+        dihedrals = [d for d in dihedrals if not is_trivial_h_c3_rotor(mol, d)]
+        n_dropped = n_total - len(dihedrals)
+
     n_sym = sum(1 for d in dihedrals if d.symmetry_order > 1)
+    parts = []
+    if n_dropped:
+        parts.append(f"dropped {n_dropped} H-only C3 rotor(s) -> {len(dihedrals)} active")
     if n_sym:
         vol_cut = math.prod(d.symmetry_order for d in dihedrals)
+        parts.append(f"{n_sym} symmetric; {vol_cut}x search-volume reduction")
+    if parts:
         logger.info(
-            f"Detected {len(dihedrals)} rotatable dihedral angles "
-            f"({n_sym} symmetric; {vol_cut}x search-volume reduction)"
+            f"Detected {n_total} rotatable dihedral angles ({'; '.join(parts)})"
         )
     else:
-        logger.info(f"Detected {len(dihedrals)} rotatable dihedral angles")
+        logger.info(f"Detected {n_total} rotatable dihedral angles")
     return dihedrals
