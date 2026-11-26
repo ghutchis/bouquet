@@ -153,12 +153,29 @@ GRADIENT_WINDOW_MIN = 50
 
 # Initial guess sampling
 INITIAL_GUESS_STD = 90
-# How initial guesses are generated: "random" (Gaussian around the start) or
-# "peaks" (systematic grid / weighted sampling from the dihedral prior peaks).
-DEFAULT_INIT_METHOD = "random"
+# How initial guesses are generated: "etkdg" (dimension-scaled ETKDGv3 + MMFF94
+# pool clustered in symmetry-reduced torsion space, default), "random" (Gaussian
+# around the start), or "peaks" (systematic grid / weighted sampling from the
+# dihedral prior peaks).
+DEFAULT_INIT_METHOD = "etkdg"
+INIT_METHODS = ("etkdg", "random", "peaks")
+# Primary and fallback greedy leader clustering thresholds (degrees, wrapped
+# periodic torsion RMSD) for --init-method etkdg.
+DEFAULT_ETKDG_CLUSTER_DEG = 35.0
+DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG = 20.0
 # Maximum systematic peak-grid size for --init-method peaks before falling back
 # to weighted sampling (e.g. 3 modes x 3 dihedrals = 27 fits; x4 = 81 does not).
 DEFAULT_INIT_GRID_BUDGET = 64
+
+
+def etkdg_seed_pool_size(num_dihedrals: int) -> int:
+    """Dimension-scaled ETKDG conformer pool size for ``--init-method etkdg``.
+
+    Scales linearly with active dihedral count ``d`` (clamped to ``[12, 128]``)
+    so small molecules (``d = 1..2``) avoid wasteful over-embedding while
+    medium/high-``d`` molecules get dense rotamer coverage.
+    """
+    return min(128, max(12, 12 * max(1, int(num_dihedrals))))
 # Upper bound on the number of ETKDG embeddings generated and scored (with the
 # energy calculator) when picking the initial 3D structure from SMILES. The
 # actual count scales with ring flexibility (see setup.num_initial_embeddings);

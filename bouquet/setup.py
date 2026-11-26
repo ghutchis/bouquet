@@ -5,6 +5,7 @@ from __future__ import annotations
 # With annotations as strings, networkx/ase/rdkit are only used inside function
 # bodies, so defer them until a structure is actually parsed (Python 3.15+).
 __lazy_modules__ = [
+    "numpy",
     "networkx",
     "ase",
     "ase.io",
@@ -19,10 +20,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import networkx as nx
+import numpy as np
 from ase import Atoms
 from ase.io import read
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdDetermineBonds
+from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
 if TYPE_CHECKING:
     from bouquet.calculator import Calculator
@@ -870,3 +872,135 @@ def detect_dihedrals(
     else:
         logger.info(f"Detected {n_total} rotatable dihedral angles")
     return dihedrals
+
+
+def _periodic_torsion_rms_deg(
+    a: np.ndarray, b: np.ndarray, periods_deg: np.ndarray
+) -> float:
+    """Symmetry-reduced wrapped RMS torsion distance in degrees."""
+    diff = np.abs(a - b) % periods_deg
+    diff = np.minimum(diff, periods_deg - diff)
+    return float(np.sqrt(np.mean(diff**2)))
+
+
+def plan_etkdg_initial_points(
+    mol: Chem.Mol,
+    start_atoms: Atoms,
+    dihedrals: list[DihedralInfo],
+    max_points: int,
+    seed: int = 42,
+    pool_size: int | None = None,
+    cluster_deg: float = 35.0,
+    fallback_cluster_deg: float = 20.0,
+    feasible=None,
+    num_threads: int = 1,
+) -> np.ndarray:
+    """Generate distinct low-energy initial dihedral seeds via ETKDGv3 + MMFF94.
+
+    Embeds a dimension-scaled pool of ETKDGv3 conformers, optimizes them with
+    MMFF94 (UFF fallback), filters out any torsion vector that clashes when
+    applied to ``start_atoms``, sorts feasible conformers by force-field energy,
+    and greedily selects up to ``max_points`` distinct clusters separated in
+    symmetry-reduced wrapped torsion RMSD from ``start_atoms`` and each other.
+
+    If a small molecule genuinely has fewer than ``max_points`` distinct
+    rotamers, returns only the unique clusters found (avoiding wasted
+    evaluations on duplicate conformers); returns shape ``(0, d)`` if embedding
+    fails or no distinct feasible clusters exist.
+    """
+    from bouquet.config import etkdg_seed_pool_size
+
+    d_eff = len(dihedrals)
+    if d_eff == 0 or max_points <= 0:
+        return np.empty((0, d_eff), dtype=float)
+
+    n_pool = pool_size if pool_size is not None else etkdg_seed_pool_size(d_eff)
+    periods_deg = np.array([di.period_deg for di in dihedrals], dtype=float)
+    start_coords = (
+        np.array([di.get_angle(start_atoms) for di in dihedrals], dtype=float)
+        % periods_deg
+    )
+
+    work = Chem.Mol(mol)
+    work.RemoveAllConformers()
+    params = AllChem.ETKDGv3()
+    params.useSmallRingTorsions = True
+    params.useMacrocycleTorsions = True
+    params.randomSeed = int(seed) + 10007
+    if hasattr(params, "numThreads"):
+        params.numThreads = num_threads
+    conf_ids = list(AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=params))
+    if not conf_ids:
+        fallback = AllChem.ETKDGv3()
+        fallback.randomSeed = int(seed) + 10007
+        fallback.useRandomCoords = True
+        if hasattr(fallback, "numThreads"):
+            fallback.numThreads = num_threads
+        conf_ids = list(
+            AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=fallback)
+        )
+    if not conf_ids:
+        return np.empty((0, d_eff), dtype=float)
+
+    try:
+        res = AllChem.MMFFOptimizeMoleculeConfs(
+            work, numThreads=num_threads, maxIters=200
+        )
+        if any(rc == -1 for rc, _ in res):
+            res = AllChem.UFFOptimizeMoleculeConfs(
+                work, numThreads=num_threads, maxIters=200
+            )
+    except Exception:
+        res = AllChem.UFFOptimizeMoleculeConfs(
+            work, numThreads=num_threads, maxIters=200
+        )
+    energies = [float(e) for _, e in res]
+
+    raw_angles = np.empty((len(conf_ids), d_eff), dtype=float)
+    chains = [di.chain for di in dihedrals]
+    for idx, cid in enumerate(conf_ids):
+        conf = work.GetConformer(cid)
+        raw_angles[idx] = (
+            np.array(
+                [rdMolTransforms.GetDihedralDeg(conf, *c) for c in chains],
+                dtype=float,
+            )
+            % periods_deg
+        )
+
+    if feasible is not None:
+        ok_mask = np.asarray(feasible(raw_angles), dtype=bool)
+    else:
+        ok_mask = np.ones(len(conf_ids), dtype=bool)
+
+    feas_idx = np.nonzero(ok_mask)[0]
+    if feas_idx.size == 0:
+        return np.empty((0, d_eff), dtype=float)
+    order = feas_idx[np.argsort([energies[i] for i in feas_idx])]
+
+    selected: list[np.ndarray] = []
+    thresholds = (
+        (cluster_deg, fallback_cluster_deg)
+        if fallback_cluster_deg < cluster_deg
+        else (cluster_deg,)
+    )
+    for thresh in thresholds:
+        for i in order:
+            if len(selected) >= max_points:
+                break
+            cand = raw_angles[i]
+            if _periodic_torsion_rms_deg(cand, start_coords, periods_deg) < thresh:
+                continue
+            if all(
+                _periodic_torsion_rms_deg(cand, prev, periods_deg) >= thresh
+                for prev in selected
+            ):
+                selected.append(cand)
+        if len(selected) >= max_points:
+            break
+
+    logger.info(
+        f"ETKDG cluster seeding: selected {len(selected)}/{max_points} distinct "
+        f"cluster(s) from {len(conf_ids)} embeddings ({int(ok_mask.sum())} clash-free)"
+    )
+    return np.asarray(selected, dtype=float) if selected else np.empty((0, d_eff), dtype=float)

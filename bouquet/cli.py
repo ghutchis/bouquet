@@ -13,6 +13,8 @@ from bouquet.config import (
     DEFAULT_ENSEMBLE_DIVERSITY,
     DEFAULT_ENSEMBLE_EXPLORE_MODE,
     DEFAULT_ENSEMBLE_STEPS,
+    DEFAULT_ETKDG_CLUSTER_DEG,
+    DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
     DEFAULT_INIT_CONFORMER_CAP,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
@@ -27,6 +29,7 @@ from bouquet.config import (
     ENSEMBLE_EXPLORE_MODES,
     GRADIENT_MATRIX_CAP,
     GRADIENT_WINDOW_MIN,
+    INIT_METHODS,
     KERNEL_ARMS,
     Configuration,
     RunOptions,
@@ -120,15 +123,14 @@ def build_parser() -> ArgumentParser:
         default=DEFAULT_INIT_STEPS,
         help="Number of initial guesses to make (ignored if --conformer-file is provided)",
     )
-    # "How to generate initial guesses: 'random' (Gaussian around the "
-    # "start) or 'peaks' (systematic grid / weighted sampling from the "
-    # "dihedral prior peaks). 'peaks' uses built-in priors if --priors is "
-    # "not given, and is ignored when --conformer-file is provided."
     parser.add_argument(
         "--init-method",
-        choices=["random", "peaks"],
+        choices=list(INIT_METHODS),
         default=DEFAULT_INIT_METHOD,
-        help=SUPPRESS,
+        help="How to generate initial guesses (ignored if --conformer-file is "
+        "provided): 'etkdg' (default; dimension-scaled ETKDGv3 + MMFF94 pool "
+        "clustered in symmetry-reduced torsion space), 'random' (Gaussian draws "
+        "around the start geometry), or 'peaks' (prior-peak grid / sampling).",
     )
     # "Maximum systematic peak-grid size for --init-method peaks before "
     # "falling back to weighted sampling of --init-steps points."
@@ -674,6 +676,7 @@ def main(argv=None):
         get_conformers_from_file,
         get_initial_candidates,
         get_initial_structure_from_file,
+        plan_etkdg_initial_points,
         select_initial_structure,
     )
     from bouquet.solver import plan_initial_points, run_optimization
@@ -849,12 +852,46 @@ def main(argv=None):
         f"{len(dihedrals)} dihedrals"
     )
 
-    # Plan prior-peak initial guesses (opt-in via --init-method peaks).
-    # Conformers take precedence. Peak-seeding is decoupled from PiBO
-    # acquisition: when no --priors file is given we build a built-ins-only
-    # module purely for seeding, leaving acquisition steering off.
+    # Plan initial guesses from ETKDG+MMFF94 distinct clusters (default) or
+    # prior peaks (--init-method peaks). Conformers take precedence; --init-method
+    # random leaves initial_dihedrals=None for Gaussian draws around the start.
     initial_dihedrals = None
-    if dihedrals and config.init_method == "peaks" and initial_conformers is None:
+    if dihedrals and config.init_method == "etkdg" and initial_conformers is None:
+        from bouquet.clash import build_feasibility
+
+        feasible = (
+            build_feasibility(
+                init_atoms,
+                mol,
+                dihedrals,
+                threshold=config.run.clash_threshold,
+                exclude_hbonds=config.run.clash_exclude_hbonds,
+            )
+            if config.run.clash_constraint
+            else None
+        )
+        max_init = config.init_steps
+        if config.auto_steps:
+            total = config.auto_total(len(dihedrals))
+            max_init = min(max_init, max(1, total - DEFAULT_MIN_AUTO_BO_STEPS))
+        planned = plan_etkdg_initial_points(
+            mol,
+            init_atoms,
+            dihedrals,
+            max_points=max_init,
+            seed=config.seed,
+            cluster_deg=DEFAULT_ETKDG_CLUSTER_DEG,
+            fallback_cluster_deg=DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
+            feasible=feasible,
+        )
+        if len(planned) > 0:
+            initial_dihedrals = planned
+        else:
+            logger.info(
+                "ETKDG cluster seeding found no distinct clash-free clusters; "
+                "falling back to random initial guesses."
+            )
+    elif dihedrals and config.init_method == "peaks" and initial_conformers is None:
         from bouquet.priors import create_prior_module
 
         planning_module = prior_module
