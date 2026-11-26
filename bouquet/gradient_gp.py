@@ -26,6 +26,7 @@ module docstring of ``periodic_grad_kernel`` and the project notes.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 from botorch.models.model import Model
@@ -71,6 +72,7 @@ class GradientEnhancedPeriodicGP(Model):
         grad_noise: float = 1e-2,
         kernel_arm: str = "product",
         condition: bool = True,
+        symmetry_orders: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         train_Y = train_Y.reshape(-1, 1)
@@ -116,7 +118,9 @@ class GradientEnhancedPeriodicGP(Model):
         self.kernel_arm = kernel_arm
         use_ard = kernel_arm == "ard"
         self.kernel = (
-            PeriodicKernelGrad(ard_num_dims=d) if use_ard else PeriodicKernelGrad()
+            PeriodicKernelGrad(ard_num_dims=d, symmetry_orders=symmetry_orders)
+            if use_ard
+            else PeriodicKernelGrad(symmetry_orders=symmetry_orders)
         ).to(train_X)
         self.kernel.period_length = torch.full((1, 1), float(period)).to(train_X)
         self.kernel.lengthscale = torch.full((1, d if use_ard else 1), 1.0).to(train_X)

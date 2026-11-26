@@ -37,6 +37,7 @@ gradient-GP machinery (and the perfect-shuffle convention) applies unchanged.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 from gpytorch.kernels.periodic_kernel import PeriodicKernel
@@ -70,6 +71,16 @@ class PeriodicKernelGrad(PeriodicKernel):
     torsions (mirroring the current ``ProductStructureKernel`` surrogate).
     """
 
+    def __init__(self, symmetry_orders: Sequence[int] | None = None, **kwargs):
+        super().__init__(**kwargs)
+        if symmetry_orders is not None and any(m > 1 for m in symmetry_orders):
+            sym_sq = torch.tensor(
+                [float(m * m) for m in symmetry_orders], dtype=torch.float64
+            ).view(1, 1, -1)
+            self.register_buffer("_sym_sq", sym_sq)
+        else:
+            self._sym_sq = None
+
     def _perdim_params(self, d: int):
         """Per-dimension lengthscale and period, each broadcastable to (..., 1, 1, d)."""
         # PeriodicKernel stores both as (*batch, 1, ard_num_dims); ard is 1 or d.
@@ -77,6 +88,8 @@ class PeriodicKernelGrad(PeriodicKernel):
         period = self.period_length[..., 0, :]  # (*batch, ard)
         ell = ell.unsqueeze(-2).unsqueeze(-2)  # (*batch, 1, 1, ard)
         period = period.unsqueeze(-2).unsqueeze(-2)  # (*batch, 1, 1, ard)
+        if self._sym_sq is not None:
+            ell = ell * self._sym_sq.to(ell)
         return ell, period
 
     # ---- block accessors ----------------------------------------------------
@@ -156,7 +169,7 @@ class PeriodicKernelGrad(PeriodicKernel):
             value = torch.ones(*batch_shape, n1, device=x1.device, dtype=x1.dtype)
             D = (4.0 * PI**2) / (ell * period.pow(2))  # (..., 1, 1, ard); ard is 1 or d
             # Broadcast per-dim variances from ard (shared: 1, or ARD: d) to d.
-            D = D.reshape(*batch_shape, -1).expand(*batch_shape, d)  # (*batch, d)
+            D = D.squeeze(-2).squeeze(-2).expand(*batch_shape, d)  # (*batch, d)
             grad = D.unsqueeze(-2).expand(*batch_shape, n1, d)  # (*batch, n1, d)
             # grouped [value(n1), grad dim-major (d*n1)] then interleave
             k_diag = torch.cat(

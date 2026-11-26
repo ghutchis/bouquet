@@ -25,6 +25,7 @@ __lazy_modules__ = [
 ]
 
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -95,6 +96,7 @@ def _build_selection_gp(
     train_X_deg: torch.Tensor,
     train_y_eV: torch.Tensor,
     periods_deg: torch.Tensor | float = 360.0,
+    symmetry_orders: Sequence[int] | None = None,
 ) -> SingleTaskGP:
     """Fit a GP for ensemble selection.
 
@@ -111,7 +113,9 @@ def _build_selection_gp(
     return _fit_value_gp(
         train_x,
         train_y,
-        covar_module=_periodic_covar_module(train_x.shape[1]),
+        covar_module=_periodic_covar_module(
+            train_x.shape[1], symmetry_orders=symmetry_orders
+        ),
         outcome_transform=Standardize(m=1),
     )
 
@@ -168,7 +172,10 @@ def _select_ensemble_candidates(
         mu, sigma = e, torch.full_like(e, sigma_floor_eV)
     else:
         with _suppress_fit_warnings():
-            gp = _build_selection_gp(x, e, periods_deg=periods_t)
+            gp = _build_selection_gp(
+                x, e, periods_deg=periods_t,
+                symmetry_orders=getattr(state, "symmetry_orders", None),
+            )
             gp.eval()
             xq = (
                 torch.remainder(x, periods_t) / periods_t
@@ -354,7 +361,10 @@ def _fit_selection_gp_valid(
     x = state.observed_coords[idx]
     periods_t, _ = _state_periods(state, x.dtype, x.device)
     with _suppress_fit_warnings():
-        gp = _build_selection_gp(x, e, periods_deg=periods_t)
+        gp = _build_selection_gp(
+            x, e, periods_deg=periods_t,
+            symmetry_orders=getattr(state, "symmetry_orders", None),
+        )
     gp.eval()
     return gp, float(e.min())
 

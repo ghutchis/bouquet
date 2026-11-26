@@ -27,9 +27,10 @@ __lazy_modules__ = [
 import math
 import time
 import warnings
+from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -95,8 +96,49 @@ def _periodic_kernel_kwargs(
     return kwargs, loc
 
 
+class _SymmetryPeriodicKernel(gpykernels.PeriodicKernel):
+    """PeriodicKernel with per-dimension ``m_j^2`` lengthscale compensation.
+
+    In symmetry-folded coordinates ``u_j = (m_j * theta_j / 360) mod 1``, sharing
+    one lengthscale ``l`` magnifies the local angular curvature of a symmetric
+    rotor by ``m_j^2`` (9x for a C3 methyl, 4x for a C2 phenyl), causing low-
+    barrier methyls to dominate the GP distance metric over backbone torsions.
+    Scaling dimension ``j``'s effective lengthscale to ``m_j^2 * l`` preserves
+    the exact physical angular curvature locally while keeping exact
+    ``360 / m_j`` periodicity globally. Works with both shared ``l`` and ARD.
+    """
+
+    def __init__(self, symmetry_orders: Sequence[int], **kwargs):
+        super().__init__(**kwargs)
+        self.register_buffer(
+            "_sym_sq",
+            torch.tensor([float(m * m) for m in symmetry_orders], dtype=torch.float64),
+        )
+
+    def forward(self, x1, x2, diag=False, **params):
+        last_dim_is_batch = params.pop("last_dim_is_batch", False)
+        x1_ = x1.div(self.period_length / math.pi)
+        x2_ = x2.div(self.period_length / math.pi)
+        diff = self.covar_dist(x1_, x2_, diag=diag, last_dim_is_batch=True, **params)
+
+        sym_sq = self._sym_sq.to(diff)
+        lengthscale = self.lengthscale[..., 0, :] * sym_sq  # (*batch, d)
+        if diag:
+            lengthscale = lengthscale[..., :, None]
+        else:
+            lengthscale = lengthscale[..., :, None, None]
+        exp_term = diff.sin().pow(2.0).div(lengthscale).mul(-2.0)
+
+        if not last_dim_is_batch:
+            exp_term = exp_term.sum(dim=(-2 if diag else -3))
+
+        return exp_term.exp()
+
+
 def _periodic_covar_module(
-    num_dims: int, lengthscale_prior: str = "none"
+    num_dims: int,
+    lengthscale_prior: str = "none",
+    symmetry_orders: Sequence[int] | None = None,
 ) -> gpykernels.ScaleKernel:
     """Build the periodic GP covariance module shared by the acquisition GP and
     the ensemble-selection GP (a scaled product of per-dihedral periodic kernels).
@@ -108,8 +150,17 @@ def _periodic_covar_module(
       LogNormal prior, ``LogNormal(sqrt(2) + 0.5*ln d, sqrt(3))``, biasing the GP
       toward smoother fits as ``d`` grows. The lengthscale is also initialized at
       the prior median.
+
+    When ``symmetry_orders`` contains any ``m_j > 1``, uses
+    :class:`_SymmetryPeriodicKernel` so dimension ``j`` has effective lengthscale
+    ``m_j^2 * l`` (preserving physical angular curvature under ``u_j = m_j * x_j``).
     """
     base_kwargs, loc = _periodic_kernel_kwargs(num_dims, lengthscale_prior)
+    if symmetry_orders is not None and any(m > 1 for m in symmetry_orders):
+        base_kernel = _SymmetryPeriodicKernel(symmetry_orders, **base_kwargs)
+        if loc is not None:
+            base_kernel.lengthscale = math.exp(loc)
+        return gpykernels.ScaleKernel(base_kernel)
     base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
     if loc is not None:
         base_kernel.lengthscale = math.exp(loc)  # start at the prior median
@@ -138,7 +189,9 @@ COVAR_ARMS = KERNEL_ARMS
 
 
 def _ard_covar_module(
-    num_dims: int, lengthscale_prior: str = "none"
+    num_dims: int,
+    lengthscale_prior: str = "none",
+    symmetry_orders: Sequence[int] | None = None,
 ) -> gpykernels.ScaleKernel:
     """Product periodic kernel with a lengthscale PER torsion.
 
@@ -149,14 +202,20 @@ def _ard_covar_module(
     """
     kwargs, loc = _periodic_kernel_kwargs(num_dims, lengthscale_prior)
     kwargs["ard_num_dims"] = num_dims
-    base = gpykernels.PeriodicKernel(**kwargs)
+    if symmetry_orders is not None and any(m > 1 for m in symmetry_orders):
+        base = _SymmetryPeriodicKernel(symmetry_orders, **kwargs)
+    else:
+        base = gpykernels.PeriodicKernel(**kwargs)
     if loc is not None:
         base.lengthscale = math.exp(loc)
     return gpykernels.ScaleKernel(base)
 
 
 def make_covar_module(
-    num_dims: int, lengthscale_prior: str = "none", arm: str = "product"
+    num_dims: int,
+    lengthscale_prior: str = "none",
+    arm: str = "product",
+    symmetry_orders: Sequence[int] | None = None,
 ):
     """Build the surrogate covariance for one arm (see :data:`COVAR_ARMS`).
 
@@ -166,8 +225,12 @@ def make_covar_module(
     if arm not in COVAR_ARMS:
         raise ValueError(f"arm must be one of {COVAR_ARMS}, got {arm!r}")
     if arm == "ard" and num_dims >= 2:
-        return _ard_covar_module(num_dims, lengthscale_prior)
-    return _periodic_covar_module(num_dims, lengthscale_prior)
+        return _ard_covar_module(
+            num_dims, lengthscale_prior, symmetry_orders=symmetry_orders
+        )
+    return _periodic_covar_module(
+        num_dims, lengthscale_prior, symmetry_orders=symmetry_orders
+    )
 
 
 def _fit_value_gp(
@@ -360,6 +423,7 @@ def _fit_gradient_gp(
     gp = GradientEnhancedPeriodicGP(
         train_x, train_y, grad_scaled, grad_mask=mask, period=1.0,
         kernel_arm=kernel_arm, condition=False,
+        symmetry_orders=symmetry_orders,
     )
     if frozen_hypers is None:
         gp.fit(steps=_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
@@ -694,6 +758,7 @@ def _select_next_points_botorch(
                     train_x.shape[1],
                     lengthscale_prior=lengthscale_prior,
                     arm=kernel_arm,
+                    symmetry_orders=symmetry_orders if has_symmetry else None,
                 ),
             )
         t_gp_fit = time.perf_counter() - _t_fit0

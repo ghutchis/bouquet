@@ -215,3 +215,114 @@ class TestSymmetryInSurrogateAndEnsemble:
         ss.update(coords, energies)
         # Row 1 is symmetry-equivalent to row 0 -> only 2 elite conformers kept
         assert ss.n_elite == 2
+
+
+class TestSymmetryLengthscaleCompensation:
+    @pytest.mark.parametrize("arm", ["product", "ard"])
+    def test_value_kernel_periodicity_and_local_curvature(self, arm):
+        """m_j^2 compensation keeps 360/m_j periodicity AND matches nosym local curvature."""
+        from bouquet.surrogate import make_covar_module
+
+        sym = (1, 2, 3)
+        k_sym = make_covar_module(3, arm=arm, symmetry_orders=sym).double()
+        k_nosym = make_covar_module(3, arm=arm, symmetry_orders=None).double()
+
+        # Set identical period=1.0, outputscale=1.0, and base lengthscales
+        for k in (k_sym, k_nosym):
+            k.outputscale = 1.0
+        base_ls = torch.tensor([[0.8, 1.1, 0.6]], dtype=torch.float64) if arm == "ard" else 0.8
+        k_sym.base_kernel.period_length = 1.0
+        k_sym.base_kernel.lengthscale = base_ls
+        if arm == "ard":
+            k_nosym.base_kernel.period_length = 1.0
+            k_nosym.base_kernel.lengthscale = base_ls
+        else:
+            k_nosym.base_kernel.base_kernel.period_length = 1.0
+            k_nosym.base_kernel.base_kernel.lengthscale = base_ls
+
+        # Small physical perturbation dtheta in degrees -> identical kernel value to O(eps^4)
+        theta0 = torch.tensor([[25.0, 40.0, 15.0]], dtype=torch.float64)
+        dtheta = torch.tensor([[1.0, -0.8, 0.5]], dtype=torch.float64)  # small angles (deg)
+        periods = torch.tensor([360.0, 180.0, 120.0], dtype=torch.float64)
+
+        u0 = torch.remainder(theta0, periods) / periods
+        u1 = torch.remainder(theta0 + dtheta, periods) / periods
+        x0 = theta0 / 360.0
+        x1 = (theta0 + dtheta) / 360.0
+
+        val_sym = k_sym(u0, u1).to_dense().item()
+        val_nosym = k_nosym(x0, x1).to_dense().item()
+        assert val_sym == pytest.approx(val_nosym, rel=1e-3, abs=1e-5)
+
+        # Exact periodicity at 360/m_j
+        u_shift = torch.remainder(theta0 + periods, periods) / periods
+        assert k_sym(u0, u_shift).to_dense().item() == pytest.approx(1.0, abs=1e-12)
+
+        # diag=True matches diagonal of full Gram matrix, including batched queries
+        U = torch.rand(4, 3, dtype=torch.float64)
+        assert torch.allclose(
+            k_sym(U, U, diag=True), k_sym(U, U).to_dense().diag(), atol=1e-12
+        )
+        Ub = torch.rand(5, 2, 3, dtype=torch.float64)
+        assert torch.allclose(
+            k_sym(Ub, Ub, diag=True),
+            torch.diagonal(k_sym(Ub, Ub).to_dense(), dim1=-2, dim2=-1),
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize("ard", [False, True])
+    def test_grad_kernel_matches_autograd_with_symmetry_orders(self, ard):
+        """PeriodicKernelGrad(symmetry_orders=...) matches autograd across all blocks."""
+        from torch.func import jacrev
+
+        from bouquet.periodic_grad_kernel import PeriodicKernelGrad
+
+        torch.manual_seed(42)
+        sym = (1, 2, 3)
+        d = len(sym)
+        sym_sq = torch.tensor([1.0, 4.0, 9.0], dtype=torch.float64)
+        base_ell = torch.tensor([0.7, 1.1, 0.5], dtype=torch.float64) if ard else torch.tensor([0.7], dtype=torch.float64)
+        eff_ell = base_ell * sym_sq
+        period = torch.ones(d, dtype=torch.float64)
+
+        kern = (
+            PeriodicKernelGrad(ard_num_dims=d, symmetry_orders=sym)
+            if ard
+            else PeriodicKernelGrad(symmetry_orders=sym)
+        ).double()
+        kern.lengthscale = base_ell.reshape(1, -1)
+        kern.period_length = torch.ones((1, d if ard else 1), dtype=torch.float64)
+
+        X = torch.rand(4, d, dtype=torch.float64)
+        K = kern.forward(X, X)
+
+        def k_scalar(a, b):
+            u = math.pi * (a - b) / period
+            return torch.exp((-2.0 * torch.sin(u).pow(2) / eff_ell).sum())
+
+        gA = jacrev(k_scalar, argnums=0)
+        gB = jacrev(k_scalar, argnums=1)
+        H = jacrev(jacrev(k_scalar, argnums=0), argnums=1)
+        blk = d + 1
+        ref = torch.zeros(4 * blk, 4 * blk, dtype=torch.float64)
+        for i in range(4):
+            for j in range(4):
+                b = torch.zeros(blk, blk, dtype=torch.float64)
+                b[0, 0] = k_scalar(X[i], X[j])
+                b[0, 1:] = gB(X[i], X[j])
+                b[1:, 0] = gA(X[i], X[j])
+                b[1:, 1:] = H(X[i], X[j])
+                ref[i * blk : (i + 1) * blk, j * blk : (j + 1) * blk] = b
+
+        assert torch.allclose(K, ref, atol=1e-9)
+        assert torch.allclose(kern.forward(X, X, diag=True), ref.diag(), atol=1e-9)
+        assert torch.allclose(kern.value_value(X, X), ref[::blk, ::blk], atol=1e-9)
+
+        # Batched diag=True with unbatched kernel
+        Xb = torch.rand(3, 2, d, dtype=torch.float64)
+        K_b = kern.forward(Xb, Xb)
+        assert torch.allclose(
+            kern.forward(Xb, Xb, diag=True),
+            torch.diagonal(K_b, dim1=-2, dim2=-1),
+            atol=1e-9,
+        )
