@@ -12,7 +12,7 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -412,6 +412,8 @@ class DihedralPriorModule(nn.Module):
     def _build_bivariate(self):
         """Build 2D bivariate von Mises distributions."""
         self.bivariate_dists: Dict[Tuple[int, int], BivariateVonMisesMixture] = {}
+        # Register as a ModuleDict too so .to(device) moves bivariate buffers.
+        self._bivariate_modules = nn.ModuleDict()
 
         for (d1, d2), type_id in self.bivariate_assignments.items():
             type_def = self.bivariate_priors.get(type_id)
@@ -420,11 +422,13 @@ class DihedralPriorModule(nn.Module):
                 logger.warning(f"Unknown bivariate type '{type_id}' for dims ({d1}, {d2})")
                 continue
 
-            self.bivariate_dists[(d1, d2)] = BivariateVonMisesMixture(
+            mod = BivariateVonMisesMixture(
                 components=type_def["components"],
                 weights=type_def["weights"],
                 max_concentration=self.max_concentration,
             )
+            self.bivariate_dists[(d1, d2)] = mod
+            self._bivariate_modules[f"{d1}_{d2}"] = mod
 
     def _to_radians(self, x: Tensor) -> Tensor:
         """Convert a dihedral value to radians, wrapped to [-π, π).
@@ -494,6 +498,16 @@ class DihedralPriorModule(nn.Module):
             if dist is None:
                 continue
             angle = self._to_radians(X[..., d])
+            # Move univariate distribution tensors lazily if X lives on another device (e.g. CUDA).
+            if dist.component_distribution.loc.device != angle.device:
+                dist = MixtureSameFamily(
+                    Categorical(dist.mixture_distribution.probs.to(angle.device)),
+                    VonMises(
+                        dist.component_distribution.loc.to(angle.device),
+                        dist.component_distribution.concentration.to(angle.device),
+                    ),
+                )
+                self.univariate_dists[d] = dist
             vm_lp = dist.log_prob(angle)
             if w_bg > 0.0:
                 bg_lp = torch.full_like(vm_lp, log_w + log_uniform)
@@ -505,10 +519,13 @@ class DihedralPriorModule(nn.Module):
         # here; they keep the hard clamp below as their floor.
         for (d1, d2), dist in self.bivariate_dists.items():
             # The prior was fitted on the SMARTS pattern's own quartets; subtract
-            # the constant offset to bouquet's quartet before scoring.
+            # the constant offset (stored in degrees) AFTER converting X to radians
+            # so both input_in_degrees=True and input_in_degrees=False shift identically.
+            if dist.mu1.device != X.device:
+                dist.to(X.device)
             off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
-            angle1 = self._to_radians(X[..., d1] - off1)
-            angle2 = self._to_radians(X[..., d2] - off2)
+            angle1 = self._to_radians(X[..., d1]) - math.radians(off1)
+            angle2 = self._to_radians(X[..., d2]) - math.radians(off2)
             log_prob = log_prob + dist.log_prob(angle1, angle2)
 
         # Average over informative dihedrals (mean, not sum) so the prior's
@@ -632,9 +649,23 @@ class DihedralPriorMatcher:
         self.univariate_patterns = sorted(univariate_smarts, key=lambda p: p.priority, reverse=True)
         self.bivariate_patterns = sorted(bivariate_smarts, key=lambda p: p.priority, reverse=True)
 
-        # Compile patterns
+        # Compile patterns (and precompute atom-map index lists once per pattern)
         self._compiled_uni = self._compile_patterns(self.univariate_patterns)
         self._compiled_bi = self._compile_patterns(self.bivariate_patterns)
+        self._uni_map_lists = {
+            smarts: self._atom_map_list(smarts_mol)
+            for smarts, smarts_mol in self._compiled_uni.items()
+        }
+
+    @staticmethod
+    def _atom_map_list(smarts_mol: Chem.Mol) -> List[int]:
+        """Precompute the atom-index permutation for atom-mapped SMARTS."""
+        index_map = {}
+        for atom in smarts_mol.GetAtoms():
+            map_num = atom.GetAtomMapNum()
+            if map_num:
+                index_map[map_num - 1] = atom.GetIdx()
+        return [index_map[x] for x in sorted(index_map)]
 
     @staticmethod
     def _compile_patterns(patterns: List) -> Dict[str, Chem.Mol]:
@@ -656,19 +687,13 @@ class DihedralPriorMatcher:
             smarts_mol = self._compiled_uni.get(pattern.smarts)
             if smarts_mol is None:
                 continue
+            map_list = self._uni_map_lists[pattern.smarts]
+            if len(map_list) < 4:
+                continue
 
             for match in mol.GetSubstructMatches(smarts_mol):
-                # these SMARTS have atom maps, so convert them
-                # http://www.rdkit.org/docs/GettingStartedInPython.html#atom-map-indices-in-smarts
-                index_map = {}
-                for atom in smarts_mol.GetAtoms():
-                    map_num = atom.GetAtomMapNum()
-                    if map_num:
-                        index_map[map_num-1] = atom.GetIdx()
-                map_list = [index_map[x] for x in sorted(index_map)]
                 mapped = tuple(match[x] for x in map_list)
-
-                if len(mapped) >= 4 and _matches_dihedral(mapped, dihedral):
+                if _matches_dihedral(mapped, dihedral):
                     return pattern.prior_type
 
         return None
@@ -800,14 +825,37 @@ class DihedralPriorMatcher:
             bivariate_dims.add(d1)
             bivariate_dims.add(d2)
 
-        # Then assign univariate to remaining
-        univariate = {}
+        # Then assign univariate to remaining in a single pass per pattern
+        # (highest-priority pattern wins; each pattern runs GetSubstructMatches once).
+        remaining: Dict[Tuple[int, int, int, int], List[int]] = {}
         for i, dih in enumerate(dihedrals):
             if i in bivariate_dims:
                 continue
-            type_id = self.match_univariate(mol, dih)
-            if type_id is not None:
-                univariate[i] = type_id
+            key = tuple(dih)
+            remaining.setdefault(key, []).append(i)
+            rev = key[::-1]
+            if rev != key:
+                remaining.setdefault(rev, []).append(i)
+
+        univariate: Dict[int, PriorTypeId] = {}
+        n_unassigned = sum(1 for i in range(len(dihedrals)) if i not in bivariate_dims)
+        if n_unassigned > 0:
+            for pattern in self.univariate_patterns:
+                if len(univariate) >= n_unassigned:
+                    break
+                smarts_mol = self._compiled_uni.get(pattern.smarts)
+                if smarts_mol is None:
+                    continue
+                map_list = self._uni_map_lists[pattern.smarts]
+                if len(map_list) < 4:
+                    continue
+                for match in mol.GetSubstructMatches(smarts_mol):
+                    mapped = tuple(match[x] for x in map_list)
+                    idxs = remaining.get(mapped)
+                    if idxs is not None:
+                        for idx in idxs:
+                            if idx not in univariate:
+                                univariate[idx] = pattern.prior_type
 
         return univariate, bivariate
 
@@ -1108,6 +1156,15 @@ def load_torlib_smarts(
     return patterns
 
 
+@lru_cache(maxsize=4)
+def _cached_torlib_matcher(resolved_path: Path) -> DihedralPriorMatcher:
+    """Compile and cache the torsion-library SMARTS matcher for ``resolved_path``."""
+    from rdkit import rdBase
+
+    with rdBase.BlockLogs():
+        return DihedralPriorMatcher(load_torlib_smarts(resolved_path), [])
+
+
 def assign_categories(
     mol: "Chem.Mol",
     dihedrals: List[Tuple[int, int, int, int]],
@@ -1130,14 +1187,7 @@ def assign_categories(
         pattern (unmatched dihedrals are absent and become their own singleton group
         downstream).
     """
-    # Some torlib rows use recursive-SMARTS label syntax RDKit can't parse; the matcher
-    # skips any pattern that fails to compile, but RDKit logs each failure to stderr.
-    # Silence those while compiling so a normal run isn't spammed. BlockLogs saves and
-    # restores the prior log state on exit, so we don't clobber a caller that had already
-    # disabled (or enabled) rdApp.error.
-    from rdkit import rdBase
-
-    with rdBase.BlockLogs():
-        matcher = DihedralPriorMatcher(load_torlib_smarts(torlib_path), [])
+    path = Path(torlib_path).resolve() if torlib_path is not None else default_torlib_path().resolve()
+    matcher = _cached_torlib_matcher(path)
     univariate, _bivariate = matcher.assign_all(mol, dihedrals)
     return univariate

@@ -103,7 +103,7 @@ def _group_rmsds(pos, pos0, systems) -> list[float]:
             for s in systems]
 
 
-def calibrate_alpha(atoms, calc, systems, cfg: RingMTDConfig) -> np.ndarray:
+def calibrate_alpha(atoms, calc, systems, cfg: RingMTDConfig, rng=None) -> np.ndarray:
     """Per-group Gaussian width from a short unbiased run.
 
     ``alpha_g = 1/(2 sigma_g^2)`` with ``sigma_g = max(2 * sigma_therm, 0.1 A)``, clamped.
@@ -115,13 +115,15 @@ def calibrate_alpha(atoms, calc, systems, cfg: RingMTDConfig) -> np.ndarray:
     from ase.md.langevin import Langevin
     from ase.md.velocitydistribution import (MaxwellBoltzmannDistribution, Stationary,
                                              ZeroRotation)
+    if rng is None:
+        rng = np.random.default_rng(cfg.seed)
     a = atoms.copy()
     a.calc = calc
     _inflate_h(a, cfg.h_mass)
-    MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K)
+    MaxwellBoltzmannDistribution(a, temperature_K=cfg.temperature_K, rng=rng)
     Stationary(a); ZeroRotation(a)
     dyn = Langevin(a, timestep=cfg.timestep_fs * units.fs, temperature_K=cfg.temperature_K,
-                   friction=cfg.friction_inv_fs / units.fs)
+                   friction=cfg.friction_inv_fs / units.fs, rng=rng)
     pos0 = a.get_positions()
     series: list[list[float]] = []
     dyn.attach(lambda: series.append(_group_rmsds(a.get_positions(), pos0, systems)),
@@ -163,17 +165,18 @@ def _run_walker(task: dict):
 
     engine = CalculatorFactory.create(method=cfg.engine, mol=molh, charge=task["charge"],
                                       multiplicity=task["mult"])
-    alpha = calibrate_alpha(atoms, engine, systems, cfg)
+    walker_rng = np.random.default_rng(task["vseed"])
+    alpha = calibrate_alpha(atoms, engine, systems, cfg, rng=walker_rng)
     bias = RMSDBias([s.bias_idx for s in systems], k=cfg.k_hill_kcal * KCAL_TO_EV,
                     alpha=alpha, max_refs=cfg.max_refs)
     atoms.calc = SumCalculator([engine, bias])
 
-    MaxwellBoltzmannDistribution(atoms, temperature_K=cfg.temperature_K,
-                                 rng=np.random.default_rng(task["vseed"]))
+    MaxwellBoltzmannDistribution(atoms, temperature_K=cfg.temperature_K, rng=walker_rng)
     Stationary(atoms); ZeroRotation(atoms)
     dyn = Langevin(atoms, timestep=cfg.timestep_fs * units.fs,
                    temperature_K=cfg.temperature_K,
-                   friction=cfg.friction_inv_fs / units.fs)
+                   friction=cfg.friction_inv_fs / units.fs,
+                   rng=walker_rng)
     bias.deposit(atoms)  # reference 0 = the starting basin
     frames: list[np.ndarray] = []
     dyn.attach(lambda: bias.deposit(atoms),
@@ -288,7 +291,11 @@ def run_ring_mtd(mol_or_smiles, cfg: RingMTDConfig | None = None) -> HarvestResu
     from bouquet.calculator import CalculatorFactory
 
     cfg = cfg or RingMTDConfig()
+    if cfg.max_bias_rounds < 1:
+        raise ValueError(f"max_bias_rounds must be >= 1, got {cfg.max_bias_rounds}")
     mol = Chem.MolFromSmiles(mol_or_smiles) if isinstance(mol_or_smiles, str) else mol_or_smiles
+    if mol is None:
+        raise ValueError(f"Could not parse SMILES: {mol_or_smiles!r}")
     # Keep the INPUT atom order end-to-end: `systems` (dedup_idx), the walker starts, the
     # stereo signature, and harvest all index into `molh = AddHs(mol)`, and the seeds come out
     # in that order too -- so they line up atom-for-atom with the molecule bouquet builds as
@@ -348,6 +355,7 @@ def run_ring_mtd(mol_or_smiles, cfg: RingMTDConfig | None = None) -> HarvestResu
 
         return harvest(
             frames, molh, systems, calc, start_signature=start_sig,
+            charge=charge, multiplicity=mult,
             coarse_tol=round_cfg.coarse_dedup_A, fine_tol=round_cfg.fine_dedup_A,
             max_coarse=round_cfg.max_coarse_frames,
             temperature=round_cfg.harvest_temperature_K,
@@ -361,8 +369,10 @@ def run_ring_mtd(mol_or_smiles, cfg: RingMTDConfig | None = None) -> HarvestResu
     # and a too-weak round's are all the starting basin, so neither is worth the second
     # quench pass that merging them would cost. A healthy molecule accepts on round 1 and
     # pays nothing (8 of 17 in Stage-0 did).
+    # lo=0.0 means "not yet bracketed from below" (so _adapt_k_hill uses k * 0.4 backoff
+    # until a too_weak round establishes a lower bound, matching hi=inf above).
     k = cfg.k_hill_kcal
-    lo, hi = cfg.k_hill_bounds[0], float("inf")
+    lo, hi = 0.0, float("inf")
     rounds, best, best_verdict = [], None, None
     n_rounds = cfg.max_bias_rounds if cfg.adaptive_bias else 1
     for _ in range(n_rounds):

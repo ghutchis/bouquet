@@ -402,3 +402,46 @@ def test_offset_puts_the_mode_where_the_prior_expects_it():
 
     # And the offsets are what carried it there.
     assert abs(assignment.offset1_deg) > 1.0
+
+
+def test_bivariate_offset_works_in_normalized_pibo_mode():
+    """Offsets are stored in degrees and must shift properly when input_in_degrees=False."""
+    priors = {
+        "p": {
+            "components": [
+                {
+                    "mu1_deg": 60.0,
+                    "mu2_deg": 180.0,
+                    "kappa1": 15.0,
+                    "kappa2": 15.0,
+                    "correlation": 0.0,
+                }
+            ],
+            "weights": [1.0],
+        }
+    }
+    ba = BivariateAssignment(prior_type="p", offset1_deg=120.0, offset2_deg=-30.0)
+    deg = DihedralPriorModule(
+        dim=2,
+        univariate_assignments={},
+        bivariate_assignments={(0, 1): ba},
+        univariate_priors={},
+        bivariate_priors=priors,
+        input_in_degrees=True,
+        max_concentration=None,
+    )
+    norm = DihedralPriorModule(
+        dim=2,
+        univariate_assignments={},
+        bivariate_assignments={(0, 1): ba},
+        univariate_priors={},
+        bivariate_priors=priors,
+        input_in_degrees=False,
+        max_concentration=None,
+    )
+    # Peak should be at (60 + 120, 180 - 30) = (180, 150) degrees.
+    x_deg = torch.tensor([[[180.0, 150.0]], [[60.0, 180.0]]], dtype=torch.float64)
+    lp_deg = deg(x_deg)
+    lp_norm = norm(x_deg / 360.0)
+    assert torch.allclose(lp_deg, lp_norm, atol=1e-9)
+    assert lp_norm[0] > lp_norm[1]

@@ -13,9 +13,10 @@ __lazy_modules__ = [
 ]
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING
 
 import networkx as nx
 from ase import Atoms
@@ -304,7 +305,7 @@ def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:
             logger.warning(f"Bond determination failed: {e}. Trying with charge=0")
             rdDetermineBonds.DetermineBonds(mol, charge=0)
 
-    elif ext in (".mol", ".sdf"):
+    elif ext in (".mol", ".sdf", ".mdl"):
         mol = Chem.MolFromMolFile(str(filepath), removeHs=False, sanitize=True)
         if mol is None:
             # Try without sanitization
@@ -467,6 +468,19 @@ class DihedralInfo:
     """Prior type ID for PiBO (assigned by SMARTS matching)"""
     correlated_with: int | None = None
     """Index of correlated dihedral (for bivariate priors)"""
+    symmetry_order: int = 1
+    """Exact local rotational symmetry order m (period = 360 / m degrees).
+
+    1 for an asymmetric rotor (360 deg), 2 for a rigid planar C2 group (phenyl,
+    para-Cl/F/CN-phenyl, -NO2, -CO2-; 180 deg), 3 for a tetrahedral C3 terminal
+    top (-CH3, -CF3, -NH3+; 120 deg), or lcm(m_u, m_v) when both sides are
+    symmetric (e.g. 6 for toluene / N-methylpyridinium; 60 deg).
+    """
+
+    @property
+    def period_deg(self) -> float:
+        """Irreducible angular period in degrees (360 / symmetry_order)."""
+        return 360.0 / self.symmetry_order
 
     def get_angle(self, atoms: Atoms) -> float:
         """Get the value of the specified dihedral angle.
@@ -526,7 +540,7 @@ def geometry_bond_set(atoms: Atoms, tol: float = 1.3) -> set[tuple[int, int]]:
 
     z = atoms.get_atomic_numbers()
     pos = atoms.get_positions()
-    rcov = np.array([covalent_radii[zi] for zi in z])
+    rcov = covalent_radii[z]
     d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
     cutoff = tol * (rcov[:, None] + rcov[None, :])
     iu = np.triu_indices(len(z), k=1)
@@ -552,6 +566,50 @@ def bonds_broken(atoms: Atoms, required_bonds: set[tuple[int, int]],
     bridgeheads) are legitimate conformations, not connectivity changes, so they are
     deliberately ignored. This is the "retain the molecule's bonds" criterion."""
     return bool(set(required_bonds) - geometry_bond_set(atoms, tol))
+
+
+# Bond-*formation* tolerance for the species guard: a non-bonded contact counts as
+# a newly formed bond only inside this multiple of the summed covalent radii. Much
+# stricter than the 1.3 breaking tolerance -- see species_changed.
+BOND_FORMATION_TOL = 1.0
+
+
+def bonds_formed(atoms: Atoms, reference_bonds: set[tuple[int, int]],
+                 tol: float = BOND_FORMATION_TOL) -> bool:
+    """True if the geometry has a covalent contact absent from ``reference_bonds``
+    -- atoms drove into each other and made a new bond.
+
+    The counterpart to :func:`bonds_broken`, and deliberately much stricter: a
+    legitimately strained or folded conformer can push non-bonded atoms close
+    (bicyclo[1.1.1] bridgeheads sit near 1.2x the summed covalent radii), so only
+    a contact inside genuine covalent-bond range (``tol`` 1.0) counts. That
+    asymmetry is what makes this safe to apply to every evaluation.
+
+    The failure it catches is not subtle. In the d=8-12 stopbench runs the
+    collapsed geometries formed 4-42 bonds at once with *zero* broken, at
+    contacts of 0.9-1.2 A between heavy atoms -- one relaxation had driven atoms
+    straight through each other. :func:`bonds_broken` is blind to that by
+    construction, which is why those runs were never rejected and instead became
+    absorbing states that consumed the rest of the budget.
+
+    ``reference_bonds`` should be perceived at the *looser* breaking tolerance
+    (as :func:`geometry_bond_set` defaults to). A pair that is already close in
+    the reference -- e.g. a 1-3 Cl...Cl contact perceived as bonded -- is then in
+    the reference set and cannot be reported as newly formed.
+    """
+    return bool(geometry_bond_set(atoms, tol) - set(reference_bonds))
+
+
+def species_changed(atoms: Atoms, required_bonds: set[tuple[int, int]],
+                    tol_break: float = 1.3,
+                    tol_form: float = BOND_FORMATION_TOL) -> bool:
+    """True if the geometry is no longer the same species -- a bond broke OR formed.
+
+    The union of :func:`bonds_broken` and :func:`bonds_formed`; see those for why
+    the two directions use different tolerances.
+    """
+    return (bonds_broken(atoms, required_bonds, tol_break)
+            or bonds_formed(atoms, required_bonds, tol_form))
 
 
 def connectivity_changed(atoms: Atoms, mol: Chem.Mol, tol: float = 1.3) -> bool:
@@ -604,19 +662,124 @@ def get_dihedral_info(
     h = graph.copy()
     h.remove_edge(*bond)
 
-    try:
-        components = list(nx.connected_components(h))
-        if len(components) != 2:
-            return None
-        a, b = components
-    except ValueError:
+    components = list(nx.connected_components(h))
+    if len(components) != 2:
         return None
+    a, b = components
 
     # Determine which component rotates
     if bond[1] in a:
         return DihedralInfo(chain=tuple(points), group=a, type="backbone")
     else:
         return DihedralInfo(chain=tuple(points), group=b, type="backbone")
+
+
+def _side_symmetry_order(
+    mol: Chem.Mol,
+    anchor_idx: int,
+    other_idx: int,
+    comp_atoms: set[int],
+    ranks: list[int],
+    rot_bonds: set[tuple[int, int]],
+) -> int:
+    """Exact rigid C_m rotational symmetry order of fragment ``comp_atoms``
+    around the ``other_idx -> anchor_idx`` bond axis.
+
+    Conservative by design (zero false positives): returns ``m > 1`` only when
+    rotating ``comp_atoms`` by ``360 / m`` degrees is an exact symmetry of the
+    3D geometry regardless of the rest of the molecule (no internal rotatable
+    bonds, no non-aromatic puckerable rings, and no pyramidal lone-pair traps
+    such as neutral -NH2).
+    """
+    anchor = mol.GetAtomWithIdx(anchor_idx)
+    nbrs = [n for n in anchor.GetNeighbors() if n.GetIdx() != other_idx]
+    k = len(nbrs)
+    if k < 2:
+        return 1
+
+    # Internal rotatable bonds or puckerable non-aromatic rings break exact
+    # invariance under a rigid rotation of this fragment.
+    for i, j in rot_bonds:
+        if i in comp_atoms and j in comp_atoms:
+            return 1
+    for idx in comp_atoms:
+        at = mol.GetAtomWithIdx(idx)
+        if at.IsInRing() and not at.GetIsAromatic():
+            return 1
+
+    hyb = anchor.GetHybridization()
+
+    # Case 1: Tetrahedral sp3 terminal C3 top (-CH3, -CF3, -CCl3, -NH3+, -SiH3).
+    if k == 3 and hyb == Chem.HybridizationType.SP3:
+        if all(n.GetDegree() == 1 for n in nbrs):
+            sigs = {(n.GetAtomicNum(), n.GetFormalCharge(), n.GetIsotope()) for n in nbrs}
+            if len(sigs) == 1:
+                return 3
+        return 1
+
+    # Case 2: Planar sp2 C2 rotor.
+    if k == 2 and hyb == Chem.HybridizationType.SP2:
+        n0, n1 = nbrs
+        # (a) Terminal planar C2 group: resonance-symmetric -NO2, -CO2-, -CS2-
+        # (exclude neutral N/P which pyramidalize, e.g. -NH2).
+        if n0.GetDegree() == 1 and n1.GetDegree() == 1:
+            if (
+                n0.GetAtomicNum() == n1.GetAtomicNum()
+                and n0.GetIsotope() == n1.GetIsotope()
+            ):
+                if ranks[n0.GetIdx()] == ranks[n1.GetIdx()]:
+                    if anchor.GetAtomicNum() == 6 or (
+                        anchor.GetAtomicNum() == 7 and anchor.GetFormalCharge() == 1
+                    ):
+                        return 2
+                elif n0.GetAtomicNum() in (8, 16):
+                    b0 = mol.GetBondBetweenAtoms(anchor_idx, n0.GetIdx()).GetBondType()
+                    b1 = mol.GetBondBetweenAtoms(anchor_idx, n1.GetIdx()).GetBondType()
+                    pair = {(b0, n0.GetFormalCharge()), (b1, n1.GetFormalCharge())}
+                    if pair == {
+                        (Chem.BondType.DOUBLE, 0),
+                        (Chem.BondType.SINGLE, -1),
+                    }:
+                        return 2
+
+        # (b) Rigid planar aromatic ring with graph-equivalent ortho neighbors
+        # (phenyl, para-F/Cl/Br/CN-phenyl, 3,5-disubstituted phenyl, 4-pyridyl,
+        # 9-anthryl, etc.): no chiral centers and no out-of-plane sp3 atoms.
+        if anchor.GetIsAromatic() and ranks[n0.GetIdx()] == ranks[n1.GetIdx()]:
+            if any(
+                mol.GetAtomWithIdx(i).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+                for i in comp_atoms
+            ):
+                return 1
+            if all(
+                mol.GetAtomWithIdx(i).GetDegree() == 1
+                or mol.GetAtomWithIdx(i).GetHybridization()
+                in (Chem.HybridizationType.SP2, Chem.HybridizationType.SP)
+                for i in comp_atoms
+            ):
+                return 2
+
+    return 1
+
+
+def assign_dihedral_symmetries(
+    mol: Chem.Mol, dihedrals: list[DihedralInfo]
+) -> None:
+    """Compute and store exact ``symmetry_order`` on each :class:`DihedralInfo`."""
+    if not dihedrals:
+        return
+    ranks = list(
+        Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True)
+    )
+    rot_bonds = {tuple(sorted((d.chain[1], d.chain[2]))) for d in dihedrals}
+    all_atoms = set(range(mol.GetNumAtoms()))
+    for d in dihedrals:
+        u, v = d.chain[1], d.chain[2]
+        comp_v = set(d.group)
+        comp_u = all_atoms - comp_v
+        mu = _side_symmetry_order(mol, u, v, comp_u, ranks, rot_bonds)
+        mv = _side_symmetry_order(mol, v, u, comp_v, ranks, rot_bonds)
+        d.symmetry_order = math.lcm(mu, mv)
 
 
 def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
@@ -656,5 +819,14 @@ def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
         if info is not None:
             dihedrals.append(info)
 
-    logger.info(f"Detected {len(dihedrals)} rotatable dihedral angles")
+    assign_dihedral_symmetries(mol, dihedrals)
+    n_sym = sum(1 for d in dihedrals if d.symmetry_order > 1)
+    if n_sym:
+        vol_cut = math.prod(d.symmetry_order for d in dihedrals)
+        logger.info(
+            f"Detected {len(dihedrals)} rotatable dihedral angles "
+            f"({n_sym} symmetric; {vol_cut}x search-volume reduction)"
+        )
+    else:
+        logger.info(f"Detected {len(dihedrals)} rotatable dihedral angles")
     return dihedrals

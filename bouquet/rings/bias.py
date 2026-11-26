@@ -32,13 +32,13 @@ import logging
 import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 
+from bouquet.config import KCAL_TO_EV
+
 logger = logging.getLogger(__name__)
 
 # Below this ratio of smallest/largest singular value the optimal rotation is not unique
 # (planar or degenerate bias set); fall back to the identity rotation rather than emit NaNs.
 _DEGENERATE_SV_RATIO = 1e-6
-
-KCAL_TO_EV = 0.0433641153  # 1 kcal/mol in eV
 
 
 def kabsch_rotation(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

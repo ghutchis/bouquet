@@ -1,7 +1,7 @@
 """Constants and default configuration values for Bouquet"""
 
+import secrets
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +9,10 @@ from typing import Optional
 # alias used for the energy/optimizer config field hints. The selectable set is
 # CalculatorFactory.available_methods() (the installed subset).
 from bouquet.calculator import MethodType
+
+# Clash-threshold default lives with the code that documents its calibration.
+# bouquet.clash imports nothing from bouquet at runtime, so this is cycle-free.
+from bouquet.clash import DEFAULT_CLASH_RATIO
 
 __all__ = ["Configuration", "MethodType", "RunOptions"]
 
@@ -23,6 +27,11 @@ DEFAULT_INIT_STEPS = 5
 DEFAULT_RELAXATION_STEPS = 10
 DEFAULT_FMAX = 5e-2
 TIGHT_FMAX = 1e-3
+TIGHT_MAX_STEPS = 500
+
+# Supported GP covariance arms (declared here so CLI parsing stays lightweight
+# without importing torch/gpytorch/botorch).
+KERNEL_ARMS = ("product", "ard")
 
 # Auto-scaling of the --auto evaluation budget with dihedral count d. Calibrated as
 # n*_95 -- the budget at which 95% of BO-reachable (acyclic/aromatic) molecules reach
@@ -114,7 +123,33 @@ GP_PERIOD_LENGTH_STD = 0.1
 # (each is an L-BFGS multi-start); raw_samples is matched to it for fidelity to the
 # measured config. See scripts/acq_sweep.py (analyze + paired).
 ACQ_NUM_RESTARTS = 24
+# NOTE: raw_samples is IGNORED whenever the clash constraint is active, because
+# surrogate._optimize_acqf_clash_free supplies batch_initial_conditions (drawn from the
+# clash-free Sobol pool) and botorch then skips raw-sample initialization entirely. It
+# still applies on the unconstrained fallback path. Measured at d=12: cutting restarts
+# 24 -> 8 buys only 1.6x on acquisition time (10.3 -> 6.4 s/step) and nothing in quality,
+# so the restart count is NOT the high-d cost lever -- GRADIENT_MATRIX_CAP is.
 ACQ_RAW_SAMPLES = 24
+
+# Gradient-GP size cap. The gradient-enhanced GP conditions on an augmented covariance
+# of size N = n + W*d (values for every point, gradients for W of them). A FIXED W does
+# not bound that: N still grows linearly in d, so W=250 is 0.9 GB at d=8 but 7.7 GB at
+# d=16. Capping N directly does, and it is the knob that matters, because measured
+# per-step acquisition cost is ~linear in N (and flat in the restart count).
+#
+#     W = clamp((N_max - n) / d,  W_min,  n)      [W >= n means "keep every gradient"]
+#
+# N_max = 4000 sits just inside both validated points: d=8/W=250/N=4138 (windowing cost
+# nothing per step and won end-to-end by finishing, p=0.014) and d=12, where quality was
+# FLAT from W=500 down to W=50 with a ~0.5 kcal/mol detection floor. It gives W=233 at
+# d=8 and W=167 at d=12, keeps everything for d<=4, and holds memory ~flat in d.
+#
+# W_min is a floor for the regime where the cap cannot be honoured at all: once
+# n >= N_max the budget goes negative, which happens whenever the step budget exceeds
+# N_max (e.g. C(12)=5215). The d=12 run found w50 indistinguishable from w500, so a
+# floor of 50 is not a compromise there -- but it IS extrapolation above d=12.
+GRADIENT_MATRIX_CAP = 4000
+GRADIENT_WINDOW_MIN = 50
 
 # Initial guess sampling
 INITIAL_GUESS_STD = 90
@@ -248,13 +283,24 @@ class RunOptions:
     gradient_steps: int = 0
     grad_refit_dense_until: int = 20
     grad_refit_every: int = 0
-    # High-leverage gradient subset (0 = keep all); keep = recent | best | both.
+    # High-leverage gradient subset. gradient_window > 0 pins W explicitly and ignores
+    # the cap; gradient_window == 0 derives W from gradient_matrix_cap (see the
+    # GRADIENT_MATRIX_CAP comment). Set gradient_matrix_cap = 0 for the old keep-all
+    # behaviour. keep = recent | best | both.
     gradient_window: int = 0
+    gradient_matrix_cap: int = GRADIENT_MATRIX_CAP
+    gradient_window_min: int = GRADIENT_WINDOW_MIN
     gradient_keep: str = "both"
 
     # Acquisition-optimizer effort (optimize_acqf)
     acq_num_restarts: int = ACQ_NUM_RESTARTS
     acq_raw_samples: int = ACQ_RAW_SAMPLES
+
+    # GP covariance arm (see surrogate.COVAR_ARMS). "product" is the shipped
+    # kernel; "ard" gives each torsion its own lengthscale. ARD was never worse than
+    # product end-to-end but was not significant either (scripts/kernel_bench.py),
+    # so it stays opt-in rather than becoming the default on a tie.
+    kernel_arm: str = "product"
 
     # Value-only-GP lengthscale prior: "auto" | "none" | "dim_scaled"
     lengthscale_prior: str = "auto"
@@ -276,9 +322,28 @@ class RunOptions:
     cert_log_path: Optional[Path] = None
     cert_betas: tuple = DEFAULT_CERTIFICATE_BETAS
     geom_log_path: Optional[Path] = None
+    # Per-evaluation (coords, energy) trail; overrides out_dir/structures.csv so a
+    # benchmark can collect every trial's trail into one directory.
+    structure_log_path: Optional[Path] = None
 
-    # Reject evaluations that change the initial covalent bond graph
+    # Reject evaluations whose relaxation BROKE a bond (dissociation). Off by
+    # default: dissociation is sometimes legitimate on these surfaces (zwitterion
+    # proton transfer), so it is the user's call.
     retain_bonds: bool = False
+
+    # Reject evaluations whose relaxation FORMED a bond -- a collapsed geometry
+    # driven through itself. On by default; unlike retain_bonds this has no
+    # measured false positives (0 of 872 legitimate stopbench final geometries)
+    # and the failure it prevents is an absorbing state that wastes a whole run.
+    species_guard: bool = True
+
+    # Steric-clash feasibility region for the acquisition optimizer: restrict the
+    # search to geometries whose worst non-bonded contact stays above
+    # clash_threshold x the summed vdW radii. See bouquet.clash for the
+    # calibration behind the default and why H-bond pairs must be excluded.
+    clash_constraint: bool = True
+    clash_threshold: float = DEFAULT_CLASH_RATIO
+    clash_exclude_hbonds: bool = True
 
     # Ensemble active level-set exploration (only used when Configuration.ensemble
     # is set). ensemble_steps: -1 = auto, 0 = passive harvest only, >0 = hard cap.
@@ -294,6 +359,8 @@ class RunOptions:
             self.cert_log_path = Path(self.cert_log_path)
         if isinstance(self.geom_log_path, str):
             self.geom_log_path = Path(self.geom_log_path)
+        if isinstance(self.structure_log_path, str):
+            self.structure_log_path = Path(self.structure_log_path)
 
         # Validate the gradient-windowing knobs up front: solver._restrict_gradient_mask
         # silently treats window <= 0 as keep-all and any unknown mode as "both", so an
@@ -305,8 +372,18 @@ class RunOptions:
             )
         if self.gradient_window < 0:
             raise ValueError(
-                "gradient_window must be a non-negative integer (0 = all), got "
-                f"{self.gradient_window}"
+                "gradient_window must be a non-negative integer (0 = derive from "
+                f"gradient_matrix_cap), got {self.gradient_window}"
+            )
+        if self.gradient_matrix_cap < 0:
+            raise ValueError(
+                "gradient_matrix_cap must be a non-negative integer (0 = uncapped), "
+                f"got {self.gradient_matrix_cap}"
+            )
+        if self.gradient_window_min < 1:
+            raise ValueError(
+                "gradient_window_min must be a positive integer, got "
+                f"{self.gradient_window_min}"
             )
 
         # Acquisition-optimizer effort must be positive: 0 or negative would reach
@@ -344,6 +421,27 @@ class RunOptions:
                 f"ensemble_explore_mode must be one of {ENSEMBLE_EXPLORE_MODES}, "
                 f"got {self.ensemble_explore_mode!r}."
             )
+        if self.kernel_arm not in KERNEL_ARMS:
+            raise ValueError(
+                f"kernel_arm must be one of {KERNEL_ARMS}, got {self.kernel_arm!r}."
+            )
+        if self.lengthscale_prior not in ("auto", "none", "dim_scaled"):
+            raise ValueError(
+                "lengthscale_prior must be one of 'auto', 'none', 'dim_scaled', "
+                f"got {self.lengthscale_prior!r}."
+            )
+        if self.lowmode_prob is not None and not (0.0 <= self.lowmode_prob <= 1.0):
+            raise ValueError(
+                f"lowmode_prob must be in [0, 1] or None, got {self.lowmode_prob}."
+            )
+        if self.category_prob is not None and not (0.0 <= self.category_prob <= 1.0):
+            raise ValueError(
+                f"category_prob must be in [0, 1] or None, got {self.category_prob}."
+            )
+        if self.clash_threshold <= 0:
+            raise ValueError(
+                f"clash_threshold must be positive, got {self.clash_threshold}."
+            )
 
     # ---- auto-default resolution (the "auto"/None sentinels -> concrete values) ----
     # Kept next to the fields and thresholds they read; run_optimization calls these
@@ -360,28 +458,37 @@ class RunOptions:
             return self.lengthscale_prior
         return "dim_scaled" if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else "none"
 
-    def resolve_lowmode_prob(self, n_dihedrals: int) -> float:
+    def resolve_lowmode_prob(self, n_dihedrals: int, relax: bool = True) -> float:
         """Resolve the ``None`` (auto) low-mode move probability by dihedral count.
 
-        Auto enables the low-mode move at high d; an explicit float passes through.
+        Auto enables the low-mode move at high d when relaxation is active (and
+        leaves it off when ``relax=False`` so ``--no-relax`` runs don't crash);
+        an explicit float passes through unchanged.
         """
         if self.lowmode_prob is not None:
             return self.lowmode_prob
+        if not relax:
+            return 0.0
         return 0.5 if n_dihedrals >= HIGH_D_DIHEDRAL_THRESHOLD else 0.0
 
     def resolve_category_prob(
-        self, n_dihedrals: int, category_groups: Optional[list] = None
+        self,
+        n_dihedrals: int,
+        category_groups: Optional[list] = None,
+        relax: bool = True,
     ) -> float:
         """Resolve the ``None`` (auto) category-tied move probability.
 
-        Auto enables the move only when the molecule is both high-d AND has a real
-        repeat to exploit -- the largest tied SMARTS category (``max_spec``) exceeds
-        ``CAT_MAXSPEC_THRESHOLD``. On large-but-irregular molecules (high d, low
-        max_spec) the tie mildly hurts, so raw dihedral count is not enough. An
-        explicit float passes through unchanged.
+        Auto enables the move only when relaxation is active AND the molecule is
+        both high-d AND has a real repeat to exploit -- the largest tied SMARTS
+        category (``max_spec``) exceeds ``CAT_MAXSPEC_THRESHOLD``. On large-but-
+        irregular molecules (high d, low max_spec) the tie mildly hurts, so raw
+        dihedral count is not enough. An explicit float passes through unchanged.
         """
         if self.category_prob is not None:
             return self.category_prob
+        if not relax:
+            return 0.0
         max_spec = (
             max((len(g) for g in category_groups), default=0)
             if category_groups else 0
@@ -420,7 +527,7 @@ class Configuration:
     init_conformer_cap: int = DEFAULT_INIT_CONFORMER_CAP
     auto_steps: bool = False
     relax: bool = True
-    seed: int = field(default_factory=lambda: datetime.now().microsecond)
+    seed: int = field(default_factory=lambda: secrets.randbelow(2**31))
 
     # Search / surrogate / benchmark tuning knobs handed to run_optimization.
     # These live on a single nested RunOptions so their defaults are declared in

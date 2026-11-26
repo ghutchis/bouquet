@@ -171,3 +171,29 @@ def test_coarse_prefilter_budget_keeps_the_spread_not_a_prefix():
     # Farthest-point keeps essentially the whole spread; a prefix cut keeps ~none of it.
     assert spread > 0.9 * allspread, "budget dropped the extremes"
     assert prefix_spread < 0.01 * allspread, "test setup no longer discriminates"
+
+
+def test_harvest_stamps_charge_and_spin_before_quench(monkeypatch):
+    """harvest() must stamp molecular charge/multiplicity onto each frame before quenching."""
+    import importlib
+
+    harvest_mod = importlib.import_module("bouquet.rings.harvest")
+
+    mol = _embed("C1CCC[NH2+]C1")
+    atoms = mol_to_ase_atoms(mol, 0)
+    systems = perceive_ring_systems(mol)
+    ref = stereo_signature(mol, atoms)
+    seen = []
+
+    def fake_quench(cand, calc, fmax=0.02, steps=300):
+        seen.append((
+            float(cand.get_initial_charges().sum()),
+            float(cand.get_initial_magnetic_moments().sum()),
+        ))
+        return cand, -1.0
+
+    monkeypatch.setattr(harvest_mod, "quench", fake_quench)
+    res = harvest([atoms.get_positions()], mol, systems, calc=None,
+                  start_signature=ref, charge=1, multiplicity=2)
+    assert len(res.seeds) == 1
+    assert seen == [(1.0, 1.0)]

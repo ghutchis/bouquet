@@ -47,33 +47,56 @@ except ImportError:  # pragma: no cover - exercised only without irmsd installed
 # --------------------------------------------------------------------------- #
 
 
+def _periodic_min_dist_sq(
+    x_deg: torch.Tensor,
+    minima_deg: torch.Tensor,
+    periods_deg: torch.Tensor | float = 360.0,
+) -> torch.Tensor:
+    """Squared wrapped RMS angular distance (deg^2) from ``x_deg`` to its nearest basin.
+
+    Wraps each dihedral modulo its irreducible symmetry period ``periods_deg``
+    (default 360 deg; e.g. 180 deg for C2 phenyls, 120 deg for C3 methyls) so
+    symmetry-equivalent rotamers have zero distance.
+    """
+    diff = (x_deg[..., None, :] - minima_deg) % periods_deg
+    d = torch.minimum(diff, periods_deg - diff)  # wrap onto [0, period/2]
+    return (d**2).mean(-1).min(-1).values  # (...)
+
+
 def _periodic_min_dist(
-    x_deg: torch.Tensor, minima_deg: torch.Tensor
+    x_deg: torch.Tensor,
+    minima_deg: torch.Tensor,
+    periods_deg: torch.Tensor | float = 360.0,
 ) -> torch.Tensor:
     """Wrapped RMS angular distance (degrees) from ``x_deg`` to its nearest basin.
 
     ``x_deg`` has shape ``(..., d)`` and ``minima_deg`` shape ``(m, d)``; the
-    per-dihedral difference is wrapped into ``[0, 180]`` (torsions are periodic on
-    360 deg) before the RMS over dihedrals and the min over the ``m`` basins.
-    Returns shape ``(...)``. Requires ``m >= 1``.
+    per-dihedral difference is wrapped into ``[0, period/2]`` before the RMS over
+    dihedrals and the min over the ``m`` basins. Returns shape ``(...)``.
+    Requires ``m >= 1``.
     """
-    diff = (x_deg[..., None, :] - minima_deg) % 360.0
-    d = torch.minimum(diff, 360.0 - diff)  # wrap onto [0, 180]
-    return torch.sqrt((d**2).mean(-1)).min(-1).values  # (...)
+    return torch.sqrt(
+        _periodic_min_dist_sq(x_deg, minima_deg, periods_deg).clamp_min(0.0)
+    )
 
 
 def _diversity_factor(
-    X: torch.Tensor, minima_deg: torch.Tensor, diversity_lambda: float
+    X: torch.Tensor,
+    minima_deg: torch.Tensor,
+    diversity_lambda: float,
+    periods_deg: torch.Tensor | float = 360.0,
 ) -> torch.Tensor:
     """Multiplicative local-penalization factor in ``[0, 1]``.
 
     ``~ 1 - lambda`` at a known basin, ``-> 1`` far from every basin (Gaussian in
     the wrapped RMS angular distance, width ``ENSEMBLE_BASIN_DEG``). ``X`` is the
     ``(b, 1, d)`` normalized-``[0, 1]`` acquisition input; returns ``(b,)``.
+    Uses squared distance directly so autograd has no ``sqrt(0)`` NaN singularity
+    when L-BFGS evaluates at a known basin.
     """
-    x_deg = X.squeeze(-2) * 360.0  # (b, d)
-    dist = _periodic_min_dist(x_deg, minima_deg)  # (b,) degrees
-    proximity = torch.exp(-((dist / ENSEMBLE_BASIN_DEG) ** 2))  # (b,)
+    x_deg = X.squeeze(-2) * periods_deg  # (b, d)
+    dist_sq = _periodic_min_dist_sq(x_deg, minima_deg, periods_deg)  # (b,) deg^2
+    proximity = torch.exp(-(dist_sq / (ENSEMBLE_BASIN_DEG**2)))  # (b,)
     return (1.0 - diversity_lambda * proximity).clamp_min(0.0)  # (b,)
 
 
@@ -91,7 +114,10 @@ class _DiversityAcquisition(AnalyticAcquisitionFunction):
     """
 
     def _init_diversity(
-        self, minima_deg: torch.Tensor | None, diversity_lambda: float
+        self,
+        minima_deg: torch.Tensor | None,
+        diversity_lambda: float,
+        periods_deg: torch.Tensor | None = None,
     ) -> None:
         self.diversity_lambda = float(diversity_lambda)
         self._penalize = (
@@ -101,6 +127,10 @@ class _DiversityAcquisition(AnalyticAcquisitionFunction):
         )
         if self._penalize:
             self.register_buffer("minima_deg", minima_deg)
+        if periods_deg is not None:
+            self.register_buffer("_periods_deg", periods_deg)
+        else:
+            self._periods_deg = None
 
     def _mean_sigma(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Posterior mean and sigma (eV) at ``X`` (b, 1, d), each shaped (b,)."""
@@ -111,7 +141,10 @@ class _DiversityAcquisition(AnalyticAcquisitionFunction):
 
     def _apply_diversity(self, term: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
         if self._penalize:
-            term = term * _diversity_factor(X, self.minima_deg, self.diversity_lambda)
+            periods = 360.0 if self._periods_deg is None else self._periods_deg.to(X)
+            term = term * _diversity_factor(
+                X, self.minima_deg, self.diversity_lambda, periods_deg=periods
+            )
         return term
 
 
@@ -128,10 +161,11 @@ class _LevelSetAcquisition(_DiversityAcquisition):
         threshold_eV: float,
         minima_deg: torch.Tensor | None = None,
         diversity_lambda: float = 0.0,
+        periods_deg: torch.Tensor | None = None,
     ):
         super().__init__(model)
-        self.register_buffer("threshold", torch.as_tensor(float(threshold_eV)))
-        self._init_diversity(minima_deg, diversity_lambda)
+        self.threshold = float(threshold_eV)
+        self._init_diversity(minima_deg, diversity_lambda, periods_deg=periods_deg)
 
     @t_batch_mode_transform(expected_q=1)
     def forward(self, X: torch.Tensor) -> torch.Tensor:
@@ -165,11 +199,12 @@ class _BoundaryAcquisition(_DiversityAcquisition):
         kappa: float,
         minima_deg: torch.Tensor | None = None,
         diversity_lambda: float = 0.0,
+        periods_deg: torch.Tensor | None = None,
     ):
         super().__init__(model)
-        self.register_buffer("target", torch.as_tensor(float(target_eV)))
+        self.target = float(target_eV)
         self.kappa = float(kappa)
-        self._init_diversity(minima_deg, diversity_lambda)
+        self._init_diversity(minima_deg, diversity_lambda, periods_deg=periods_deg)
 
     @t_batch_mode_transform(expected_q=1)
     def forward(self, X: torch.Tensor) -> torch.Tensor:

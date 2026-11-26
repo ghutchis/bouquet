@@ -30,6 +30,7 @@ from bouquet.ensemble import _HAVE_IRMSD, _rmsd
 from bouquet.rings.bias import kabsch_rotation
 
 logger = logging.getLogger(__name__)
+_WARNED_NO_IRMSD = False
 
 
 @dataclass(frozen=True)
@@ -155,6 +156,9 @@ def ring_state_distance(system: RingSystem, coords_a: np.ndarray,
         a = Atoms(numbers=system.dedup_numbers, positions=coords_a[idx])
         b = Atoms(numbers=system.dedup_numbers, positions=coords_b[idx])
         return _rmsd(a, b)  # reuse ensemble's iRMSD wrapper (same backend used elsewhere)
-    logger.warning("irmsd unavailable; ring_state_distance falls back to proper-rotation "
-                   "Kabsch, which over-splits mirror-image embeddings")
+    global _WARNED_NO_IRMSD
+    if not _WARNED_NO_IRMSD:
+        logger.warning("irmsd unavailable; ring_state_distance falls back to proper-rotation "
+                       "Kabsch, which over-splits mirror-image embeddings")
+        _WARNED_NO_IRMSD = True
     return _kabsch_rmsd(coords_a[idx], coords_b[idx])

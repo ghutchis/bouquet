@@ -164,3 +164,28 @@ class TestConstants:
         assert DEFAULT_NUM_STEPS > 0
         assert DEFAULT_INIT_STEPS > 0
         assert AUTO_STEPS_CAP > AUTO_STEPS_FLOOR
+
+
+class TestCliAndAutoResolution:
+    """Tests for CLI defaults and auto-resolution under --no-relax."""
+
+    def test_cli_relax_defaults_true_and_supports_no_relax(self):
+        from bouquet.cli import build_parser
+
+        parser = build_parser()
+        assert parser.parse_args(["--smiles", "CCCC"]).relax is True
+        assert parser.parse_args(["--smiles", "CCCC", "--no-relax"]).relax is False
+        assert parser.parse_args(["--smiles", "CCCC", "--relax"]).relax is True
+
+    def test_auto_collective_moves_disable_when_relax_false(self):
+        from bouquet.config import RunOptions
+
+        opts = RunOptions()
+        assert opts.resolve_lowmode_prob(15, relax=True) > 0.0
+        assert opts.resolve_lowmode_prob(15, relax=False) == 0.0
+        groups = [list(range(6))] + [[i] for i in range(6, 16)]
+        assert opts.resolve_category_prob(16, groups, relax=True) > 0.0
+        assert opts.resolve_category_prob(16, groups, relax=False) == 0.0
+        # Explicit user value still passes through (so solver raises clearly).
+        explicit = RunOptions(lowmode_prob=0.3)
+        assert explicit.resolve_lowmode_prob(15, relax=False) == 0.3

@@ -66,7 +66,7 @@ def seeds_to_dict(mol, systems, result, config, wall_seconds: float | None = Non
             "temperature_K": config.temperature_K,
             "t_run_ps": config.t_run_ps,
             "n_walkers": result.diagnostics.get("n_walkers", config.n_walkers),
-            "k_hill_kcal": config.k_hill_kcal,
+            "k_hill_kcal": result.diagnostics.get("k_hill_final", config.k_hill_kcal),
             "wall_seconds": wall_seconds,
         },
         "ring_systems": [{
@@ -92,7 +92,9 @@ def seeds_to_dict(mol, systems, result, config, wall_seconds: float | None = Non
 def write_seeds(path, mol, systems, result, config, wall_seconds: float | None = None) -> None:
     """Write the ring-seed JSON for a run to ``path``."""
     d = seeds_to_dict(mol, systems, result, config, wall_seconds=wall_seconds)
-    Path(path).write_text(json.dumps(d, indent=2))
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(d, indent=2))
 
 
 @dataclass

@@ -22,13 +22,14 @@ from dataclasses import dataclass, field
 import numpy as np
 from ase import Atoms
 
+from bouquet.assess import _reset_calculators
+from bouquet.config import KCAL_TO_EV
 from bouquet.ensemble import _boltzmann_weights
 from bouquet.rings.systems import RingSystem, _kabsch_rmsd, ring_state_distance
-from bouquet.setup import connectivity_changed
+from bouquet.setup import apply_charge_spin, connectivity_changed
 
 logger = logging.getLogger(__name__)
 
-KCAL_TO_EV = 0.0433641153
 StereoSignature = tuple  # (atom_idx -> "R"/"S", (i, j) -> "E"/"Z"), both dicts
 
 
@@ -97,6 +98,7 @@ def quench(atoms: Atoms, calc, fmax: float = 0.02, steps: int = 300):
         energy = float(a.get_potential_energy())
     except Exception:
         logger.debug("quench failed; dropping snapshot", exc_info=True)
+        _reset_calculators(calc)
         return None
     return a, energy
 
@@ -233,6 +235,7 @@ def coarse_prefilter(frames, ring_idx, coarse_tol: float, max_coarse: int = 0):
 
 def harvest(frames, ref_mol, systems: list[RingSystem], calc, *,
             start_signature: StereoSignature,
+            charge: int = 0, multiplicity: int = 1,
             coarse_tol: float = 0.10, fine_tol: float = 0.20, max_coarse: int = 180,
             temperature: float = 298.15, energy_window_kcal: float = 12.0,
             fmax: float = 0.02, steps: int = 300, conn_tol: float = 1.3,
@@ -252,10 +255,12 @@ def harvest(frames, ref_mol, systems: list[RingSystem], calc, *,
     ring_idx = _ring_union(systems)
     coarse = coarse_prefilter(frames, ring_idx, coarse_tol, max_coarse)
 
+    numbers = ref_mol_numbers(ref_mol)
     n_stereo_rej = n_topo_rej = n_quench_fail = 0
     survivors = []
     for pos in coarse:
-        cand = Atoms(numbers=ref_mol_numbers(ref_mol), positions=pos)
+        cand = Atoms(numbers=numbers, positions=pos)
+        apply_charge_spin(cand, charge, multiplicity)
         q = quench(cand, calc, fmax=fmax, steps=steps)
         if q is None:
             n_quench_fail += 1
@@ -273,7 +278,15 @@ def harvest(frames, ref_mol, systems: list[RingSystem], calc, *,
     seeds = rank_and_window(clusters, temperature, energy_window_kcal)
 
     n_frames = len(frames)
-    reject_rate = (n_stereo_rej / len(coarse)) if coarse else 0.0
+    n_quenched = len(coarse) - n_quench_fail
+    # Measure stereo rejection over successfully quenched frames (not raw coarse
+    # frames), so a run where most frames exploded during quench isn't misread as
+    # a low stereo-reject rate ("too_weak"). If every coarse frame failed quench,
+    # treat reject_rate as 1.0 so the adaptive controller backs off k_hill.
+    if n_quenched > 0:
+        reject_rate = n_stereo_rej / n_quenched
+    else:
+        reject_rate = 1.0 if coarse else 0.0
     diagnostics = {
         "n_frames_raw": n_frames,
         "n_after_coarse_dedup": len(coarse),

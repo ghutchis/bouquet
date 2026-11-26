@@ -65,8 +65,10 @@ from bouquet.ensemble import (
 )
 from bouquet.setup import DihedralInfo, geometry_bond_set
 from bouquet.surrogate import (
+    _FEASIBLE_MAX_CHUNKS,
     _cert_sobol_pool,
     _fit_value_gp,
+    _optimize_acqf_clash_free,
     _periodic_covar_module,
     _suppress_fit_warnings,
 )
@@ -77,16 +79,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _state_periods(
+    state: OptimizationState, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor | float, np.ndarray | float]:
+    """Per-dihedral irreducible periods in degrees (torch + numpy), or scalar 360.0."""
+    orders = getattr(state, "symmetry_orders", None)
+    if orders is not None and any(m > 1 for m in orders):
+        p_np = 360.0 / np.asarray(orders, dtype=float)
+        p_t = torch.as_tensor(p_np, dtype=dtype, device=device)
+        return p_t, p_np
+    return 360.0, 360.0
+
+
 def _build_selection_gp(
-    train_X_deg: torch.Tensor, train_y_eV: torch.Tensor
+    train_X_deg: torch.Tensor,
+    train_y_eV: torch.Tensor,
+    periods_deg: torch.Tensor | float = 360.0,
 ) -> SingleTaskGP:
     """Fit a GP for ensemble selection.
 
-    Reuses the acquisition GP's kernel and [0, 1] input normalization, but fits
-    energies in their natural (minimization) sense with a ``Standardize`` outcome
-    transform, so the posterior is returned directly in eV (relative energies).
+    Reuses the acquisition GP's kernel and symmetry-reduced [0, 1] input
+    normalization, but fits energies in their natural (minimization) sense with
+    a ``Standardize`` outcome transform, so the posterior is returned directly
+    in eV (relative energies).
     """
-    train_x = train_X_deg.clone() / 360.0
+    if torch.is_tensor(periods_deg):
+        train_x = torch.remainder(train_X_deg, periods_deg) / periods_deg
+    else:
+        train_x = train_X_deg.clone() / float(periods_deg)
     train_y = train_y_eV.clone().unsqueeze(-1)  # (n, 1), eV, lower = better
     return _fit_value_gp(
         train_x,
@@ -142,15 +162,21 @@ def _select_ensemble_candidates(
     x = coords[idx]
 
     # Fit selection GP and evaluate the posterior at the observed coordinates.
+    periods_t, _ = _state_periods(state, x.dtype, x.device)
     if idx.numel() < 3:
         # Too few points for a meaningful posterior: fall back to a flat window.
         mu, sigma = e, torch.full_like(e, sigma_floor_eV)
     else:
         with _suppress_fit_warnings():
-            gp = _build_selection_gp(x, e)
+            gp = _build_selection_gp(x, e, periods_deg=periods_t)
             gp.eval()
+            xq = (
+                torch.remainder(x, periods_t) / periods_t
+                if torch.is_tensor(periods_t)
+                else x / float(periods_t)
+            )
             with torch.no_grad():
-                post = gp.posterior(x / 360.0)
+                post = gp.posterior(xq)
         mu = post.mean.flatten()
         sigma = post.variance.clamp_min(0.0).sqrt().flatten()
     sigma = sigma.clamp_min(sigma_floor_eV)
@@ -206,7 +232,6 @@ def _perform_ensemble_relaxation(
     """
     window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
     sigma_floor_eV = ENSEMBLE_SIGMA_FLOOR_KCAL * KCAL_TO_EV
-    e_tol_eV = ENSEMBLE_ENERGY_TOL_KCAL * KCAL_TO_EV
 
     candidates = _select_ensemble_candidates(
         state,
@@ -326,8 +351,10 @@ def _fit_selection_gp_valid(
     if idx.numel() < 3:
         return None, None
     e = state.observed_energies[idx]
+    x = state.observed_coords[idx]
+    periods_t, _ = _state_periods(state, x.dtype, x.device)
     with _suppress_fit_warnings():
-        gp = _build_selection_gp(state.observed_coords[idx], e)
+        gp = _build_selection_gp(x, e, periods_deg=periods_t)
     gp.eval()
     return gp, float(e.min())
 
@@ -370,11 +397,12 @@ def _initial_basins(
     # Greedy dedup into a preallocated buffer (at most one seed per in-window
     # observation), filling the first ``m`` rows -- avoids re-stacking the whole
     # growing seed list on every iteration.
+    periods_t, _ = _state_periods(state, coords.dtype, coords.device)
     seeds = xw.new_zeros((xw.shape[0], d))
     m = 0
     for i in order.tolist():
         c = xw[i]
-        if m == 0 or float(_periodic_min_dist(c, seeds[:m])) >= basin_deg:
+        if m == 0 or float(_periodic_min_dist(c, seeds[:m], periods_deg=periods_t)) >= basin_deg:
             seeds[m] = c
             m += 1
     return seeds[:m]
@@ -388,6 +416,7 @@ def _select_exploration_point(
     minima_deg: torch.Tensor,
     diversity_lambda: float,
     opts: RunOptions,
+    feasible_seed_offset: int = 0,
 ) -> tuple[np.ndarray | None, SingleTaskGP | None]:
     """Propose one exploration point by optimizing the exploration acquisition.
 
@@ -403,27 +432,42 @@ def _select_exploration_point(
         return None, None
     d = state.observed_coords.shape[1]
     tx = state.observed_coords
+    periods_t, periods_np = _state_periods(state, tx.dtype, tx.device)
+    p_buf = periods_t if torch.is_tensor(periods_t) else None
     if mode == "boundary":
         acqf = _BoundaryAcquisition(
             gp, e_min + offset_eV, kappa,
             minima_deg=minima_deg, diversity_lambda=diversity_lambda,
+            periods_deg=p_buf,
         )
     else:
         acqf = _LevelSetAcquisition(
             gp, e_min + offset_eV,
             minima_deg=minima_deg, diversity_lambda=diversity_lambda,
+            periods_deg=p_buf,
         )
     bounds = torch.zeros(2, d, dtype=tx.dtype, device=tx.device)
     bounds[1, :] = 1.0
     with _suppress_fit_warnings():
-        candidate, _ = optimize_acqf(
-            acqf,
-            bounds=bounds,
-            q=1,
-            num_restarts=opts.acq_num_restarts,
-            raw_samples=opts.acq_raw_samples,
-        )
-    coords_deg = candidate.detach().cpu().numpy()[0, :] * 360.0
+        # Level-set exploration deliberately walks *up* to an energy offset, so it
+        # is more likely than the main loop to wander into clashed geometry; apply
+        # the same feasibility region here.
+        if state.clash_feasibility is not None:
+            candidate = _optimize_acqf_clash_free(
+                acqf, bounds, opts.acq_num_restarts, opts.acq_raw_samples,
+                state.clash_feasibility,
+                seed_offset=feasible_seed_offset,
+                periods_deg=periods_np,
+            )
+        else:
+            candidate, _ = optimize_acqf(
+                acqf,
+                bounds=bounds,
+                q=1,
+                num_restarts=opts.acq_num_restarts,
+                raw_samples=opts.acq_raw_samples,
+            )
+    coords_deg = candidate.detach().cpu().numpy()[0, :] * periods_np
     return coords_deg, gp
 
 
@@ -434,6 +478,7 @@ def _perform_ensemble_exploration(
     relaxCalc: Calculator,
     relax: bool,
     opts: RunOptions,
+    seed: int = 0,
 ) -> None:
     """Active exploration; enriches ``state`` in place with new basins.
 
@@ -461,6 +506,7 @@ def _perform_ensemble_exploration(
     dtype = state.observed_coords.dtype
     device = state.observed_coords.device
 
+    periods_t, _ = _state_periods(state, dtype, device)
     minima_deg = _initial_basins(state, delta_eV, ENSEMBLE_BASIN_DEG)
     state.reserve(budget)  # loop appends at most one observation per step
 
@@ -489,6 +535,7 @@ def _perform_ensemble_exploration(
         coords_deg, gp = _select_exploration_point(
             state, step_mode, offset_eV, kappa, minima_deg,
             opts.ensemble_diversity, opts,
+            feasible_seed_offset=seed + (step + 10000) * _FEASIBLE_MAX_CHUNKS,
         )
         if coords_deg is None:
             logger.info(
@@ -513,7 +560,7 @@ def _perform_ensemble_exploration(
         if rel < FAILURE_ENERGY_EV and rel <= e_min + delta_eV:
             c = torch.as_tensor(coords_deg, dtype=dtype, device=device)
             if minima_deg.shape[0] == 0 or (
-                float(_periodic_min_dist(c, minima_deg)) >= ENSEMBLE_BASIN_DEG
+                float(_periodic_min_dist(c, minima_deg, periods_deg=periods_t)) >= ENSEMBLE_BASIN_DEG
             ):
                 minima_deg = torch.cat([minima_deg, c.unsqueeze(0)], dim=0)
                 is_new = True

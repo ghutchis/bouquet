@@ -26,9 +26,9 @@ import torch
 from ase import Atoms
 from ase.calculators.calculator import Calculator
 
-from bouquet.assess import evaluate_energy, relax_structure
+from bouquet.assess import _reset_calculators, evaluate_energy, relax_structure
 from bouquet.config import RELAX_FAILURE_ENERGY_EV
-from bouquet.setup import DihedralInfo, bonds_broken
+from bouquet.setup import DihedralInfo, bonds_broken, bonds_formed
 from bouquet.surrogate import _select_next_points_botorch
 
 if TYPE_CHECKING:
@@ -65,20 +65,58 @@ def _collective_kick_relax(
     return relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
 
 
+def _collective_clash_reject(state: OptimizationState, target_deg: np.ndarray) -> bool:
+    """True if a proposed collective geometry fails the clash feasibility region.
+
+    Collective moves must be screened by the SAME region the acquisition optimizer
+    uses. They were not, originally, and that was the one hole left in the guards:
+    a low-mode kick is a committed geometry change followed by an UNCONSTRAINED
+    relaxation, which is precisely where a clashed structure collapses -- and a
+    collapsed structure poisons xtb's restart wavefunction for the remainder of the
+    run (see assess._reset_calculators). Low-mode auto-enables at
+    HIGH_D_DIHEDRAL_THRESHOLD, so the hole opened exactly at the high d it was
+    meant to help: two d=12 molecules in the kernel A/B collapsed mid-run and
+    stayed collapsed in every arm, reporting energies near -6000 kcal/mol.
+    """
+    if state.clash_feasibility is None:
+        return False
+    feasible = bool(
+        state.clash_feasibility(np.asarray(target_deg, dtype=float)[None, :])[0]
+    )
+    if not feasible:
+        state.n_collective_clash_rejects += 1
+    return not feasible
+
+
 def _collective_result(
     state: OptimizationState,
     atoms: Atoms,
     energy: float,
     dihedrals: list[DihedralInfo],
+    calc: Calculator | None = None,
+    relaxCalc: Calculator | None = None,
 ) -> tuple[np.ndarray, Atoms, float] | None:
-    """Finish a collective move: reject it (return None) if the UNCONSTRAINED relax changed
-    connectivity under --retain-bonds, else return (relaxed dihedrals [deg], atoms, energy)."""
-    if (
-        state.required_bonds is not None
-        and energy < RELAX_FAILURE_ENERGY_EV
-        and bonds_broken(atoms, state.required_bonds)
-    ):
-        state.n_bond_breaks += 1
+    """Finish a collective move: reject it (return None) if the UNCONSTRAINED relax
+    changed connectivity, else return (relaxed dihedrals [deg], atoms, energy).
+
+    The same species guard ``_evaluate_point`` applies to ordinary BO steps, and for
+    the same reason -- but it matters MORE here, because a collective move relaxes
+    without dihedral constraints and so has far more freedom to collapse. Bond
+    FORMATION is checked by default; bond BREAKING stays behind --retain-bonds, as
+    on the BO path. A rejected geometry also resets the calculators, since it may
+    have left a broken SCF solution that would corrupt every later evaluation.
+    """
+    rejected = False
+    if state.required_bonds is not None and energy < RELAX_FAILURE_ENERGY_EV:
+        if state.check_bond_forms and bonds_formed(atoms, state.required_bonds):
+            state.n_bond_forms += 1
+            rejected = True
+        elif state.check_bond_breaks and bonds_broken(atoms, state.required_bonds):
+            state.n_bond_breaks += 1
+            rejected = True
+    if rejected or energy >= RELAX_FAILURE_ENERGY_EV:
+        _reset_calculators(*(c for c in (calc, relaxCalc) if c is not None))
+    if rejected:
         return None
     new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
     return new_coords, atoms, energy
@@ -107,7 +145,10 @@ def _low_mode_move(
     # Clamp to the torsion count: the PCA basis has at most `d` columns, so a larger
     # k would let the `rng.integers(k)` mode pick index past the available columns.
     k = min(state.lowmode_modes, coords.shape[1])
-    ss = LowEnergySubspace(n_dihedrals=coords.shape[1])
+    ss = LowEnergySubspace(
+        n_dihedrals=coords.shape[1],
+        symmetry_orders=getattr(state, "symmetry_orders", None),
+    )
     ss.update(coords, energies)
     if ss.n_elite < k + 1:
         return None
@@ -132,15 +173,20 @@ def _low_mode_move(
     if V is None:                                # PCA (default, or ENM fallback)
         _, V = ss.pca_basis(k)                   # (d, k) tangent (radian) directions
     direction = V[:, rng.integers(V.shape[1])]
-    direction = direction / np.linalg.norm(direction)
+    nrm = float(np.linalg.norm(direction))
+    if nrm < 1e-12:
+        return None
+    direction = direction / nrm
     if rng.random() < 0.5:
         direction = -direction
     # incumbent + amp*direction, wrapped to torsion degrees (reuse LowEnergySubspace.line).
     amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
     target_deg = ss.line(direction, np.array([amp]))[0]
 
+    if _collective_clash_reject(state, target_deg):
+        return None
     energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
-    return _collective_result(state, atoms, energy, dihedrals)
+    return _collective_result(state, atoms, energy, dihedrals, calc, relaxCalc)
 
 
 def _build_category_groups(
@@ -232,7 +278,6 @@ def _category_move(
 
     best_idx = int(state.observed_energies.argmin().item())
     anchor = state.observed_atoms[best_idx]
-    incumbent_deg = state.observed_coords[best_idx].detach().cpu().numpy()
 
     # Reduced-space point z (one value per category), in degrees. Below the warmup the
     # prior seeds it; after that the reduced-space GP picks it -- the same value-only
@@ -247,18 +292,26 @@ def _category_move(
             acq_raw_samples=state.acq_raw_samples,
         )
 
-    # Broadcast: every dihedral takes its group's value (singletons get their own
-    # coordinate). The groups partition all indices, so the incumbent copy is just a
-    # defensive base -- every entry is overwritten.
-    target_deg = incumbent_deg.copy()
+    # Broadcast: every dihedral takes its group's value (groups partition all indices).
+    target_deg = np.empty(len(dihedrals), dtype=float)
     for gi, members in enumerate(groups):
         target_deg[members] = z[gi] % 360.0
 
+    if _collective_clash_reject(state, target_deg):
+        # A clashed z still teaches the low-D GP -- record it at the failure energy
+        # rather than evaluating it, matching the "record before the connectivity
+        # check" intent below without paying for (or risking) the evaluation.
+        state._cat_Z.append([float(v) for v in z])
+        state._cat_Y.append(float(RELAX_FAILURE_ENERGY_EV - state.start_energy))
+        return None
+
     energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
+    result = _collective_result(state, atoms, energy, dihedrals, calc, relaxCalc)
 
-    # Record the reduced-space observation (energy relative to the run's start) for the
-    # low-D BO, before the connectivity check so a rejected z still teaches the GP.
+    # Record the reduced-space observation (energy relative to the run's start).
+    # If the species guard rejected a collapsed geometry, record the failure energy
+    # rather than the bogus negative collapse energy so it cannot poison the low-D GP.
+    recorded_energy = energy if result is not None else RELAX_FAILURE_ENERGY_EV
     state._cat_Z.append([float(v) for v in z])
-    state._cat_Y.append(float(energy - state.start_energy))
-
-    return _collective_result(state, atoms, energy, dihedrals)
+    state._cat_Y.append(float(recorded_energy - state.start_energy))
+    return result

@@ -99,10 +99,15 @@ def _psi4_calculator(
             system_changes=all_changes, symmetry='c1',
         ):
             self.psi4.set_options({"ddx": True, "ddx_solvent": solvent})
-            super().calculate(
-                atoms=atoms, properties=properties,
-                system_changes=system_changes, symmetry=symmetry,
-            )
+            try:
+                super().calculate(
+                    atoms=atoms, properties=properties,
+                    system_changes=system_changes, symmetry=symmetry,
+                )
+            finally:
+                # Reset global Psi4 DDX state so subsequent gas-phase Psi4
+                # calculations in the same process do not inherit solvation.
+                self.psi4.set_options({"ddx": False})
 
     return _SolvatedPsi4(**kwargs)
 
