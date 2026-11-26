@@ -101,3 +101,46 @@ def test_final_relaxation_reverts_to_best_observed(populated_state, monkeypatch)
     # Reverted to the lowest structure actually observed during the search.
     assert rel_energy == pytest.approx(best_observed_eV)
     assert best_observed_eV < RELAX_FAILURE_ENERGY_EV
+
+
+def test_final_relaxation_reverts_on_unconstrained_energy_regression(
+    populated_state, monkeypatch
+):
+    """If unconstrained relax returns a finite energy HIGHER than constrained/observed,
+    keep the lower-energy geometry instead of regressing."""
+    state, dihedrals, calc = populated_state
+    best_idx = state.observed_energies.argmin().item()
+    best_observed_abs = state.observed_energies[best_idx].item() + state.start_energy
+
+    def regressing_relax(atoms, energyCalc, relaxCalc, steps):
+        # Finite energy below RELAX_FAILURE_ENERGY_EV, but +3.5 eV worse!
+        return best_observed_abs + 3.5, atoms.copy()
+
+    monkeypatch.setattr(solver, "relax_structure", regressing_relax)
+
+    _, rel_energy = solver._perform_final_relaxation(state, dihedrals, calc, calc)
+    assert rel_energy + state.start_energy <= best_observed_abs + 1e-6
+
+
+def test_final_relaxation_reverts_on_constrained_energy_regression(
+    populated_state, monkeypatch
+):
+    """If constrained relax regresses in energy (finite but worse than best observed),
+    revert to best observed BEFORE unconstrained relaxation so it seeds cleanly."""
+    state, dihedrals, calc = populated_state
+    best_idx = state.observed_energies.argmin().item()
+    best_observed_eV = state.observed_energies[best_idx].item()
+    best_observed_abs = best_observed_eV + state.start_energy
+
+    def regressing_eval(*args, **kwargs):
+        atoms = args[1]
+        return best_observed_abs + 4.0, atoms.copy()
+
+    def failing_relax(atoms, energyCalc, relaxCalc, steps):
+        return RELAX_FAILURE_ENERGY_EV, atoms.copy()
+
+    monkeypatch.setattr(solver, "evaluate_energy", regressing_eval)
+    monkeypatch.setattr(solver, "relax_structure", failing_relax)
+
+    _, rel_energy = solver._perform_final_relaxation(state, dihedrals, calc, calc)
+    assert rel_energy == pytest.approx(best_observed_eV)

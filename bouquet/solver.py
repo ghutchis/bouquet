@@ -1113,17 +1113,51 @@ def _perform_final_relaxation(
     # Seed from the actual best observation (aligned with best_idx/best_coords),
     # which may come from the initial point, a seeded conformer, a random guess,
     # or the BO loop -- best_step only tracks BO-loop wins, so don't key off it here.
-    best_energy, best_atoms = evaluate_energy(
-        best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
+    observed_atoms = state.observed_atoms[best_idx].copy()
+    # observed_energies stores E-E0 (relative); convert to absolute energy so
+    # comparisons and E/E-E0 bookkeeping stay consistent.
+    observed_energy = state.observed_energies[best_idx].item() + state.start_energy
+    observed_bonds = geometry_bond_set(observed_atoms)
+
+    constrained_energy, constrained_atoms = evaluate_energy(
+        best_coords, observed_atoms, dihedrals, calc, relaxCalc, steps=None
     )
+    # Guard the constrained tight relaxation against calculator failures,
+    # connectivity changes, or energy regressions (e.g. FixInternals + BFGS
+    # stepping onto a higher-energy surface while still returning a finite energy
+    # below RELAX_FAILURE_ENERGY_EV). Reverting BEFORE releasing constraints lets
+    # the unconstrained relaxation start from the clean best observed geometry.
+    if (
+        constrained_energy >= RELAX_FAILURE_ENERGY_EV
+        or constrained_energy > observed_energy + 1e-6
+        or geometry_bond_set(constrained_atoms) != observed_bonds
+    ):
+        if constrained_energy >= RELAX_FAILURE_ENERGY_EV:
+            logger.warning(
+                "Final constrained relaxation failed (calculator error, e.g. SCF "
+                "non-convergence); seeding unconstrained relaxation from best observed."
+            )
+        elif constrained_energy > observed_energy + 1e-6:
+            logger.warning(
+                f"Final constrained relaxation regressed in energy "
+                f"({constrained_energy - observed_energy:+.4f} eV vs best observed); "
+                f"reverting to best observed geometry."
+            )
+        else:
+            logger.warning(
+                "Final constrained relaxation changed connectivity vs best observed; "
+                "reverting to best observed geometry."
+            )
+        constrained_atoms = observed_atoms.copy()
+        constrained_energy = observed_energy
+
     # (E-E0 is logged once at the end, after any failed-relax fallback, so the value
     # the sweep log-parser reads is always the trustworthy final energy.)
     if state.add_entry is not None:
-        state.add_entry(best_coords, best_atoms, best_energy)
+        state.add_entry(best_coords, constrained_atoms, constrained_energy)
 
     # Relaxation without dihedral constraints
-    constrained_atoms = best_atoms.copy()  # retained-bonds fallback
-    constrained_energy = best_energy  # its energy, restored alongside if we revert
+    best_atoms = constrained_atoms.copy()
     best_atoms.set_constraint()
     # Relax the released geometry directly. Going through evaluate_energy would
     # reapply FixInternals (relax=True re-pins the dihedrals via
@@ -1132,27 +1166,22 @@ def _perform_final_relaxation(
     # released one.
     best_energy, best_atoms = relax_structure(best_atoms, calc, relaxCalc, None)
     # If the final tight relaxation walked into a geometry the calculator cannot
-    # evaluate (SCF non-convergence -> sentinel failure energy), the released
-    # structure is garbage and would be written to final.xyz with a nonsense
-    # energy. Fall back to the best geometry we can still trust: the constrained
-    # final relaxation if it succeeded, otherwise the lowest structure actually
-    # observed during the search (which was evaluated successfully to be selected).
+    # evaluate (SCF non-convergence -> sentinel failure energy) or regressed to a
+    # higher finite energy than the geometry it started from, revert to the
+    # lower-energy constrained/observed geometry.
     if best_energy >= RELAX_FAILURE_ENERGY_EV:
-        if constrained_energy < RELAX_FAILURE_ENERGY_EV:
-            logger.warning(
-                "Final unconstrained relaxation failed (calculator error, e.g. SCF "
-                "non-convergence); reverting to the constrained final relaxation."
-            )
-            best_atoms, best_energy = constrained_atoms, constrained_energy
-        else:
-            logger.warning(
-                "Final relaxation failed (calculator error, e.g. SCF non-convergence); "
-                "reverting to the best structure observed during the search."
-            )
-            best_atoms = state.observed_atoms[best_idx].copy()
-            # observed_energies stores E-E0 (relative); restore the absolute energy so
-            # the E/E-E0 bookkeeping below (return, add_entry, logging) stays consistent.
-            best_energy = state.observed_energies[best_idx].item() + state.start_energy
+        logger.warning(
+            "Final unconstrained relaxation failed (calculator error, e.g. SCF "
+            "non-convergence); reverting to the constrained/observed best."
+        )
+        best_atoms, best_energy = constrained_atoms, constrained_energy
+    elif best_energy > constrained_energy + 1e-6:
+        logger.warning(
+            f"Final unconstrained relaxation regressed in energy "
+            f"({best_energy - constrained_energy:+.4f} eV vs constrained/observed best); "
+            f"reverting to the lower-energy geometry."
+        )
+        best_atoms, best_energy = constrained_atoms, constrained_energy
 
     # Species guard (always on): if releasing the dihedral constraints let the
     # geometry FORM or BREAK any bond relative to the constrained final geometry
