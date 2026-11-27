@@ -471,7 +471,12 @@ def nstar_table(ev: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("d").reset_index(drop=True)
 
 
-def fit_scaling(d, y, through_origin=True):
+# Exponent-grid bounds for fit_scaling; a fitted p on either edge is not an estimate.
+SCALING_PMIN = 0.5
+SCALING_PMAX = 6.0
+
+
+def fit_scaling(d, y, through_origin=True, pmax=SCALING_PMAX):
     """Fit n* ~ a + b*d^p (least squares over a p grid). Returns (a,b,p,rmse).
 
     ``through_origin`` (default) forces a=0: a molecule with no dihedrals needs no
@@ -479,6 +484,11 @@ def fit_scaling(d, y, through_origin=True):
     fit can return an unphysical negative intercept (usually an artifact of an
     under-populated/outlier d-bin -- filter those out before fitting). Forcing the
     origin is typically within a few percent RMSE of the free fit on clean data.
+
+    ``pmax`` bounds the exponent grid. It was 3.0, and on the d1-9 GFN2 data BOTH the
+    rho=0.90 and rho=0.95 fits returned p = 3.00 exactly -- pinned to the bound, so the
+    reported exponent was the grid edge, not an estimate. A fitted p equal to pmax (or
+    to the 0.5 floor) means the fit is censored and must not be quoted as the law.
     """
     d = np.asarray(d, float)
     y = np.asarray(y, float)
@@ -487,7 +497,8 @@ def fit_scaling(d, y, through_origin=True):
     if len(d) < 3:
         return None
     best = None
-    for p in np.linspace(0.5, 3.0, 101):
+    for p in np.linspace(SCALING_PMIN, pmax,
+                         int(round((pmax - SCALING_PMIN) / 0.025)) + 1):
         if through_origin:
             X = (d ** p)[:, None]
             b = np.linalg.lstsq(X, y, rcond=None)[0]
@@ -596,6 +607,10 @@ def cmd_nstar(df, args, out: Path):
     tab = nstar_table(ev, args.bootstrap, args.seed)
     tab_fit = nstar_table(ev_fit, args.bootstrap, args.seed) if ev_fit is not ev else tab
     tab.to_csv(out / "nstar.csv", index=False)
+    # The scaling law is fitted on tab_fit, NOT on the table printed above. Write that
+    # out too, or a published exponent cannot be reconciled with any file on disk.
+    if tab_fit is not tab:
+        tab_fit.to_csv(out / "nstar_fitclasses.csv", index=False)
     print("n*(d; rho) [xTB calls], censoring-aware (nan = censoring prevents rho):")
     with pd.option_context("display.width", 200):
         print(tab[["d", "n_trials", "n_hit", "reliability",
@@ -604,13 +619,20 @@ def cmd_nstar(df, args, out: Path):
     # that distorts the scaling law (and drove the earlier negative intercept).
     ft = tab_fit[tab_fit.n_trials >= args.min_fit_trials]
     origin = not args.free_intercept
+    if tab_fit is not tab:
+        print("n*(d) restricted to the fit classes (THIS is what the scaling law uses):")
+        with pd.option_context("display.width", 200):
+            print(tab_fit[["d", "n_trials", "n_hit", "reliability",
+                           "nstar_90", "nstar_95", "nstar_99"]].to_string(index=False))
     fits = {}
     for r in RHOS:
         f = fit_scaling(ft.d, ft[f"nstar_{int(r*100)}"], through_origin=origin)
         if f:
             fits[r] = f
+            edge = "  [PINNED TO GRID EDGE -- not an estimate]" if (
+                abs(f[2] - SCALING_PMIN) < 1e-9 or abs(f[2] - SCALING_PMAX) < 1e-9) else ""
             print(f"  scaling n*_{int(r*100)} ~ {f[0]:.1f} + {f[1]:.2f}*d^{f[2]:.2f} "
-                  f"(rmse {f[3]:.1f}{', origin' if origin else ''})")
+                  f"(rmse {f[3]:.1f}{', origin' if origin else ''}){edge}")
     _plot_nstar(tab, fits, out / "nstar.pdf")
     (out / "fitted.json").write_text(json.dumps(
         {"eps_kcal": args.eps,

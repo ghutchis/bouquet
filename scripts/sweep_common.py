@@ -804,6 +804,7 @@ def analyze(args: argparse.Namespace, baseline: str) -> None:
     """Per-config summaries + a paired-by-(molecule, seed) comparison vs baseline."""
     import pandas as pd
 
+    baseline = getattr(args, "baseline", None) or baseline
     df = pd.read_csv(args.input)
     df = df[df["success"] == 1].copy()
     for c in ["best_step", "e_e0_unconstrained", "e_e0_constrained", "num_dihedrals"]:
@@ -1020,6 +1021,7 @@ def trajectory(args: argparse.Namespace, baseline: str) -> None:
     import numpy as np
     import pandas as pd
 
+    baseline = getattr(args, "baseline", None) or baseline
     trial_keys = ["config", "name", "seed"]
     df = pd.read_csv(args.input)
     for c in ["eval_index", "e_e0", "best_so_far", "n_search_evals",
@@ -1066,10 +1068,11 @@ def trajectory(args: argparse.Namespace, baseline: str) -> None:
 
     tol = args.tol
     print(f"\n=== Anytime performance vs budget fraction "
-          f"({len(best_known)} molecules, paired by (molecule, seed)) ===")
+          f"({len(best_known)} molecules, paired by (molecule, seed) vs '{baseline}') ===")
     print("E = median best_so_far over trials; cap = median captured = "
           "best_so_far / best_known (1.00 = matches the best conformer found by "
-          "any arm/seed); 'vs base' = paired wins/ties/losses against the baseline.")
+          "any arm/seed); paired Δ = baseline - cfg (>0 => cfg lower/better); "
+          "p = two-sided Wilcoxon signed-rank on per-molecule mean Δ.")
     for f in checkpoints:
         sub = chk[chk["frac"] == f]
         base_pairs = (
@@ -1086,16 +1089,61 @@ def trajectory(args: argparse.Namespace, baseline: str) -> None:
             if cfg != baseline and not base_pairs.empty:
                 cur = g.set_index(["name", "seed"])["best_so_far"]
                 d = (base_pairs - cur).dropna()  # >0 => cfg lower (better)
-                w = int((d > tol).sum())
-                t = int((d.abs() <= tol).sum())
-                ls = int((d < -tol).sum())
-                tag = f"  vs base: +{w}/={t}/-{ls} (n={len(d)})"
+                tag = f"  vs {baseline}: {_paired_summary(d, tol)}"
             print(f"      {cfg:<24} E={med_e:+.4f} cap={med_cap:.2f}{tag}")
     print("(a config should lead the baseline at low budget if it helps; parity at "
           "100% is expected -- full budget tends to converge.)")
 
+    # Threshold-free integrated anytime metric: per-trial mean best_so_far over
+    # frac in [0, 1] (area under best-so-far curve; lower is faster/better).
+    _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
+    auc_grid = np.linspace(0.0, 1.0, 101)
+    auc_rows = []
+    for (cfg, name, seed), g in df.groupby(trial_keys):
+        auc_val = float(_trapz(interp_trial(g, auc_grid), auc_grid))
+        auc_rows.append({"config": cfg, "name": name, "seed": seed, "auc_eV": auc_val})
+    auc_df = pd.DataFrame(auc_rows)
+    base_auc = auc_df[auc_df["config"] == baseline].set_index(["name", "seed"])["auc_eV"]
+    if not base_auc.empty:
+        print(f"\n=== Integrated anytime AUC (mean best_so_far over budget [0, 1], "
+              f"paired vs '{baseline}') ===")
+        for cfg in configs:
+            g = auc_df[auc_df["config"] == cfg]
+            if g.empty:
+                continue
+            med_auc = g["auc_eV"].median()
+            if cfg == baseline:
+                print(f"      {cfg:<24} medAUC={med_auc:+.4f} eV  (baseline)")
+                continue
+            cur = g.set_index(["name", "seed"])["auc_eV"]
+            d = (base_auc - cur).dropna()  # >0 => cfg lower/faster on average
+            print(f"      {cfg:<24} medAUC={med_auc:+.4f} eV  vs {baseline}: "
+                  f"{_paired_summary(d, tol, with_mean=True)}")
+
     if not args.no_plot:
         _plot_trajectories(df, best_known, configs, baseline, args.plot_dir)
+
+
+def _paired_summary(d, tol: float, with_mean: bool = False) -> str:
+    """One-line paired comparison of baseline-minus-config deltas ``d``.
+
+    ``d`` is a Series indexed by (name, seed), > 0 where the config is lower
+    (better). Reports wins/ties/losses at ``tol``, the median (and optionally mean)
+    delta, and the Wilcoxon p on the per-molecule mean delta.
+    """
+    w = int((d > tol).sum())
+    t = int((d.abs() <= tol).sum())
+    ls = int((d < -tol).sum())
+    per_mol = d.groupby(level="name").mean()
+    p_w = _wilcoxon_p(per_mol.to_numpy())
+    med_g = float(d.median()) if len(d) else float("nan")
+    p_str = f"{p_w:.4f}" if not np.isnan(p_w) else "n/a"
+    mean_str = ""
+    if with_mean:
+        mean_g = float(d.mean()) if len(d) else float("nan")
+        mean_str = f" meanΔ={mean_g:+.4f}"
+    return (f"+{w}/={t}/-{ls} medΔ={med_g:+.4f}{mean_str} "
+            f"p={p_str} (n={len(d)}, m={len(per_mol)})")
 
 
 def _plot_trajectories(df, best_known, configs, baseline, plot_dir) -> None:
@@ -1327,6 +1375,8 @@ def concat_sweep_csvs(paths, drop_traj: bool = True) -> Path:
 
 def add_analyze_args(parser) -> None:
     parser.add_argument("input", type=Path, help="Tidy sweep CSV from 'run'")
+    parser.add_argument("--baseline", default=None,
+                        help="Override the baseline config label for paired comparisons")
     parser.add_argument("--tol", type=float, default=1e-3,
                         help="Energy tolerance (eV) for win/improvement (default 1e-3)")
     parser.add_argument("--max-abs-e", type=float, default=5.0,
@@ -1350,6 +1400,8 @@ def add_analyze_args(parser) -> None:
 
 def add_traj_args(parser) -> None:
     parser.add_argument("input", type=Path, help="Trajectory CSV from 'run' (..._traj.csv)")
+    parser.add_argument("--baseline", default=None,
+                        help="Override the baseline config label for paired comparisons")
     parser.add_argument("--tol", type=float, default=1e-3,
                         help="Energy tolerance (eV) for a paired win (default 1e-3)")
     parser.add_argument("--max-abs-e", type=float, default=5.0,

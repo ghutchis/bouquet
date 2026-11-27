@@ -100,17 +100,19 @@ def _gfnff_calc(method, mol, charge):
 
 
 def _optimize(atoms, calc, fmax=0.05, steps=300):
-    """Unconstrained local optimization; returns (atoms, E_eV) or None on failure."""
-    from ase.optimize import LBFGS
-    a = atoms.copy()
-    a.calc = calc
-    try:
-        with _suppress_c_stdout():
-            LBFGS(a, logfile=None).run(fmax=fmax, steps=steps)
-            e = float(a.get_potential_energy())
-        return a, e
-    except Exception:
-        return None
+    """Unconstrained local optimization; returns (atoms, E_eV) or None on failure.
+
+    ONE `calc` is built per molecule (see the caller) and reused for the start proxy
+    and every pool member, so a failure must not just lose this structure: xtb keeps
+    the non-converged SCF as its restart guess and every LATER member of the same pool
+    inherits it. That is how a009_d02 came back with E_star = -97283 kcal/mol: not one
+    bad structure, a bad pool. ``quench`` resets the calculator on failure, as the
+    handlers in bouquet/assess.py do.
+    """
+    from bouquet.rings.harvest import quench
+
+    with _suppress_c_stdout():
+        return quench(atoms, calc, fmax=fmax, steps=steps)
 
 
 def _etkdg_confs(mol, n, seed):
@@ -502,14 +504,18 @@ def cmd_build(args):
     geom_dir = args.geom_dir
     angles = [float(a) for a in args.angles.split(",")]
 
-    crest_dir = args.crest_dir
+    crest_dirs = args.crest_dir or []
     tasks = []
+    n_crest = 0
     for _, r in man.iterrows():
         mid = r.mol_id
         trails = sorted(glob.glob(str(geom_dir / f"*_{mid}_seed*.xyz"))) if geom_dir else []
         # ensemble_bench layout: <crest-dir>/<mol_id>/<crest-glob> (crest_*/refined.xyz).
-        crest_files = (sorted(glob.glob(str(crest_dir / mid / args.crest_glob)))
-                       if crest_dir else [])
+        # Unioned over every --crest-dir: the combined manifest's cells were built by
+        # separate per-manifest jobs, each into its own tree.
+        crest_files = sorted(f for cd in crest_dirs
+                             for f in glob.glob(str(cd / mid / args.crest_glob)))
+        n_crest += bool(crest_files)
         # skip molecules already done (resume)
         if args.resume and (args.out_dir / f"{mid}.json").exists():
             continue
@@ -525,6 +531,16 @@ def cmd_build(args):
         })
     print(f"Building references for {len(tasks)} molecules "
           f"({args.method}, {args.workers} workers)...")
+    if crest_dirs:
+        # CREST is the strong bouquet-independent source; a molecule missing its cell
+        # falls back to the orthogonal pool and gets a systematically weaker E*. Say so
+        # loudly rather than letting it average into the result.
+        missing = [t["mol_id"] for t in tasks if not t["crest_files"]]
+        print(f"  CREST cells found for {n_crest}/{len(man)} manifest molecules "
+              f"across {len(crest_dirs)} dir(s)")
+        if missing:
+            print(f"  WARNING: {len(missing)} molecule(s) have NO CREST cell, e.g. "
+                  f"{', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
 
     done = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -644,10 +660,16 @@ def main():
                    help="select_smiles.py manifest CSV (mol_id, raw_smiles, d)")
     b.add_argument("--geom-dir", type=Path, default=None,
                    help="Geometry-trail dir (*_geom) for the BO pool; optional")
-    b.add_argument("--crest-dir", type=Path, default=None,
-                   help="ensemble_bench workdir holding CREST cells "
+    b.add_argument("--crest-dir", type=Path, nargs="+", default=None,
+                   help="ensemble_bench workdir(s) holding CREST cells "
                    "(<crest-dir>/<mol_id>/crest_*/refined.xyz); adds them to the "
-                   "reference pool as the strong bouquet-independent source. Optional.")
+                   "reference pool as the strong bouquet-independent source. Optional. "
+                   "Accepts SEVERAL dirs, unioned per mol_id -- the combined manifest's "
+                   "CREST cells were produced by separate per-manifest jobs that each "
+                   "wrote their own tree (stopbench-500 -> ensemble_bench, autosteps-calib "
+                   "-> autosteps_ensemble, stopbench-extras -> its own), so one reference "
+                   "over combined-gfnff.csv needs all of them. Cells are re-optimized on "
+                   "--method, so dirs built on different surfaces can safely be mixed.")
     b.add_argument("--crest-glob", default="crest_*/refined.xyz",
                    help="Glob under <crest-dir>/<mol_id>/ for CREST refined cells "
                    "(default crest_*/refined.xyz).")
