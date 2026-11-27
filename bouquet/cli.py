@@ -514,6 +514,15 @@ def build_parser() -> ArgumentParser:
         "not significant at the endpoint, so it stays opt-in.",
     )
     parser.add_argument(
+        "--gc-every",
+        type=int,
+        default=None,
+        help="Run MMFF-screened graph-subtree crossover every N BO steps to "
+        "recombine distinct low-energy basins (default: auto = every 5 steps "
+        "for d >= 6, off below; set 0 to disable or a positive integer to force "
+        "at any d >= 2).",
+    )
+    parser.add_argument(
         "--retain-bonds",
         action="store_true",
         help="Also reject any evaluated geometry that BROKE a bond relative to the "
@@ -611,6 +620,7 @@ def main(argv=None):
             category_prob=args.category_prob,
             category_warmup=args.category_warmup,
             category_min_moves=args.category_min_moves,
+            gc_every=args.gc_every,
             initial_prior_exponent=args.prior_exponent,
             prior_exponent_decay=args.prior_decay,
             cert_log_path=Path(args.certificate_log) if args.certificate_log else None,

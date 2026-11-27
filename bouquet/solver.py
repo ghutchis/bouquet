@@ -38,6 +38,7 @@ from bouquet.config import (
     GRADIENT_WINDOW_MIN,
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
+    DEFAULT_GC_WARMUP,
     DEFAULT_RELAXATION_STEPS,
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
@@ -75,6 +76,8 @@ from bouquet.solver_moves import (
     _build_category_groups,
     _category_move,
     _low_mode_move,
+    _propose_gc_crossover,
+    build_graph_cuts,
 )
 from bouquet.solver_ensemble import (
     _build_selection_gp,
@@ -232,6 +235,18 @@ class OptimizationState:
     category_count: int = 0
     _cat_Z: list = field(default_factory=list)
     _cat_Y: list = field(default_factory=list)
+
+    # Graph-aware genetic subtree crossover (Phase 3): every gc_every BO steps
+    # (starting at step >= gc_warmup), proposes an MMFF-screened novel clash-free
+    # subtree cross of top distinct basins and evaluates it on the same BO surface.
+    gc_every: int = 0
+    gc_warmup: int = DEFAULT_GC_WARMUP
+    gc_cuts: list | None = None
+    gc_mol: object | None = None
+    gc_geom: object | None = None
+    gc_rng: np.random.Generator | None = None
+    gc_count: int = 0
+    gc_best_count: int = 0
 
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
@@ -976,37 +991,55 @@ def _run_optimization_loop(
             cert_out = ({"t_select": 0.0, "t_eval": 0.0, "t_collective": t_collective}
                         if state.cert_log is not None else None)
         else:
-            # ---- standard BO step: fit the GP and optimize the acquisition ----
+            # ---- standard BO step (or scheduled graph-subtree crossover) ----
+            used_gc = False
+            next_coords = None
             cert_out = {} if state.cert_log is not None else None
-            # Time the two cost centers separately: GP fit/condition + acquisition
-            # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
             _t0 = time.perf_counter()
-            next_coords = _select_next_points_botorch(
-                state.observed_coords, state.observed_energies,
-                prior_module=state.prior_module,
-                prior_exponent=state.prior_exponent,
-                observed_gradients=state.observed_gradients,
-                use_gradients=step_uses_gradients,
-                gp_frozen_hypers=frozen_hypers,
-                gp_hyper_out=hyper_out,
-                cert_out=cert_out,
-                cert_betas=state.cert_betas,
-                acq_num_restarts=state.acq_num_restarts,
-                acq_raw_samples=state.acq_raw_samples,
-                gradient_window=state.gradient_window,
-                gradient_matrix_cap=state.gradient_matrix_cap,
-                gradient_window_min=state.gradient_window_min,
-                gradient_keep=state.gradient_keep,
-                lengthscale_prior=state.lengthscale_prior,
-                feasible=state.clash_feasibility,
-                kernel_arm=state.kernel_arm,
-                feasible_seed_offset=seed + step * _FEASIBLE_MAX_CHUNKS,
-                symmetry_orders=state.symmetry_orders,
-            )
+            if (
+                state.gc_every > 0
+                and step >= state.gc_warmup
+                and (step % state.gc_every == 0)
+            ):
+                next_coords = _propose_gc_crossover(state, dihedrals)
+                if next_coords is not None:
+                    used_gc = True
+                    state.gc_count += 1
+                    # No GP fit ran on a GC step, so leave posterior certificate
+                    # fields blank while still recording wall time cleanly.
+                    cert_out = (
+                        {"t_select": 0.0, "t_eval": 0.0, "t_collective": 0.0}
+                        if state.cert_log is not None
+                        else None
+                    )
+            if next_coords is None:
+                # Time the two cost centers separately: GP fit/condition + acquisition
+                # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
+                next_coords = _select_next_points_botorch(
+                    state.observed_coords, state.observed_energies,
+                    prior_module=state.prior_module,
+                    prior_exponent=state.prior_exponent,
+                    observed_gradients=state.observed_gradients,
+                    use_gradients=step_uses_gradients,
+                    gp_frozen_hypers=frozen_hypers,
+                    gp_hyper_out=hyper_out,
+                    cert_out=cert_out,
+                    cert_betas=state.cert_betas,
+                    acq_num_restarts=state.acq_num_restarts,
+                    acq_raw_samples=state.acq_raw_samples,
+                    gradient_window=state.gradient_window,
+                    gradient_matrix_cap=state.gradient_matrix_cap,
+                    gradient_window_min=state.gradient_window_min,
+                    gradient_keep=state.gradient_keep,
+                    lengthscale_prior=state.lengthscale_prior,
+                    feasible=state.clash_feasibility,
+                    kernel_arm=state.kernel_arm,
+                    feasible_seed_offset=seed + step * _FEASIBLE_MAX_CHUNKS,
+                    symmetry_orders=state.symmetry_orders,
+                )
+                if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
+                    state.grad_gp_hypers = hyper_out["hypers"]
             t_select = time.perf_counter() - _t0
-            if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
-                state.grad_gp_hypers = hyper_out["hypers"]
-            # logger.info(f'Selected next point: {next_coords}')
 
             _t0 = time.perf_counter()
             energy, cur_atoms, gradient = _evaluate_point(
@@ -1014,7 +1047,7 @@ def _run_optimization_loop(
             )
             t_eval = time.perf_counter() - _t0
             if cert_out is not None:
-                cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
+                cert_out["t_select"] = t_select  # GP + acquisition (or GC proposal)
                 cert_out["t_eval"] = t_eval      # xTB energy + relaxation
                 # Any collective attempt(s) this step returned None (failed), so we fell
                 # through to the standard BO step. Their attempt time still elapsed, so
@@ -1027,6 +1060,8 @@ def _run_optimization_loop(
 
         if rel_energy < state.observed_energies.min().item():
             state.best_step = step
+            if collective_result is None and used_gc:
+                state.gc_best_count += 1
             if out_dir is not None:
                 save_structure(out_dir, cur_atoms, "current_best.xyz")
             # Geometry trail: this BO point is a new best-so-far. n_calls matches the
@@ -1070,6 +1105,11 @@ def _run_optimization_loop(
         logger.info(
             f"Phase 3: {state.category_count} category-tied move(s) of {n_steps} BO "
             f"steps over {n_groups} categor(y/ies) for {len(dihedrals)} dihedrals."
+        )
+    if state.gc_every > 0:
+        logger.info(
+            f"Graph-subtree crossover: {state.gc_count} move(s) of {n_steps} BO "
+            f"steps ({state.gc_best_count} set new best)."
         )
 
 
@@ -1471,6 +1511,22 @@ def run_optimization(
             "Clash constraint requested but no RDKit mol was supplied to "
             "run_optimization; searching the unconstrained torsion box."
         )
+
+    # Graph-aware genetic subtree crossover (Phase 3): auto-enables at d >= 6
+    # when mol is available (or forced via opts.gc_every > 0; 0 disables).
+    gc_every = opts.resolve_gc_every(n_dihedrals, has_mol=mol is not None)
+    if gc_every > 0 and mol is not None:
+        gc_cuts = build_graph_cuts(mol, dihedrals)
+        if gc_cuts:
+            state.gc_every = gc_every
+            state.gc_warmup = opts.gc_warmup
+            state.gc_cuts = gc_cuts
+            state.gc_mol = mol
+            state.gc_rng = np.random.default_rng(seed + 77773)
+            logger.info(
+                f"Graph-subtree crossover enabled: every {gc_every} BO step(s) "
+                f"(warmup {opts.gc_warmup}, {len(gc_cuts)} graph cut(s))."
+            )
 
     # Optional per-step stopping-rule certificate log (calibration benchmark).
     if opts.cert_log_path is not None:

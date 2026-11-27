@@ -106,6 +106,14 @@ HIGH_D_DIHEDRAL_THRESHOLD = 12
 CAT_D_THRESHOLD = 14        # auto-enable only when n_dihedrals > this
 CAT_MAXSPEC_THRESHOLD = 4   # ...AND the largest tied category > this (real repeat)
 
+# Graph-aware genetic subtree crossover (Phase 3) defaults. Auto-enables at
+# d >= GC_D_THRESHOLD when an RDKit mol is available (validated on d=6..9:
+# 20/22/6 FINAL p=0.017, 13/17/2 acyclic p=0.0020, -7% wall time). A broader
+# d=3..12 sweep can tune GC_D_THRESHOLD; --gc-every N overrides at any d>=2.
+GC_D_THRESHOLD = 6
+DEFAULT_GC_EVERY = 5
+DEFAULT_GC_WARMUP = 5
+
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
@@ -347,6 +355,11 @@ class RunOptions:
     category_warmup: int = 20
     category_min_moves: int = 6
 
+    # Graph-aware genetic subtree crossover (None = auto -> DEFAULT_GC_EVERY at
+    # d >= GC_D_THRESHOLD when an RDKit mol is available; 0 = off; >0 = every N BO steps)
+    gc_every: Optional[int] = None
+    gc_warmup: int = DEFAULT_GC_WARMUP
+
     # Benchmark-only logging (hidden from the normal CLI happy path)
     cert_log_path: Optional[Path] = None
     cert_betas: tuple = DEFAULT_CERTIFICATE_BETAS
@@ -467,6 +480,15 @@ class RunOptions:
             raise ValueError(
                 f"category_prob must be in [0, 1] or None, got {self.category_prob}."
             )
+        if self.gc_every is not None and self.gc_every < 0:
+            raise ValueError(
+                f"gc_every must be a non-negative integer (0 = off) or None (auto), "
+                f"got {self.gc_every}."
+            )
+        if self.gc_warmup < 0:
+            raise ValueError(
+                f"gc_warmup must be a non-negative integer, got {self.gc_warmup}."
+            )
         if self.clash_threshold <= 0:
             raise ValueError(
                 f"clash_threshold must be positive, got {self.clash_threshold}."
@@ -525,6 +547,20 @@ class RunOptions:
         return 0.5 if (
             n_dihedrals > CAT_D_THRESHOLD and max_spec > CAT_MAXSPEC_THRESHOLD
         ) else 0.0
+
+    def resolve_gc_every(self, n_dihedrals: int, has_mol: bool = True) -> int:
+        """Resolve ``gc_every`` (``None`` = auto) to a concrete step cadence.
+
+        Auto enables MMFF-screened graph-subtree crossover every
+        ``DEFAULT_GC_EVERY`` BO steps once ``n_dihedrals >= GC_D_THRESHOLD`` and
+        an RDKit ``mol`` is available; ``0`` disables it; an explicit positive
+        integer forces it at any ``n_dihedrals >= 2`` (still requires ``mol``).
+        """
+        if not has_mol or n_dihedrals < 2:
+            return 0
+        if self.gc_every is not None:
+            return self.gc_every
+        return DEFAULT_GC_EVERY if n_dihedrals >= GC_D_THRESHOLD else 0
 
 
 @dataclass(slots=True)
