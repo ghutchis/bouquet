@@ -702,6 +702,7 @@ def _screen_initial_guesses(
             widths_used.append(width)
 
     n_rejected = n_wanted - int(keep.sum())
+    kept = kept[:n_wanted]
     if n_rejected:
         detail = (f" (resampled at {'/'.join(f'{w:g}' for w in widths_used)} deg)"
                   if widths_used else "")
@@ -710,7 +711,16 @@ def _screen_initial_guesses(
             f"({label}) were sterically infeasible; {len(kept) - int(keep.sum())} "
             f"resampled{detail}, {len(kept)} usable."
         )
-    return kept[:n_wanted] if kept else list(guess_array[:1])
+    if len(kept) < n_wanted:
+        # Only screened points are returned: a rejected guess is never sent to the
+        # calculator (it could poison the SCF restart). With none left, the search
+        # simply continues from the start observation already in the state.
+        logger.warning(
+            f"Clash constraint: only {len(kept)} of {n_wanted} initial guesses "
+            f"({label}) are feasible"
+            + ("; continuing from the start structure alone." if not kept else ".")
+        )
+    return kept
 
 
 def _evaluate_initial_guesses(
@@ -770,10 +780,22 @@ def _evaluate_initial_guesses(
     # candidates. This is not a nicety: the random init design is drawn blind, so
     # it is the most likely source of a badly clashed geometry, and evaluating one
     # can leave the calculator in a broken state that corrupts the whole run (see
-    # _reset_calculators). Guesses that come from real conformers are geometries
-    # someone already vetted, so they are passed through untouched.
-    if state.clash_feasibility is not None and initial_conformers is None and guesses:
-        guesses = _screen_initial_guesses(state, guesses, rng_seed=seed, label=label)
+    # _reset_calculators). Conformer guesses are screened too: only their TORSIONS
+    # transfer -- _evaluate_point rebuilds every guess on state.start_atoms -- so a
+    # vetted conformer can still clash once its angles land on the start geometry.
+    # User-provided seeds are never replaced by random draws; a clashed one is
+    # dropped.
+    if state.clash_feasibility is not None and guesses:
+        if initial_conformers is not None:
+            keep = np.asarray(state.clash_feasibility(np.asarray(guesses)), dtype=bool)
+            if not keep.all():
+                logger.warning(
+                    f"Clash constraint: dropped {int((~keep).sum())} of {len(guesses)} "
+                    f"provided conformers whose torsions clash on the start structure."
+                )
+            guesses = [g for g, ok in zip(guesses, keep) if ok]
+        else:
+            guesses = _screen_initial_guesses(state, guesses, rng_seed=seed, label=label)
 
     state.init_steps = len(guesses)
     state.reserve(len(guesses))  # size the buffers once for this phase's appends
@@ -1142,7 +1164,7 @@ def _perform_final_relaxation(
     # stepping onto a higher-energy surface while still returning a finite energy
     # below RELAX_FAILURE_ENERGY_EV). Reverting BEFORE releasing constraints lets
     # the unconstrained relaxation start from the clean best observed geometry.
-    if constrained_energy >= RELAX_FAILURE_ENERGY_EV:
+    if not np.isfinite(constrained_energy) or constrained_energy >= RELAX_FAILURE_ENERGY_EV:
         revert_reason = (
             "Final constrained relaxation failed (calculator error, e.g. SCF "
             "non-convergence); seeding unconstrained relaxation from best observed."
@@ -1183,7 +1205,7 @@ def _perform_final_relaxation(
     # evaluate (SCF non-convergence -> sentinel failure energy) or regressed to a
     # higher finite energy than the geometry it started from, revert to the
     # lower-energy constrained/observed geometry.
-    if best_energy >= RELAX_FAILURE_ENERGY_EV:
+    if not np.isfinite(best_energy) or best_energy >= RELAX_FAILURE_ENERGY_EV:
         logger.warning(
             "Final unconstrained relaxation failed (calculator error, e.g. SCF "
             "non-convergence); reverting to the constrained/observed best."
@@ -1272,8 +1294,9 @@ def run_optimization(
     category_assignments: dict | None = None,
     return_ensemble: bool = False,
     ensemble_seed_geometries: list[Atoms] | None = None,
-    mol: Chem.Mol | None = None,
     opts: RunOptions | None = None,
+    *,
+    mol: Chem.Mol | None = None,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 

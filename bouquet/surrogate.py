@@ -166,7 +166,14 @@ def _periodic_covar_module(
         base_kwargs["ard_num_dims"] = num_dims
     symmetric = symmetry_orders is not None and any(m > 1 for m in symmetry_orders)
     if symmetric:
+        # Folded inputs span exactly one irreducible period per dimension, so the
+        # period is a structural constant (1.0), not a fitted hyperparameter --
+        # matching the gradient GP. A fitted period would break the exact 360/m_j
+        # periodicity the folding relies on.
+        base_kwargs.pop("period_length_prior", None)
         base_kernel = _SymmetryPeriodicKernel(symmetry_orders, **base_kwargs)
+        base_kernel.period_length = 1.0
+        base_kernel.raw_period_length.requires_grad_(False)
     else:
         base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
     if loc is not None:
@@ -307,21 +314,22 @@ def _restrict_gradient_mask(
 
 
 class _SymmetryScaledPrior(torch.nn.Module):
-    """Map symmetry-folded ``u in [0, 1]^d`` back to full-turn ``x = u / m``
-    before querying a ``DihedralPriorModule`` built in the ``[0, 1] = [0, 360 deg)``
-    convention. Keeps all existing univariate and bivariate priors exact when
-    symmetric rotors are folded into ``[0, 360 / m_j)``."""
+    """Score symmetry-folded ``u in [0, 1]^d`` under a ``DihedralPriorModule`` built
+    in the ``[0, 1] = [0, 360 deg)`` convention.
+
+    A folded ``u_j`` stands for all ``m_j`` equivalent full-turn angles
+    ``(u_j + k) / m_j``; scoring only one of them (``u / m``) would ignore prior mass
+    at the others and make the boundaries u=0 and u=1 -- the same physical angle --
+    score differently. The prior module therefore combines every representative per
+    factor (jointly for bivariate pairs); order-1 dimensions are unchanged."""
 
     def __init__(self, prior_module: torch.nn.Module, sym_orders: Sequence[int]):
         super().__init__()
         self.prior_module = prior_module
-        self.register_buffer(
-            "inv_sym",
-            1.0 / torch.tensor(list(sym_orders), dtype=torch.float64),
-        )
+        self.sym_orders = tuple(int(m) for m in sym_orders)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        return self.prior_module(X * self.inv_sym.to(X))
+        return self.prior_module(X, symmetry_orders=self.sym_orders)
 
 
 def _periods_deg_array(

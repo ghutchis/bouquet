@@ -98,6 +98,31 @@ def test_topology_retained_and_broken():
     assert not topology_retained(mol, broken)
 
 
+def test_topology_rejects_a_formed_bond():
+    """Added connectivity (atoms driven into covalent range) is a topology change too."""
+    mol = _embed("CCCCCC")
+    atoms = mol_to_ase_atoms(mol, 0)
+    formed = atoms.copy()
+    p = formed.get_positions()
+    p[5] = p[0] + (p[1] - p[0]) * -1.0  # put C6 one C-C bond length from C1
+    formed.set_positions(p)
+    assert not topology_retained(mol, formed)
+
+
+def test_quench_rejects_an_unconverged_run():
+    """An LBFGS run that hits its step cap is not a minimum and must not be kept."""
+    from ase.calculators.emt import EMT
+
+    from bouquet.rings.harvest import quench
+
+    from ase.build import molecule
+    atoms = molecule("CH4")
+    atoms.rattle(0.2, seed=1)
+    assert quench(atoms, EMT(), fmax=1e-6, steps=1) is None
+    out = quench(atoms, EMT(), fmax=1e-6, steps=1, require_convergence=False)
+    assert out is not None
+
+
 # --- ring-state clustering + ranking ---------------------------------------------
 
 def test_cluster_ring_states_labels_and_ranks():

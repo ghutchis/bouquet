@@ -26,7 +26,7 @@ from bouquet.assess import _reset_calculators
 from bouquet.config import KCAL_TO_EV
 from bouquet.ensemble import _boltzmann_weights
 from bouquet.rings.systems import RingSystem, _kabsch_rmsd, ring_state_distance
-from bouquet.setup import apply_charge_spin, connectivity_changed
+from bouquet.setup import apply_charge_spin, mol_bond_set, species_changed
 
 logger = logging.getLogger(__name__)
 
@@ -81,24 +81,36 @@ def topology_retained(ref_mol, atoms: Atoms, tol: float = 1.3) -> bool:
 
     A no-op for a fixed-topology engine like GFN-FF, but real for GFN2 / AIMNet2 and a
     cheap backstop against an over-biased structure that dissociated or cyclised.
+    Broken bonds use ``tol``; formed bonds use the species guard's stricter
+    ``BOND_FORMATION_TOL`` (see :func:`bouquet.setup.bonds_formed`), so a strained ring's
+    close non-bonded contact is not mistaken for a new bond.
     """
-    return not connectivity_changed(atoms, ref_mol, tol)
+    return not species_changed(atoms, mol_bond_set(ref_mol), tol_break=tol)
 
 
 # --------------------------------------------------------------------------- #
 # Quench
 # --------------------------------------------------------------------------- #
-def quench(atoms: Atoms, calc, fmax: float = 0.02, steps: int = 300):
-    """Local (unconstrained) optimization; returns ``(atoms, energy_eV)`` or None on failure."""
+def quench(atoms: Atoms, calc, fmax: float = 0.02, steps: int = 300,
+           require_convergence: bool = True):
+    """Local (unconstrained) optimization; returns ``(atoms, energy_eV)`` or None on failure.
+
+    With ``require_convergence`` (default) a run that hits ``steps`` before reaching
+    ``fmax`` also returns None: an unconverged snapshot is not a minimum, so it must not
+    be clustered or ranked as a ring state.
+    """
     from ase.optimize import LBFGS
     a = atoms.copy()
     a.calc = calc
     try:
-        LBFGS(a, logfile=None).run(fmax=fmax, steps=steps)
+        converged = LBFGS(a, logfile=None).run(fmax=fmax, steps=steps)
         energy = float(a.get_potential_energy())
     except Exception:
         logger.debug("quench failed; dropping snapshot", exc_info=True)
         _reset_calculators(calc)
+        return None
+    if require_convergence and not converged:
+        logger.debug("quench did not converge in %d steps; dropping snapshot", steps)
         return None
     return a, energy
 

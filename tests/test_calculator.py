@@ -264,3 +264,38 @@ class TestCalculatorFactoryIntegration:
         calc = CalculatorFactory.create("aimnet2")
         assert calc is not None
         assert hasattr(calc, "get_potential_energy")
+
+
+@pytest.mark.parametrize("cls_name", ["RDKitUFFCalculator", "RDKitMMFFCalculator"])
+def test_cached_force_field_matches_fresh_build_after_folding(cls_name):
+    """The force field is built once on the embedded conformer; its nonbonded terms
+    must not depend on that build geometry. Build on an all-anti (extended) chain,
+    then evaluate coiled geometries: energies and forces must match a fresh build."""
+    import numpy as np
+    from ase import Atoms
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit.Chem import rdMolTransforms as T
+
+    import bouquet.calc_rdkit as cr
+
+    mol = Chem.AddHs(Chem.MolFromSmiles("C" * 40))
+    cids = list(AllChem.EmbedMultipleConfs(mol, 4, randomSeed=1))
+    ext = mol.GetConformer(cids[0])
+    for k in range(37):
+        T.SetDihedralDeg(ext, k, k + 1, k + 2, k + 3, 180.0)
+    extended = Chem.Mol(mol, confId=cids[0])
+    extended.RemoveAllConformers()
+    extended.AddConformer(Chem.Conformer(ext), assignId=True)
+    calc = getattr(cr, cls_name)(extended)
+    symbols = [a.GetSymbol() for a in mol.GetAtoms()]
+    for c in cids[1:]:
+        pos = mol.GetConformer(c).GetPositions()
+        coiled = Chem.Mol(mol)
+        coiled.RemoveAllConformers()
+        coiled.AddConformer(Chem.Conformer(mol.GetConformer(c)), assignId=True)
+        fresh = getattr(cr, cls_name)(coiled)
+        a, b = Atoms(symbols, positions=pos), Atoms(symbols, positions=pos)
+        a.calc, b.calc = calc, fresh
+        assert a.get_potential_energy() == pytest.approx(b.get_potential_energy(), abs=1e-9)
+        np.testing.assert_allclose(a.get_forces(), b.get_forces(), atol=1e-9)

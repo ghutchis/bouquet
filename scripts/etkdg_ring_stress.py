@@ -64,7 +64,7 @@ def _embed(smiles, n, small_ring_torsions, seed):
 
 def stress(task: dict) -> list[dict]:
     from rdkit import Chem
-    from bouquet.setup import apply_charge_spin, default_multiplicity
+    from bouquet.setup import apply_charge_spin, connectivity_changed, default_multiplicity
     mid, smiles = task["mol_id"], task["smiles"]
     rows = []
     try:
@@ -95,7 +95,7 @@ def stress(task: dict) -> list[dict]:
             for _r, cf in mmff[: task["gfn2_cap"]]:
                 a = cf.copy(); apply_charge_spin(a, charge, mult)
                 opt = ref._optimize(a, calc)
-                if opt is not None:
+                if opt is not None and not connectivity_changed(opt[0], molh):
                     gfn2_rmsds.append(C.ring_rmsd(opt[0], crest_min, ring_idx))
             min_gfn2 = min(gfn2_rmsds) if gfn2_rmsds else float("inf")
             row.update(n_mmff_close=n_close,

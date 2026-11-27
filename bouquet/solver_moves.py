@@ -62,17 +62,36 @@ def _collective_kick_relax(
     relax (clash cleanup), then release the constraint and relax UNCONSTRAINED to a local
     minimum -- so the geometry can slide along the curved fold valley a standard, dihedral-
     pinned BO step cannot cross. Used by both the low-mode kick and the category broadcast.
-    Returns (energy [eV], relaxed atoms)."""
-    _, atoms = evaluate_energy(
+    Returns (energy [eV], relaxed atoms). A failed constrained stage returns the
+    failure sentinel immediately, without starting the free relaxation."""
+    constrained_energy, atoms = evaluate_energy(
         target_deg, anchor, dihedrals, calc, relaxCalc,
         relax=True, steps=_LOWMODE_CONSTRAINED_STEPS,
     )
+    if _relax_failed(constrained_energy):
+        return RELAX_FAILURE_ENERGY_EV, atoms
     atoms.set_constraint()
     return relax_structure(atoms, calc, relaxCalc, _LOWMODE_FREE_STEPS)
 
 
-def _collective_clash_reject(state: OptimizationState, target_deg: np.ndarray) -> bool:
+def _relax_failed(energy: float) -> bool:
+    """True for a calculator failure: the sentinel energy or a non-finite value."""
+    return not np.isfinite(energy) or energy >= RELAX_FAILURE_ENERGY_EV
+
+
+def _collective_clash_reject(
+    state: OptimizationState,
+    target_deg: np.ndarray,
+    anchor: Atoms | None = None,
+    dihedrals: list[DihedralInfo] | None = None,
+) -> bool:
     """True if a proposed collective geometry fails the clash feasibility region.
+
+    ``anchor`` is the geometry the move applies ``target_deg`` to (the incumbent, see
+    :func:`_collective_kick_relax`). When given with ``dihedrals``, the target is screened on THAT
+    geometry with the run's clash detector, rather than on the start structure the
+    shared feasibility region was built from, so the screen judges the structure the
+    calculator actually sees.
 
     Collective moves must be screened by the SAME region the acquisition optimizer
     uses. They were not, originally, and that was the one hole left in the guards:
@@ -86,9 +105,15 @@ def _collective_clash_reject(state: OptimizationState, target_deg: np.ndarray) -
     """
     if state.clash_feasibility is None:
         return False
-    feasible = bool(
-        state.clash_feasibility(np.asarray(target_deg, dtype=float)[None, :])[0]
-    )
+    feasibility = state.clash_feasibility
+    detector = getattr(feasibility, "detector", None)
+    if anchor is not None and dihedrals is not None and detector is not None:
+        from bouquet.clash import TorsionFeasibility, TorsionGeometry
+
+        feasibility = TorsionFeasibility(
+            TorsionGeometry(anchor, dihedrals), detector
+        )
+    feasible = bool(feasibility(np.asarray(target_deg, dtype=float)[None, :])[0])
     if not feasible:
         state.n_collective_clash_rejects += 1
     return not feasible
@@ -102,8 +127,8 @@ def _collective_result(
     calc: Calculator | None = None,
     relaxCalc: Calculator | None = None,
 ) -> tuple[np.ndarray, Atoms, float] | None:
-    """Finish a collective move: reject it (return None) if the UNCONSTRAINED relax
-    changed connectivity, else return (relaxed dihedrals [deg], atoms, energy).
+    """Finish a collective move: reject it (return None) if the relaxation failed or
+    the UNCONSTRAINED relax changed connectivity, else return (relaxed dihedrals [deg], atoms, energy).
 
     The same species guard ``_evaluate_point`` applies to ordinary BO steps, and for
     the same reason -- but it matters MORE here, because a collective move relaxes
@@ -112,6 +137,11 @@ def _collective_result(
     on the BO path. A rejected geometry also resets the calculators, since it may
     have left a broken SCF solution that would corrupt every later evaluation.
     """
+    if _relax_failed(energy):
+        # Failed relaxation: reset the calculators (the guard does so on the
+        # sentinel) and fall back to BO without committing the failed geometry.
+        _species_guard(state, atoms, RELAX_FAILURE_ENERGY_EV, calc, relaxCalc)
+        return None
     if _species_guard(state, atoms, energy, calc, relaxCalc):
         return None
     new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
@@ -208,7 +238,7 @@ def _low_mode_move(
     amp = math.radians(state.lowmode_kick_deg) * math.sqrt(direction.shape[0])
     target_deg = ss.line(direction, np.array([amp]))[0]
 
-    if _collective_clash_reject(state, target_deg):
+    if _collective_clash_reject(state, target_deg, anchor, dihedrals):
         return None
     energy, atoms = _collective_kick_relax(target_deg, anchor, dihedrals, calc, relaxCalc)
     return _collective_result(state, atoms, energy, dihedrals, calc, relaxCalc)
@@ -322,7 +352,7 @@ def _category_move(
     for gi, members in enumerate(groups):
         target_deg[members] = z[gi] % 360.0
 
-    if _collective_clash_reject(state, target_deg):
+    if _collective_clash_reject(state, target_deg, anchor, dihedrals):
         # A clashed z still teaches the low-D GP -- record it at the failure energy
         # rather than evaluating it, matching the "record before the connectivity
         # check" intent below without paying for (or risking) the evaluation.
@@ -510,6 +540,13 @@ def _propose_gc_crossover(
         conf.SetPositions(np.ascontiguousarray(pos, dtype=np.float64))
         work.AddConformer(conf, assignId=True)
 
-    res = ff_optimize_confs(work, max_iters=_GC_MMFF_QUENCH_ITERS)
-    energies = [float(e) for _, e in res]
-    return pool[int(np.argmin(energies))]
+    try:
+        res = ff_optimize_confs(work, max_iters=_GC_MMFF_QUENCH_ITERS)
+    except Exception:
+        # MMFF and the UFF fallback both failed (e.g. unparameterized atoms): no
+        # ranking is possible, so let the caller fall back to a standard BO step.
+        return None
+    energies = np.array([float(e) for _, e in res], dtype=float)
+    if len(energies) != len(pool) or not np.isfinite(energies).any():
+        return None
+    return pool[int(np.nanargmin(np.where(np.isfinite(energies), energies, np.nan)))]

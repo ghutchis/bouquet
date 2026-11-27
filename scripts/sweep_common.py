@@ -1125,6 +1125,8 @@ def trajectory(args: argparse.Namespace, baseline: str) -> None:
 
 
 def _paired_summary(d, tol: float, with_mean: bool = False) -> str:
+    import numpy as np
+
     """One-line paired comparison of baseline-minus-config deltas ``d``.
 
     ``d`` is a Series indexed by (name, seed), > 0 where the config is lower

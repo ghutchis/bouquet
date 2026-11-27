@@ -150,3 +150,27 @@ def test_ring_buffer_caps_references(rng):
     _, bias = _biased(X, [np.arange(5)], [X + 0.1 * rng.standard_normal((5, 3))
                                           for _ in range(40)], max_refs=25)
     assert bias.n_refs() == [25]
+
+
+def test_planar_set_keeps_the_proper_rotation():
+    """A rank-2 (planar) set has a unique proper rotation; it must not fall back to
+    the identity (which would leave the sets unaligned)."""
+    from bouquet.rings.bias import kabsch_rotation, rmsd_sq_and_grad
+
+    ang = np.linspace(0, 2 * np.pi, 6, endpoint=False)
+    ring = np.c_[1.4 * np.cos(ang), 1.4 * np.sin(ang), np.zeros(6)]  # planar hexagon
+    th = 0.7
+    Rz = np.array([[np.cos(th), -np.sin(th), 0], [np.sin(th), np.cos(th), 0], [0, 0, 1]])
+    rotated = ring @ Rz.T
+    R, _ = kabsch_rotation(ring - ring.mean(0), rotated - rotated.mean(0))
+    assert np.isclose(np.linalg.det(R), 1.0)
+    rmsd2, _ = rmsd_sq_and_grad(ring, rotated)
+    assert rmsd2 == pytest.approx(0.0, abs=1e-12)
+
+
+def test_collinear_set_falls_back_to_identity():
+    from bouquet.rings.bias import kabsch_rotation
+
+    line = np.c_[np.linspace(-1, 1, 4), np.zeros(4), np.zeros(4)]
+    R, _ = kabsch_rotation(line, line)
+    assert np.allclose(R, np.eye(3))

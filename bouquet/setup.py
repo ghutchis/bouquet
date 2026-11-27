@@ -419,9 +419,10 @@ def get_conformers_from_file(
         conformers = [atoms]
 
     elif ext == ".json":
-        # Ring-MTD seed file (ring_seeds schema). The seed geometries are in
-        # AddHs(MolFromSmiles(smiles)) order -- the same order bouquet builds its molecule in
-        # -- so they line up atom-for-atom. Charge/spin are (re)stamped by the caller,
+        # Ring-MTD seed file (ring_seeds schema). The seed geometries are in the atom order
+        # of the SMILES the seeds were generated from, which need not match the run's
+        # molecule (the stored SMILES is canonical, so it often does not): the caller maps
+        # them with align_conformers_to_mol. Charge/spin are (re)stamped by the caller,
         # matching the other branches.
         #
         # CAUTION: conformers loaded here do NOT carry their ring pucker into the search.
@@ -460,6 +461,100 @@ def get_conformers_from_file(
 
     logger.info(f"Read {len(conformers)} conformers from {filepath}")
     return conformers
+
+
+def _connectivity_graph(atomic_numbers, bonds) -> Chem.Mol:
+    """Element + bond-topology-only molecule (no bond orders, charges or implicit H)."""
+    rw = Chem.RWMol()
+    for z in atomic_numbers:
+        atom = Chem.Atom(int(z))
+        atom.SetNoImplicit(True)
+        rw.AddAtom(atom)
+    for i, j in bonds:
+        rw.AddBond(int(i), int(j), Chem.BondType.SINGLE)
+    graph = rw.GetMol()
+    graph.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(graph)
+    return graph
+
+
+def _perceived_bonds(atoms: Atoms) -> set[tuple[int, int]] | None:
+    """Bond graph perceived from a geometry (RDKit connectivity), or None on failure."""
+    xyz = f"{len(atoms)}\n\n" + "\n".join(
+        f"{s} {x:.8f} {y:.8f} {w:.8f}"
+        for s, (x, y, w) in zip(atoms.get_chemical_symbols(), atoms.get_positions())
+    )
+    perceived = Chem.MolFromXYZBlock(xyz)
+    try:
+        rdDetermineBonds.DetermineConnectivity(perceived)
+    except Exception:
+        return None
+    return {
+        tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+        for b in perceived.GetBonds()
+    }
+
+
+def align_conformers_to_mol(
+    conformers: list[Atoms], mol: Chem.Mol, reference_atoms: Atoms | None = None
+) -> list[Atoms]:
+    """Map each conformer's atoms onto ``mol``'s atom order, dropping unmappable ones.
+
+    Bouquet's torsions index atoms in ``mol``'s order, so a conformer whose atoms are
+    ordered differently (e.g. a ring-seed file written from a different SMILES
+    spelling) would silently put every torsion on the wrong atoms. Each conformer's
+    connectivity is perceived from its geometry and compared to ``mol``'s bond graph:
+    an already aligned conformer (same elements, same bonds, same order) is returned
+    unchanged; otherwise its atoms are reordered by a graph isomorphism onto ``mol``.
+    A conformer with no such correspondence is rejected with a warning.
+
+    ``reference_atoms`` (the start geometry, in ``mol``'s atom order) supplies the
+    reference graph when given, so both sides are perceived the same way: geometric
+    perception can disagree with the SMILES graph (e.g. the ~1.85 A bridgehead
+    contact of a bicyclo[1.1.1]pentane reads as a bond), which would otherwise reject
+    correctly aligned conformers.
+
+    Raises:
+        ValueError: if no conformer can be mapped onto ``mol``.
+    """
+    ref_z = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    ref_bonds = _perceived_bonds(reference_atoms) if reference_atoms is not None else None
+    if ref_bonds is None:
+        ref_bonds = {
+            tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+            for b in mol.GetBonds()
+        }
+    ref_graph = None
+    aligned = []
+    for i, conf in enumerate(conformers):
+        z = [int(v) for v in conf.get_atomic_numbers()]
+        if len(z) != len(ref_z):
+            raise ValueError(f"Conformer {i} has {len(z)} atoms, expected {len(ref_z)}")
+        bonds = _perceived_bonds(conf)
+        if bonds is None:
+            logger.warning(f"Conformer {i}: connectivity perception failed; rejected")
+            continue
+        if z == ref_z and bonds == ref_bonds:
+            aligned.append(conf)
+            continue
+        match = ()
+        if len(bonds) == len(ref_bonds):
+            if ref_graph is None:
+                ref_graph = _connectivity_graph(ref_z, ref_bonds)
+            # Same atom and bond counts, so a full-graph substructure match is an
+            # isomorphism: match[k] is the conformer atom playing mol's atom k.
+            match = _connectivity_graph(z, bonds).GetSubstructMatch(ref_graph)
+        if not match:
+            logger.warning(
+                f"Conformer {i}: atoms do not correspond to the start molecule "
+                f"(different elements or connectivity); rejected"
+            )
+            continue
+        logger.info(f"Conformer {i}: reordered atoms to match the start molecule")
+        aligned.append(conf[list(match)])
+    if not aligned:
+        raise ValueError("No conformer could be mapped onto the start molecule's atoms")
+    return aligned
 
 
 @dataclass(slots=True)

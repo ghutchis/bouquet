@@ -36,8 +36,10 @@ from bouquet.config import KCAL_TO_EV
 
 logger = logging.getLogger(__name__)
 
-# Below this ratio of smallest/largest singular value the optimal rotation is not unique
-# (planar or degenerate bias set); fall back to the identity rotation rather than emit NaNs.
+# Below this ratio of the SECOND/largest singular value the optimal rotation is not unique
+# (collinear or coincident bias set, rank < 2); fall back to the identity rotation rather
+# than emit NaNs. A planar set (rank 2) is fine: the det = +1 correction fixes the third
+# axis, so its proper-rotation SVD solution is unique and is kept.
 _DEGENERATE_SV_RATIO = 1e-6
 
 
@@ -46,12 +48,13 @@ def kabsch_rotation(P: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarra
 
     ``P`` and ``Q`` are (n, 3) and assumed already centered on their centroids. Returns
     ``(R, singular_values)``; the caller uses the singular values for the degeneracy
-    guard. On a degenerate/planar set (rotation non-unique) returns the identity.
+    guard. On a collinear/coincident set (rank < 2, rotation non-unique) returns the
+    identity; planar (rank-2) sets keep the proper-rotation solution.
     """
     H = P.T @ Q
     U, S, Vt = np.linalg.svd(H)
-    if S[0] < 1e-12 or S[-1] / S[0] < _DEGENERATE_SV_RATIO:
-        logger.debug("RMSDBias: degenerate/planar bias set; using identity rotation")
+    if S[0] < 1e-12 or S[1] / S[0] < _DEGENERATE_SV_RATIO:
+        logger.debug("RMSDBias: collinear/degenerate bias set; using identity rotation")
         return np.eye(3), S
     d = np.sign(np.linalg.det(Vt.T @ U.T)) or 1.0
     R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T

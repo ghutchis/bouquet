@@ -62,8 +62,9 @@ from botorch.acquisition.analytic import LogExpectedImprovement
 from bouquet.config import ENERGY_CLIP_OFFSET
 from bouquet.surrogate import _fit_gradient_gp, _fit_value_gp, make_covar_module
 
+# bo_slice_common is imported only on the --slice / --seeds paths that use it, so the
+# synthetic-surface default runs without it.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bo_slice_common import SliceSurface, draw_molecule, plot_convergence  # noqa: E402
 
 torch.set_default_dtype(torch.float64)
 
@@ -478,6 +479,8 @@ def main():
 
     surface = None
     if args.slice:
+        from bo_slice_common import SliceSurface
+
         surface = SliceSurface(args.slice)
         if surface.ndim != 2:
             ap.error(f"{args.slice} is a {surface.ndim}D slice; use plot_bo_1d.py")
@@ -535,12 +538,16 @@ def main():
         bad = [n for n in args.composite if not num_pairs <= n <= args.n_total]
         if bad:
             ap.error(f"--composite counts {bad} outside [{num_pairs}, {args.n_total}]")
+        if surface:
+            from bo_slice_common import draw_molecule
         mol_img = draw_molecule(surface) if surface else None
         plot_composite(T1, T2, true_k, frames, args.composite, num_pairs, e_levels,
                        out_root / "composite.pdf", mol_img=mol_img)
         print(f"\nwrote {out_root / 'composite.pdf'}")
 
     if args.seeds:
+        from bo_slice_common import plot_convergence
+
         rng = np.random.default_rng(args.seed)
         H = {"no_gradients": [], "gradients": []}
         designs = []

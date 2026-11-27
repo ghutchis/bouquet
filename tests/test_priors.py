@@ -235,6 +235,22 @@ def test_pair_claimed_once_per_orientation():
     assert set(result) in ({(0, 1)}, {(1, 0)})
 
 
+def test_overlapping_pairs_stay_disjoint():
+    """A dihedral shared by two matched pairs must join only one of them; a
+    non-overlapping pair is kept unchanged."""
+    mol = Chem.AddHs(Chem.MolFromSmiles("CCCCCCC"))
+    smarts = "[C:1][C:2][C:3][C:4][C:5]"
+    matcher = _matcher(BivariateTopology.ADJACENT, smarts)
+    chain = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 6]
+    # Backbone dihedrals 0..3 along the heptane chain: (0,1), (1,2), (2,3) overlap.
+    dihedrals = [tuple(chain[k:k + 4]) for k in range(4)]
+    result = matcher.match_bivariate(mol, dihedrals)
+
+    dims = [d for pair in result for d in pair]
+    assert len(dims) == len(set(dims)), f"overlapping pairs kept: {set(result)}"
+    assert len(result) == 2  # (0,1) and (2,3): both disjoint pairs survive
+
+
 def test_transposed_assignment_changes_the_density():
     """Guards the reason order matters: an asymmetric mixture is not symmetric."""
     priors = {

@@ -20,6 +20,16 @@ from rdkit.Chem import AllChem
 from bouquet.config import KCAL_TO_EV
 
 
+# The force field is built ONCE (on the molecule's embedded conformer) and reused for
+# every geometry. RDKit decides which nonbonded pairs to include from distances in the
+# BUILD geometry (MMFF ``nonBondedThresh``, in A; UFF ``vdwThresh``, a multiple of the vdW
+# distance), so with the defaults a pair that is far apart there -- e.g. the two ends of
+# an extended chain -- would be silently missing once the molecule folds. A threshold
+# this large includes every pair, so the cached terms are geometry-independent and
+# match a fresh build at any geometry.
+_ALL_PAIRS_THRESH = 1.0e6
+
+
 class RDKitCalculator(Calculator, ABC):
     """Base ASE Calculator wrapper for RDKit force fields.
 
@@ -137,7 +147,7 @@ class RDKitMMFFCalculator(RDKitCalculator):
     def _create_force_field(self, conf_id: int = 0):
         """Create an MMFF force field instance."""
         return AllChem.MMFFGetMoleculeForceField(
-            self.mol, self.mmff_props, confId=conf_id
+            self.mol, self.mmff_props, nonBondedThresh=_ALL_PAIRS_THRESH, confId=conf_id
         )
 
 
@@ -157,4 +167,6 @@ class RDKitUFFCalculator(RDKitCalculator):
 
     def _create_force_field(self, conf_id: int = 0):
         """Create a UFF force field instance."""
-        return AllChem.UFFGetMoleculeForceField(self.mol, confId=conf_id)
+        return AllChem.UFFGetMoleculeForceField(
+            self.mol, vdwThresh=_ALL_PAIRS_THRESH, confId=conf_id
+        )

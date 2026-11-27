@@ -3,8 +3,10 @@
 Serializes a :class:`bouquet.rings.harvest.HarvestResult` into the seed file bouquet
 consumes, and reads it back into ASE structures. The one invariant that matters: ``coords``
 are in the molecule's input-atom order (RDKit ``AddHs`` order), because bouquet indexes its
-torsions off exactly that ordering -- so a seed's coordinates drop straight into
-``run_optimization(initial_conformers=...)``.
+torsions off exactly that ordering. Note that ``run_optimization(initial_conformers=...)``
+uses only each seed's TORSIONS (applied to the one start geometry), so ring pucker does
+not enter the BO; to search from a ring state, make it the start structure (``--file``).
+See RING_MTD_BENCH section 9.17.
 """
 
 from __future__ import annotations

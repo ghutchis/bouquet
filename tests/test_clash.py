@@ -273,8 +273,9 @@ class TestInitialGuessScreening:
         assert len(kept) == len(guesses)
         assert state.clash_feasibility(np.asarray(kept)).all()
 
-    def test_never_returns_empty_when_nothing_is_feasible(self, flexible):
-        """An impossible constraint must not wipe out the initial design."""
+    def test_never_returns_a_rejected_guess(self, flexible):
+        """With nothing feasible, no rejected guess reaches the calculator: the
+        search continues from the start observation instead."""
         from bouquet.solver import _screen_initial_guesses
 
         state, dihedrals = self._state(flexible)
@@ -282,7 +283,7 @@ class TestInitialGuessScreening:
         guesses = list(np.random.default_rng(6).uniform(0, 360, size=(4, len(dihedrals))))
 
         kept = _screen_initial_guesses(state, guesses, rng_seed=6, label="test")
-        assert len(kept) >= 1
+        assert kept == []
 
 
     def test_narrows_the_draw_until_the_quota_is_met(self, flexible):
@@ -365,12 +366,17 @@ def _linear_chain(positions):
 
 
 class TestDegenerateDihedrals:
-    @pytest.mark.parametrize("positions", [COLLINEAR, COINCIDENT])
-    def test_build_raises_where_ase_raises(self, positions):
-        atoms, dihedrals = _linear_chain(positions)
-        # ASE's own behaviour on this geometry, for the record.
+    def test_ase_raises_on_collinear(self):
+        """ASE's own behaviour on a collinear chain, for the record. (COINCIDENT is
+        not asserted: what ASE does there is incidental -- it divides by a zero
+        norm -- and not part of bouquet's contract.)"""
+        atoms, _ = _linear_chain(COLLINEAR)
         with pytest.raises(ZeroDivisionError):
             atoms.copy().set_dihedral(0, 1, 2, 3, 90.0, indices={3})
+
+    @pytest.mark.parametrize("positions", [COLLINEAR, COINCIDENT])
+    def test_build_raises_on_degenerate_chain(self, positions):
+        atoms, dihedrals = _linear_chain(positions)
         with pytest.raises(DegenerateDihedralError):
             TorsionGeometry(atoms, dihedrals).build(np.array([90.0]))
 
@@ -473,3 +479,67 @@ class TestEvaluateEnergyUsesTorsionGeometry:
             TorsionGeometry(atoms, dihedrals).build(angles),
             atol=1e-10,
         )
+
+
+class TestConformerAlignment:
+    """--conformer-file seeds must correspond atom-for-atom to the start molecule."""
+
+    @staticmethod
+    def _mol_and_atoms(smiles):
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+
+        from bouquet.setup import mol_to_ase_atoms
+
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        AllChem.EmbedMolecule(mol, randomSeed=7)
+        return mol, mol_to_ase_atoms(mol)
+
+    def test_aligned_conformer_is_kept_unchanged(self):
+        from bouquet.setup import align_conformers_to_mol
+
+        mol, atoms = self._mol_and_atoms("CCO")
+        out = align_conformers_to_mol([atoms], mol)
+        assert out[0] is atoms
+
+    def test_permuted_conformer_is_reordered(self):
+        from bouquet.setup import align_conformers_to_mol, geometry_bond_set
+
+        mol, atoms = self._mol_and_atoms("CCO")
+        perm = np.random.default_rng(0).permutation(len(atoms))
+        out = align_conformers_to_mol([atoms[perm]], mol)
+        assert list(out[0].get_atomic_numbers()) == list(atoms.get_atomic_numbers())
+        ref = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+               for b in mol.GetBonds()}
+        assert geometry_bond_set(out[0]) == ref
+
+    def test_wrong_molecule_is_rejected(self):
+        from bouquet.setup import align_conformers_to_mol
+
+        mol, _ = self._mol_and_atoms("CCO")
+        _, other = self._mol_and_atoms("COC")  # same formula, different graph
+        with pytest.raises(ValueError):
+            align_conformers_to_mol([other], mol)
+
+    def test_strained_cage_is_not_rejected_with_a_reference_geometry(self):
+        """Geometric perception reads bicyclo[1.1.1]pentane's ~1.85 A bridgehead
+        contact as a bond the SMILES graph lacks; perceiving the reference from the
+        start geometry keeps an aligned conformer instead of rejecting it."""
+        from bouquet.setup import align_conformers_to_mol
+
+        mol, atoms = self._mol_and_atoms("C1C2CC1C2")
+        start = atoms.copy()
+        out = align_conformers_to_mol([atoms], mol, start)
+        assert out[0] is atoms
+
+
+def test_blocked_screen_matches_unblocked(flexible, monkeypatch):
+    """Blocking the contact reduction must not change any per-candidate ratio."""
+    import bouquet.clash as clash_mod
+
+    atoms, mol, dihedrals = flexible
+    feas = build_feasibility(atoms, mol, dihedrals)
+    angles = np.random.default_rng(2).uniform(0, 360, size=(37, len(dihedrals)))
+    full = feas.ratios(angles)
+    monkeypatch.setattr(clash_mod, "_SCREEN_BLOCK_ELEMENTS", 3 * feas.detector.n_pairs * 4)
+    np.testing.assert_array_equal(feas.ratios(angles), full)

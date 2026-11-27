@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -453,7 +453,23 @@ class DihedralPriorModule(nn.Module):
         # but it keeps the documented range honest.
         return torch.remainder(theta + math.pi, 2.0 * math.pi) - math.pi
 
-    def forward(self, X: Tensor) -> Tensor:
+    def _representatives(self, X: Tensor, d: int, orders) -> Tensor:
+        """Full-turn representatives of dim ``d``, shape (..., q, m_d).
+
+        Without ``orders`` (or for an order-1 rotor) X is already the full-turn angle
+        and there is a single representative. For a symmetry-folded ``u`` in one
+        irreducible period, the m physically equivalent full-turn angles are
+        ``(u + k) / m`` for ``k = 0..m-1`` (in the module's input units).
+        """
+        x = X[..., d].unsqueeze(-1)
+        m = 1 if orders is None else int(orders[d])
+        if m <= 1:
+            return x
+        full_turn = 360.0 if self.input_in_degrees else 1.0
+        k = torch.arange(m, dtype=X.dtype, device=X.device) * full_turn
+        return (x + k) / m
+
+    def forward(self, X: Tensor, symmetry_orders: Optional[Sequence[int]] = None) -> Tensor:
         """
         Compute the LOG probability of X under the prior.
 
@@ -470,6 +486,14 @@ class DihedralPriorModule(nn.Module):
 
         Args:
             X: Shape (..., q, dim) - dihedral values
+            symmetry_orders: Optional per-dihedral symmetry order ``m_d``. When
+                given, ``X[..., d]`` is a symmetry-folded coordinate covering one
+                irreducible period (``360 / m_d`` degrees), and each factor scores
+                the MEAN density over all ``m_d`` equivalent full-turn angles (all
+                ``m_d1 * m_d2`` angle pairs jointly for a bivariate factor, which
+                keeps its fitted correlation), so equivalent angles -- including the
+                period boundaries u=0 and u=1 -- score identically. Order-1
+                dihedrals are unchanged.
 
         The per-dihedral log-densities are *averaged*, not summed: the joint
         log-prior is ``mean_d log p_d(x_d)`` over the informative dihedrals
@@ -497,7 +521,8 @@ class DihedralPriorModule(nn.Module):
         for d, dist in self.univariate_dists.items():
             if dist is None:
                 continue
-            angle = self._to_radians(X[..., d])
+            reps = self._representatives(X, d, symmetry_orders)
+            angle = self._to_radians(reps)
             # Move univariate distribution tensors lazily if X lives on another device (e.g. CUDA).
             if dist.component_distribution.loc.device != angle.device:
                 dist = MixtureSameFamily(
@@ -512,6 +537,8 @@ class DihedralPriorModule(nn.Module):
             if w_bg > 0.0:
                 bg_lp = torch.full_like(vm_lp, log_w + log_uniform)
                 vm_lp = torch.logaddexp(log_one_minus_w + vm_lp, bg_lp)
+            # Mean density over the equivalent representatives (exactly vm_lp for m=1).
+            vm_lp = torch.logsumexp(vm_lp, dim=-1) - math.log(reps.shape[-1])
             log_prob = log_prob + vm_lp
 
         # Bivariate contributions. These factors are *unnormalized*, so the uniform
@@ -524,9 +551,15 @@ class DihedralPriorModule(nn.Module):
             if dist.mu1.device != X.device:
                 dist.to(X.device)
             off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
-            angle1 = self._to_radians(X[..., d1]) - math.radians(off1)
-            angle2 = self._to_radians(X[..., d2]) - math.radians(off2)
-            log_prob = log_prob + dist.log_prob(angle1, angle2)
+            reps1 = self._representatives(X, d1, symmetry_orders)  # (..., q, m1)
+            reps2 = self._representatives(X, d2, symmetry_orders)  # (..., q, m2)
+            # Every (k1, k2) combination jointly, so the fitted correlation holds.
+            angle1 = (self._to_radians(reps1) - math.radians(off1)).unsqueeze(-1)
+            angle2 = (self._to_radians(reps2) - math.radians(off2)).unsqueeze(-2)
+            pair_lp = dist.log_prob(angle1, angle2).flatten(-2)  # (..., q, m1*m2)
+            log_prob = log_prob + (
+                torch.logsumexp(pair_lp, dim=-1) - math.log(pair_lp.shape[-1])
+            )
 
         # Average over informative dihedrals (mean, not sum) so the prior's
         # magnitude is O(1) in dim. n_active_dims == 0 means an all-uniform prior
@@ -745,9 +778,13 @@ class DihedralPriorMatcher:
         conf = mol.GetConformer(conf_id) if mol.GetNumConformers() else None
 
         results: Dict[Tuple[int, int], BivariateAssignment] = {}
-        # Dedup is on the unordered pair: one physical pair must not be claimed
-        # twice (once per orientation) by two different matches.
-        seen: Set[frozenset] = set()
+        # Each dihedral joins at most ONE pair: a dihedral shared by two pairs would
+        # become two independent joint axes (double-counted in ``forward`` and set to
+        # conflicting values by ``peak_modes``). Patterns run highest priority first,
+        # so the higher-priority pair keeps a contested dihedral; a pair that loses
+        # one falls back to univariate priors for its other dihedral (assign_all).
+        # This also dedups a physical pair matched in both orientations.
+        claimed: Set[int] = set()
 
         for pattern in self.bivariate_patterns:
             smarts_mol = self._compiled_bi.get(pattern.smarts)
@@ -775,9 +812,8 @@ class DihedralPriorMatcher:
                 if off1 is None or off2 is None:
                     continue
 
-                key = frozenset((idx1, idx2))
-                if key not in seen:
-                    seen.add(key)
+                if idx1 not in claimed and idx2 not in claimed:
+                    claimed.update((idx1, idx2))
                     results[(idx1, idx2)] = BivariateAssignment(
                         prior_type=pattern.prior_type,
                         offset1_deg=off1,

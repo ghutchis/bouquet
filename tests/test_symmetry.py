@@ -167,7 +167,8 @@ class TestSymmetryInSurrogateAndEnsemble:
         assert float(e_pred[0]) == pytest.approx(1.0, abs=0.05)   # 60 deg -> +1.0
         assert float(e_pred[1]) == pytest.approx(-1.0, abs=0.05)  # 0 deg -> -1.0
 
-    def test_symmetry_scaled_prior_matches_true_angle(self):
+    def test_symmetry_scaled_prior_averages_equivalent_angles(self):
+        """A folded u scores the MEAN density over its m equivalent full-turn angles."""
         pm = DihedralPriorModule(
             dim=2,
             univariate_assignments={0: "sp3_sp3", 1: "sp3_sp2"},
@@ -177,10 +178,48 @@ class TestSymmetryInSurrogateAndEnsemble:
             input_in_degrees=False,
         )
         wrapped = _SymmetryScaledPrior(pm, (3, 2))
-        # u = (0.5, 0.5) in symmetry-folded space = (60 deg, 90 deg) = (1/6, 1/4) in full turn
         u = torch.tensor([[[0.5, 0.5]]], dtype=torch.float64)
-        x_full = torch.tensor([[[60.0 / 360.0, 90.0 / 360.0]]], dtype=torch.float64)
-        assert torch.allclose(wrapped(u), pm(x_full), atol=1e-12)
+        # Folded (0.5, 0.5) under (C3, C2) = {60, 180, 300} deg x {90, 270} deg.
+        reps0 = [60.0, 180.0, 300.0]
+        reps1 = [90.0, 270.0]
+
+        def factor(d, deg):  # per-dim log density via a 1-D-informative module
+            x = torch.zeros(1, 1, 2, dtype=torch.float64)
+            x[..., d] = deg / 360.0
+            return pm.univariate_dists[d].log_prob(pm._to_radians(x[..., d]))
+
+        lp0 = torch.logsumexp(torch.stack([factor(0, a) for a in reps0]), 0) - math.log(3)
+        lp1 = torch.logsumexp(torch.stack([factor(1, a) for a in reps1]), 0) - math.log(2)
+        expected = (lp0 + lp1) / pm.n_active_dims
+        assert torch.allclose(wrapped(u), torch.clamp(expected, min=-20.0), atol=1e-12)
+
+    def test_symmetry_scaled_prior_period_boundaries_agree(self):
+        """u=0 and u=1 are the same physical angle and must score identically,
+        for univariate and (jointly) bivariate factors."""
+        biv = {"t": {"components": [{"mu1_deg": 70.0, "mu2_deg": 200.0, "kappa1": 4.0,
+                                     "kappa2": 3.0, "correlation": 1.5}],
+                     "weights": [1.0]}}
+        pm = DihedralPriorModule(
+            dim=3,
+            univariate_assignments={0: "sp3_sp3"},
+            bivariate_assignments={(1, 2): "t"},
+            univariate_priors={},
+            bivariate_priors=biv,
+            input_in_degrees=False,
+        )
+        wrapped = _SymmetryScaledPrior(pm, (3, 2, 1))
+        lo = torch.tensor([[[0.0, 0.0, 0.3]]], dtype=torch.float64)
+        hi = torch.tensor([[[1.0, 1.0, 0.3]]], dtype=torch.float64)
+        assert torch.allclose(wrapped(lo), wrapped(hi), atol=1e-12)
+
+    def test_order_one_factors_are_unchanged(self):
+        pm = DihedralPriorModule(
+            dim=2, univariate_assignments={0: "sp3_sp3", 1: "sp3_sp2"},
+            bivariate_assignments={}, univariate_priors={}, bivariate_priors={},
+            input_in_degrees=False,
+        )
+        x = torch.rand(4, 1, 2, dtype=torch.float64)
+        assert torch.equal(_SymmetryScaledPrior(pm, (1, 1))(x), pm(x))
 
     def test_ensemble_periodic_distance_folds_symmetric_rotors(self):
         periods = torch.tensor([180.0, 120.0], dtype=torch.float64)

@@ -235,6 +235,11 @@ def _rotate_about_axis_batch(points: np.ndarray, origin: np.ndarray,
     return p * c + np.cross(ax, p) * s + ax * dot * (1.0 - c) + origin[:, None, :]
 
 
+# Cap on elements in one block's (block, n_pairs, 3) difference array (~16 MB of
+# float64), bounding the clash screen's memory regardless of batch size.
+_SCREEN_BLOCK_ELEMENTS = 2_000_000
+
+
 class ClashDetector:
     """Worst non-bonded contact ratio of a geometry, and the feasibility test.
 
@@ -295,9 +300,18 @@ class ClashDetector:
         """Batched :meth:`min_ratio`; ``positions`` is (B, n_atoms, 3) -> (B,)."""
         if self.n_pairs == 0:
             return np.full(len(positions), np.inf)
-        diff = positions[:, self.i, :] - positions[:, self.j, :]
-        d2 = (diff * diff).sum(axis=2)
-        return np.sqrt((d2 * self._inv_vdw_sums_sq).min(axis=1))
+        # Process candidates in blocks so the (block, n_pairs, 3) temporaries stay
+        # bounded instead of scaling with the whole batch (acquisition pools are
+        # hundreds of candidates x thousands of pairs). Per-candidate minima are
+        # independent, so the result is identical to the unblocked reduction.
+        out = np.empty(len(positions))
+        block = max(1, _SCREEN_BLOCK_ELEMENTS // (3 * self.n_pairs))
+        for s in range(0, len(positions), block):
+            p = positions[s:s + block]
+            diff = p[:, self.i, :] - p[:, self.j, :]
+            d2 = (diff * diff).sum(axis=2)
+            out[s:s + block] = (d2 * self._inv_vdw_sums_sq).min(axis=1)
+        return np.sqrt(out)
 
     def is_feasible(self, positions: np.ndarray) -> bool:
         return self.min_ratio(positions) >= self.threshold

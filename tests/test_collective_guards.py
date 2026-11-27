@@ -66,6 +66,30 @@ class TestClashPreScreen:
         state = _State(clash_feasibility=None)
         assert not _collective_clash_reject(state, np.array([10.0, 20.0]))
 
+    def test_screens_on_the_anchor_geometry(self, chain):
+        """The screen must judge the geometry the move is applied to (the
+        incumbent), not the start structure the shared region was built from."""
+        from bouquet.clash import TorsionFeasibility, TorsionGeometry
+
+        atoms, dihedrals, _ = chain
+
+        class _Detector:
+            threshold = 0.5
+            seen = None
+
+            def min_ratio_batch(self, positions):
+                self.seen = np.array(positions)
+                return np.ones(len(positions))
+
+        det = _Detector()
+        state = _State(clash_feasibility=TorsionFeasibility(
+            TorsionGeometry(atoms, dihedrals), det))
+        anchor = atoms.copy()
+        anchor.positions += 10.0  # distinguishable from the start structure
+        assert not _collective_clash_reject(state, np.array([60.0]), anchor, dihedrals)
+        # Atom 0 is not rotated by the dihedral, so it shows which geometry was built.
+        np.testing.assert_allclose(det.seen[0][0], anchor.positions[0])
+
     def test_screens_the_proposal_as_a_single_batch_row(self):
         """The feasibility callable takes (n_candidates, n_dihedrals)."""
         seen = {}
@@ -95,6 +119,16 @@ class TestSpeciesGuardOnCollectiveResult:
         coords, got, energy = out
         assert energy == -5.0 and len(coords) == 1
         assert state.n_bond_forms == 0
+
+    @pytest.mark.parametrize("energy", [RELAX_FAILURE_ENERGY_EV, float("nan")])
+    def test_rejects_a_failed_relaxation(self, chain, energy):
+        """A failed relax is a failed move (BO fallback), never a committed point,
+        and the calculators are reset."""
+        atoms, dihedrals, reference = chain
+        spy = _SpyCalc()
+        state = _State(required_bonds=reference)
+        assert _collective_result(state, atoms, energy, dihedrals, spy) is None
+        assert spy.resets == 1
 
     def test_bond_breaking_stays_opt_in(self, chain):
         """Matches the BO path: formation is default-on, breaking needs --retain-bonds."""

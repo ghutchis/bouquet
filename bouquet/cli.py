@@ -681,6 +681,7 @@ def main(argv=None):
         setup_logging,
     )
     from bouquet.setup import (
+        align_conformers_to_mol,
         apply_charge_spin,
         default_multiplicity,
         detect_dihedrals,
@@ -809,15 +810,12 @@ def main(argv=None):
         logger.info(
             f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}{picked}"
         )
+        # Torsions index atoms in mol's order: verify each conformer corresponds
+        # atom-for-atom (reordering it if needed; unmappable ones are rejected).
+        initial_conformers = align_conformers_to_mol(initial_conformers, mol, init_atoms)
         # Stamp charge/spin on conformer atoms too, so xtb reads them per-eval.
         for conf in initial_conformers:
             apply_charge_spin(conf, config.charge, config.multiplicity)
-        # Validate that conformers have the same number of atoms
-        for i, conf in enumerate(initial_conformers):
-            if len(conf) != len(init_atoms):
-                raise ValueError(
-                    f"Conformer {i} has {len(conf)} atoms, expected {len(init_atoms)}"
-                )
 
     # Create prior module if priors file provided. This drives PiBO acquisition
     # steering and is only built when --priors is given.
@@ -902,6 +900,9 @@ def main(argv=None):
         if len(planned) > 0:
             initial_dihedrals = planned
         else:
+            # Carry the --auto cap into the random fallback (max_init == init_steps
+            # outside --auto), so it is also the count the BO budget is reduced by.
+            init_steps = max_init
             logger.info(
                 "ETKDG cluster seeding found no distinct clash-free clusters; "
                 "falling back to random initial guesses."

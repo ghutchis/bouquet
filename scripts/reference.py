@@ -112,7 +112,7 @@ def _optimize(atoms, calc, fmax=0.05, steps=300):
     from bouquet.rings.harvest import quench
 
     with _suppress_c_stdout():
-        return quench(atoms, calc, fmax=fmax, steps=steps)
+        return quench(atoms, calc, fmax=fmax, steps=steps, require_convergence=False)
 
 
 def _etkdg_confs(mol, n, seed):
@@ -255,17 +255,24 @@ def _drop_stereoisomers(pools: dict, molh, rejected: dict | None = None):
     ref_mol = Chem.Mol(molh)
     Chem.AssignStereochemistry(ref_mol, cleanIt=True, force=True)
     rdCIPLabeler.AssignCIPLabels(ref_mol)
-    want = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))): b.GetProp("_CIPCode")
-            for b in ref_mol.GetBonds() if b.HasProp("_CIPCode")}
-    if not want:                       # nothing stereo-specified -> nothing to enforce
+    # Both atom (R/S, catches epimers) and bond (E/Z) requirements. Centres the SMILES
+    # leaves unspecified carry no CIP label, so they stay unrestricted.
+    want_atoms = {a.GetIdx(): a.GetProp("_CIPCode")
+                  for a in ref_mol.GetAtoms() if a.HasProp("_CIPCode")}
+    want_bonds = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))): b.GetProp("_CIPCode")
+                  for b in ref_mol.GetBonds() if b.HasProp("_CIPCode")}
+    if not want_atoms and not want_bonds:   # nothing stereo-specified -> nothing to enforce
         return pools, {src: 0 for src in pools}
+
+    def _matches(got: dict, want: dict) -> bool:
+        return all(got.get(k) is None or got[k] == v for k, v in want.items())
 
     n_rej = {src: 0 for src in pools}
     out: dict = {src: [] for src in pools}
     for src, res in pools.items():
         for a, e in res:
-            got = stereo_signature(molh, a)[1]      # (atom_cip, bond_cip) -> bonds
-            if all(got.get(k) is None or got[k] == v for k, v in want.items()):
+            got_atoms, got_bonds = stereo_signature(molh, a)
+            if _matches(got_atoms, want_atoms) and _matches(got_bonds, want_bonds):
                 out[src].append((a, e))
             else:
                 n_rej[src] += 1
