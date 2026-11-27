@@ -100,7 +100,9 @@ def test_cli_init_method_default_and_choices():
     assert parser.parse_args(["--smiles", "CCCC", "--init-steps", "7"]).init_steps == 7
 
 
-def test_unified_pool_dedups_rings_and_reuses_conformers_without_reembedding():
+def test_unified_pool_dedups_rings_and_reuses_conformers_without_reembedding(
+    monkeypatch,
+):
     """get_initial_candidates(pool_size=...) dedups to <= n_score distinct
     low-MMFF structures while leaving the full ff_energy-stamped pool on mol
     for plan_etkdg_initial_points to reuse directly."""
@@ -115,7 +117,14 @@ def test_unified_pool_dedups_rings_and_reuses_conformers_without_reembedding():
     assert 1 <= len(candidates) <= n_score
     assert all(c.HasProp("ff_energy") for c in mol.GetConformers())
 
-    # plan_etkdg_initial_points reuses the 64 conformers already on mol cleanly
+    # plan_etkdg_initial_points reuses the 64 conformers already on mol cleanly;
+    # a fresh embedding pass during planning is a failure.
+    import bouquet.setup as setup_mod
+
+    def _no_reembed(*args, **kwargs):
+        raise AssertionError("plan_etkdg_initial_points re-embedded the pool")
+
+    monkeypatch.setattr(setup_mod, "_embed_mmff_pool", _no_reembed)
     dihs = detect_dihedrals(mol, drop_h_c3=True)
     feas = build_feasibility(candidates[0], mol, dihs)
     pts = plan_etkdg_initial_points(

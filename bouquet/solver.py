@@ -1608,13 +1608,32 @@ def run_optimization(
             _perform_ensemble_exploration(
                 state, dihedrals, calc, relaxCalc, relax, opts, seed=seed
             )
-        extra_ens = list(ensemble_seed_geometries or []) + ring_grafts
+        extra_ens = list(ensemble_seed_geometries or [])
+        # Ring grafts get the same guards as _evaluate_ring_grafts: after the tight
+        # opt, connectivity must match the START structure (not just the graft's own
+        # pre-opt bonds) and stereochemistry must be retained.
+        graft_validator = None
+        if ring_grafts:
+            from bouquet.rings.harvest import stereo_retained, stereo_signature
+
+            start_sig = stereo_signature(mol, state.start_atoms)
+            ref_bonds = geometry_bond_set(state.start_atoms)
+
+            def graft_validator(rel_a: Atoms) -> str | None:
+                if geometry_bond_set(rel_a) != ref_bonds:
+                    return "ring graft connectivity changed vs start structure"
+                if not stereo_retained(mol, rel_a, start_sig):
+                    return "ring graft stereochemistry inverted"
+                return None
+
         # Select and tightly optimize the low-energy ensemble. The best member
         # is the lowest-energy conformer; fall back to single-best relaxation if
         # the ensemble comes back empty (e.g. all evaluations failed).
         ensemble = _perform_ensemble_relaxation(
             state, dihedrals, calc, relaxCalc,
             extra_candidates=extra_ens or None,
+            graft_candidates=ring_grafts or None,
+            graft_validator=graft_validator,
         )
         if ensemble:
             best_atoms, best_e_e0, _weight = ensemble[0]
