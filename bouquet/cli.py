@@ -26,6 +26,7 @@ from bouquet.config import (
     DEFAULT_PRIOR_MAX_CONCENTRATION,
     DEFAULT_RING_DEDUP_RMSD,
     DEFAULT_RING_EMBED_POOL,
+    DEFAULT_RING_GRAFTS,
     ENSEMBLE_EXPLORE_MODES,
     GRADIENT_MATRIX_CAP,
     GRADIENT_WINDOW_MIN,
@@ -525,6 +526,14 @@ def build_parser() -> ArgumentParser:
         "at any d >= 2).",
     )
     parser.add_argument(
+        "--ring-grafts",
+        type=int,
+        default=DEFAULT_RING_GRAFTS,
+        help="Post-BO alternate-ring x best-exocyclic grafts to relax on "
+        f"flexible-ring molecules (default: {DEFAULT_RING_GRAFTS}; 0 disables). "
+        "Reuses alternate ring puckers already embedded in the initial ETKDG pool.",
+    )
+    parser.add_argument(
         "--retain-bonds",
         action="store_true",
         help="Also reject any evaluated geometry that BROKE a bond relative to the "
@@ -623,6 +632,7 @@ def main(argv=None):
             category_warmup=args.category_warmup,
             category_min_moves=args.category_min_moves,
             gc_every=args.gc_every,
+            ring_grafts=args.ring_grafts,
             initial_prior_exponent=args.prior_exponent,
             prior_exponent_decay=args.prior_decay,
             cert_log_path=Path(args.certificate_log) if args.certificate_log else None,

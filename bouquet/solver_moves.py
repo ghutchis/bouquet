@@ -30,10 +30,12 @@ from bouquet.assess import _reset_calculators, evaluate_energy, relax_structure
 from bouquet.config import FAILURE_ENERGY_EV, RELAX_FAILURE_ENERGY_EV
 from bouquet.setup import (
     DihedralInfo,
+    _kabsch_rmsd,
     _periodic_torsion_rms_deg,
     ff_optimize_confs,
     bonds_broken,
     bonds_formed,
+    geometry_bond_set,
 )
 from bouquet.surrogate import _select_next_points_botorch
 
@@ -550,3 +552,235 @@ def _propose_gc_crossover(
     if len(energies) != len(pool) or not np.isfinite(energies).any():
         return None
     return pool[int(np.nanargmin(np.where(np.isfinite(energies), energies, np.nan)))]
+
+
+# ---------------------------------------------------------------------------
+# Post-BO ring-exocyclic genetic grafting (Plan 2 Phase 2)
+# ---------------------------------------------------------------------------
+# The BO loop perturbs rotatable dihedrals on a single starting ring pucker.
+# After BO finishes optimizing the exocyclic folds, we graft its top distinct
+# exocyclic torsion states onto the alternate flexible-ring puckers already
+# stored in `mol`'s unified ETKDG pool, clash-screen + 20-step MMFF-quench,
+# and tightly relax the best grafts (stereo + connectivity guarded).
+_RING_GRAFT_MAX_SCAFFOLDS = 8
+_RING_GRAFT_TOP_EXO = 4
+_RING_GRAFT_RING_RMSD = 0.15
+_RING_GRAFT_EXO_SEP_DEG = 25.0
+_RING_GRAFT_DEDUP_RMSD = 0.20
+
+
+def _flex_ring_heavy_indices(mol) -> list[int]:
+    """Heavy-atom indices belonging to non-aromatic (flexible) rings."""
+    ri = mol.GetRingInfo()
+    idx: set[int] = set()
+    for ring in ri.AtomRings():
+        if not all(mol.GetAtomWithIdx(i).GetIsAromatic() for i in ring):
+            idx.update(i for i in ring if mol.GetAtomWithIdx(i).GetAtomicNum() > 1)
+    return sorted(idx)
+
+
+def build_ring_graft_candidates(
+    state: OptimizationState,
+    mol,
+    dihedrals: list[DihedralInfo],
+    max_grafts: int,
+    *,
+    clash_constraint: bool = True,
+    clash_threshold: float = 0.6,
+    clash_exclude_hbonds: bool = True,
+) -> list[Atoms]:
+    """Build up to ``max_grafts`` distinct alternate-ring x BO-best-exocyclic
+    candidate ``Atoms`` for post-BO tight relaxation.
+
+    Returns an empty list when the molecule has no flexible rings, ``mol`` has
+    fewer than 2 conformers, or no alternate clash-free ring grafts survive.
+    """
+    if max_grafts <= 0 or mol is None or not dihedrals or mol.GetNumConformers() < 2:
+        return []
+    ring_idx = _flex_ring_heavy_indices(mol)
+    if not ring_idx:
+        return []
+
+    # 1. Extract up to _RING_GRAFT_MAX_SCAFFOLDS distinct alternate ring puckers
+    #    from mol's existing conformer pool (excluding start_atoms's ring pucker).
+    start_ring_pos = state.start_atoms.get_positions()[ring_idx]
+    confs = list(mol.GetConformers())
+    items = [
+        (
+            c.GetId(),
+            np.asarray(c.GetPositions(), dtype=float),
+            c.GetDoubleProp("ff_energy") if c.HasProp("ff_energy") else float(rank),
+        )
+        for rank, c in enumerate(confs)
+    ]
+    items.sort(key=lambda x: x[2])
+
+    alt_scaffolds: list[np.ndarray] = []
+    seen_ring_pos: list[np.ndarray] = [start_ring_pos]
+    for _, pos, _ in items:
+        rpos = pos[ring_idx]
+        if all(_kabsch_rmsd(rpos, prev) >= _RING_GRAFT_RING_RMSD for prev in seen_ring_pos):
+            alt_scaffolds.append(pos)
+            seen_ring_pos.append(rpos)
+            if len(alt_scaffolds) >= _RING_GRAFT_MAX_SCAFFOLDS:
+                break
+    if not alt_scaffolds:
+        return []
+
+    # 2. Extract top distinct lowest-energy exocyclic torsion states found by BO.
+    periods_deg = np.array([di.period_deg for di in dihedrals], dtype=float)
+    obs_coords = state.observed_coords.cpu().numpy() % periods_deg
+    obs_e = state.observed_energies.cpu().numpy()
+    valid = np.nonzero(obs_e < FAILURE_ENERGY_EV)[0]
+    if valid.size == 0:
+        return []
+    order = valid[np.argsort(obs_e[valid])]
+    exo_states: list[np.ndarray] = []
+    for i in order:
+        c = obs_coords[i]
+        if all(
+            _periodic_torsion_rms_deg(c, prev, periods_deg) >= _RING_GRAFT_EXO_SEP_DEG
+            for prev in exo_states
+        ):
+            exo_states.append(c)
+            if len(exo_states) >= _RING_GRAFT_TOP_EXO:
+                break
+    if not exo_states:
+        return []
+    exo_arr = np.asarray(exo_states, dtype=float)
+
+    # 3. Graft alternate ring scaffolds x BO-best exocyclic torsions, clash-screen,
+    #    and rank by a fast 20-step MMFF94 (UFF fallback) quench.
+    from rdkit import Chem
+
+    from bouquet.clash import TorsionGeometry, build_feasibility
+
+    work = Chem.Mol(mol)
+    work.RemoveAllConformers()
+    n_atoms = work.GetNumAtoms()
+    for spos in alt_scaffolds:
+        a = state.start_atoms.copy()
+        a.set_positions(spos)
+        feas = (
+            build_feasibility(
+                a,
+                mol,
+                dihedrals,
+                threshold=clash_threshold,
+                exclude_hbonds=clash_exclude_hbonds,
+            )
+            if clash_constraint
+            else None
+        )
+        geom = feas.geometry if feas is not None else TorsionGeometry(a, dihedrals)
+        cand_thetas = (
+            exo_arr[np.asarray(feas(exo_arr), dtype=bool)]
+            if feas is not None
+            else exo_arr
+        )
+        if len(cand_thetas) == 0:
+            continue
+        for pos in geom.build_batch(cand_thetas):
+            conf = Chem.Conformer(n_atoms)
+            conf.SetPositions(np.ascontiguousarray(pos, dtype=np.float64))
+            work.AddConformer(conf, assignId=True)
+
+    if work.GetNumConformers() == 0:
+        return []
+
+    try:
+        res = ff_optimize_confs(work, max_iters=_GC_MMFF_QUENCH_ITERS)
+    except Exception:
+        return []
+
+    cids = [c.GetId() for c in work.GetConformers()]
+    energies = np.array([float(e) for _, e in res], dtype=float)
+    if len(energies) != len(cids) or not np.isfinite(energies).any():
+        return []
+
+    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    if len(heavy_idx) < 3:
+        heavy_idx = list(range(n_atoms))
+
+    ranked = np.argsort(np.where(np.isfinite(energies), energies, np.inf))
+    kept_heavy: list[np.ndarray] = []
+    grafts: list[Atoms] = []
+    for idx in ranked:
+        if len(grafts) >= max_grafts or not np.isfinite(energies[idx]):
+            break
+        pos = np.asarray(work.GetConformer(cids[idx]).GetPositions(), dtype=float)
+        ph = pos[heavy_idx]
+        if all(_kabsch_rmsd(ph, prev) >= _RING_GRAFT_DEDUP_RMSD for prev in kept_heavy):
+            kept_heavy.append(ph)
+            cand_atoms = state.start_atoms.copy()
+            cand_atoms.set_constraint()
+            cand_atoms.set_positions(pos)
+            grafts.append(cand_atoms)
+    return grafts
+
+
+def _evaluate_ring_grafts(
+    grafts: list[Atoms],
+    best_atoms: Atoms,
+    best_e_e0: float,
+    state: OptimizationState,
+    mol,
+    dihedrals: list[DihedralInfo],
+    calc: Calculator,
+    relaxCalc: Calculator,
+) -> tuple[Atoms, float]:
+    """Tightly relax post-BO ring grafts (stereo + connectivity guarded) and
+    return the lowest-energy valid structure between the BO final and grafts."""
+    if not grafts:
+        return best_atoms, best_e_e0
+
+    import logging
+
+    from bouquet.config import KCAL_TO_EV
+    from bouquet.rings.harvest import stereo_retained, stereo_signature
+
+    log = logging.getLogger("bouquet.solver")
+    start_sig = stereo_signature(mol, state.start_atoms)
+    ref_bonds = geometry_bond_set(state.start_atoms)
+    best_energy = state.start_energy + best_e_e0
+    initial_best = best_energy
+    n_valid = 0
+
+    for k, cand in enumerate(grafts):
+        a = cand.copy()
+        a.set_constraint()
+        energy, rel_a = relax_structure(a, calc, relaxCalc, steps=None)
+        if energy >= RELAX_FAILURE_ENERGY_EV:
+            continue
+        if geometry_bond_set(rel_a) != ref_bonds:
+            log.info(
+                f"Ring graft {k + 1}/{len(grafts)}: connectivity changed; discarding."
+            )
+            continue
+        if not stereo_retained(mol, rel_a, start_sig):
+            log.info(
+                f"Ring graft {k + 1}/{len(grafts)}: stereochemistry inverted; discarding."
+            )
+            continue
+        n_valid += 1
+        if energy < best_energy - 1e-6:
+            best_energy = float(energy)
+            best_atoms = rel_a
+            best_e_e0 = best_energy - state.start_energy
+            if state.add_entry is not None:
+                coords = np.array([d.get_angle(best_atoms) for d in dihedrals])
+                state.add_entry(coords, best_atoms, best_energy)
+
+    if best_energy < initial_best - 1e-6:
+        gain_kcal = (initial_best - best_energy) / KCAL_TO_EV
+        log.info(
+            f"Post-BO ring grafting: found lower-energy alternate ring conformer "
+            f"(-{gain_kcal:.2f} kcal/mol across {n_valid}/{len(grafts)} valid grafts); "
+            f"E: {best_energy}. E-E0: {best_e_e0}"
+        )
+    else:
+        log.info(
+            f"Post-BO ring grafting: evaluated {n_valid}/{len(grafts)} valid alternate-ring "
+            f"graft(s); BO ring conformer remained lowest."
+        )
+    return best_atoms, best_e_e0

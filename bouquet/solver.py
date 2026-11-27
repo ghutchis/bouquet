@@ -76,10 +76,12 @@ from bouquet.surrogate import (
 from bouquet.solver_moves import (
     _build_category_groups,
     _category_move,
+    _evaluate_ring_grafts,
     _low_mode_move,
     _propose_gc_crossover,
     _species_guard,
     build_graph_cuts,
+    build_ring_graft_candidates,
 )
 from bouquet.solver_ensemble import (
     _build_selection_gp,
@@ -1577,6 +1579,27 @@ def run_optimization(
             f"before any energy evaluation."
         )
 
+    # Post-BO ring-exocyclic grafting (Plan 2 Phase 2): on flexible-ring
+    # molecules with alternate ring puckers in `mol`'s conformer pool, graft
+    # BO's top exocyclic folds onto alternate rings so single-scaffold BO isn't
+    # trapped on a suboptimal ring pucker.
+    ring_grafts: list[Atoms] = []
+    if (
+        opts.ring_grafts > 0
+        and relax
+        and mol is not None
+        and mol.GetNumConformers() >= 2
+    ):
+        ring_grafts = build_ring_graft_candidates(
+            state,
+            mol,
+            dihedrals,
+            max_grafts=opts.ring_grafts,
+            clash_constraint=opts.clash_constraint,
+            clash_threshold=opts.clash_threshold,
+            clash_exclude_hbonds=opts.clash_exclude_hbonds,
+        )
+
     if return_ensemble:
         # Active level-set exploration (on by default; opts.ensemble_steps == 0
         # keeps the historical passive-harvest behavior). Enriches `state` with
@@ -1585,12 +1608,13 @@ def run_optimization(
             _perform_ensemble_exploration(
                 state, dihedrals, calc, relaxCalc, relax, opts, seed=seed
             )
+        extra_ens = list(ensemble_seed_geometries or []) + ring_grafts
         # Select and tightly optimize the low-energy ensemble. The best member
         # is the lowest-energy conformer; fall back to single-best relaxation if
         # the ensemble comes back empty (e.g. all evaluations failed).
         ensemble = _perform_ensemble_relaxation(
             state, dihedrals, calc, relaxCalc,
-            extra_candidates=ensemble_seed_geometries,
+            extra_candidates=extra_ens or None,
         )
         if ensemble:
             best_atoms, best_e_e0, _weight = ensemble[0]
@@ -1599,7 +1623,11 @@ def run_optimization(
         _log_improvement_geometry(state, best_atoms, "final", e_e0_eV=best_e_e0)
         return best_atoms, ensemble
 
-    # Final relaxation and return best structure
+    # Final relaxation, optional post-BO alternate-ring grafts, and return best
     best_atoms, best_e_e0 = _perform_final_relaxation(state, dihedrals, calc, relaxCalc)
+    if ring_grafts:
+        best_atoms, best_e_e0 = _evaluate_ring_grafts(
+            ring_grafts, best_atoms, best_e_e0, state, mol, dihedrals, calc, relaxCalc
+        )
     _log_improvement_geometry(state, best_atoms, "final", e_e0_eV=best_e_e0)
     return best_atoms

@@ -115,6 +115,14 @@ GC_D_THRESHOLD = 6
 DEFAULT_GC_EVERY = 5
 DEFAULT_GC_WARMUP = 5
 
+# Post-BO ring-exocyclic grafting (Plan 2 Phase 2): on flexible-ring molecules,
+# graft BO's top distinct exocyclic torsion states onto alternate ring puckers
+# already stored in mol's unified ETKDG pool, clash-screen + MMFF-quench, and
+# tightly relax the top N grafts (with stereo + connectivity guards). Benchmarked
+# on 26 hard flexible-ring CREST-win molecules: 18/8/0 GFN2 (-0.97 kcal/mol,
+# p=1.9e-6; matched budget 18/6/2, -0.94 kcal/mol, p=1.3e-4). 0 disables.
+DEFAULT_RING_GRAFTS = 6
+
 # Energy clipping for Bayesian optimization
 ENERGY_CLIP_OFFSET = 2.0
 
@@ -369,6 +377,10 @@ class RunOptions:
     gc_every: Optional[int] = None
     gc_warmup: int = DEFAULT_GC_WARMUP
 
+    # Post-BO alternate-ring x best-exocyclic grafting on flexible-ring molecules
+    # (0 = off; >0 = max distinct MMFF-screened grafts to relax after BO).
+    ring_grafts: int = DEFAULT_RING_GRAFTS
+
     # Benchmark-only logging (hidden from the normal CLI happy path)
     cert_log_path: Optional[Path] = None
     cert_betas: tuple = DEFAULT_CERTIFICATE_BETAS
@@ -497,6 +509,11 @@ class RunOptions:
         if self.gc_warmup < 0:
             raise ValueError(
                 f"gc_warmup must be a non-negative integer, got {self.gc_warmup}."
+            )
+        if self.ring_grafts < 0:
+            raise ValueError(
+                f"ring_grafts must be a non-negative integer (0 = off), "
+                f"got {self.ring_grafts}."
             )
         if self.clash_threshold <= 0:
             raise ValueError(
