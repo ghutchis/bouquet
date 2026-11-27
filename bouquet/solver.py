@@ -57,7 +57,7 @@ from bouquet.io import (
 from bouquet.clash import build_feasibility
 from bouquet.priors import DihedralPriorModule
 from bouquet.setup import (
-    DihedralInfo, bonds_broken, bonds_formed, geometry_bond_set,
+    DihedralInfo, bonds_broken, geometry_bond_set,
 )
 
 if TYPE_CHECKING:
@@ -70,6 +70,7 @@ from bouquet.surrogate import (
     _FEASIBLE_MAX_CHUNKS,
     _fit_gradient_gp,
     _periodic_covar_module,
+    _periods_deg_array,
     _select_next_points_botorch,
 )
 from bouquet.solver_moves import (
@@ -77,6 +78,7 @@ from bouquet.solver_moves import (
     _category_move,
     _low_mode_move,
     _propose_gc_crossover,
+    _species_guard,
     build_graph_cuts,
 )
 from bouquet.solver_ensemble import (
@@ -539,11 +541,7 @@ def plan_initial_points(
     """
     axes, uniform_dims = prior_module.peak_modes()
     start_coords = np.asarray(start_coords, dtype=float)
-    periods_deg = (
-        360.0 / np.asarray(symmetry_orders, dtype=float)
-        if symmetry_orders is not None
-        else np.full(n_dihedrals, 360.0, dtype=float)
-    )
+    periods_deg = _periods_deg_array(n_dihedrals, symmetry_orders)
     rng = np.random.default_rng(seed)
 
     grid_size = 1
@@ -641,25 +639,11 @@ def _evaluate_point(
     # species, not a conformer; give it a failure energy so it can never be picked
     # as best (and drop its gradient so it doesn't bias the GP). Without this a
     # collapsed geometry reports a hugely negative energy, becomes the incumbent,
-    # and the search never leaves it.
-    rejected = False
-    if state.required_bonds is not None and energy < RELAX_FAILURE_ENERGY_EV:
-        if state.check_bond_forms and bonds_formed(cur_atoms, state.required_bonds):
-            state.n_bond_forms += 1
-            rejected = True
-        elif state.check_bond_breaks and bonds_broken(cur_atoms, state.required_bonds):
-            state.n_bond_breaks += 1
-            rejected = True
-    if rejected:
+    # and the search never leaves it. The guard also resets the calculators on a
+    # rejected or failed evaluation.
+    if _species_guard(state, cur_atoms, energy, calc, relaxCalc):
         energy = RELAX_FAILURE_ENERGY_EV
         gradient = None
-
-    # A rejected or failed evaluation may have left the calculator holding a
-    # broken SCF solution that would corrupt every later point; clear it. Doing
-    # this only on the bad path keeps the wavefunction restart (and its speedup)
-    # on the normal path.
-    if rejected or energy >= RELAX_FAILURE_ENERGY_EV:
-        _reset_calculators(calc, relaxCalc)
     return energy, cur_atoms, gradient
 
 
@@ -761,11 +745,7 @@ def _evaluate_initial_guesses(
     # only the source and a log label differ, so a single evaluation loop follows.
     # Conformer angles are used as reported by get_angle; peak/random guesses are
     # wrapped to [0, 360) so standardization later sees a consistent range.
-    periods_deg = (
-        360.0 / np.asarray(state.symmetry_orders, dtype=float)
-        if state.symmetry_orders is not None
-        else np.full(len(dihedrals), 360.0, dtype=float)
-    )
+    periods_deg = _periods_deg_array(len(dihedrals), state.symmetry_orders)
     if initial_conformers is not None:
         guesses = [
             np.array([d.get_angle(conformer) for d in dihedrals])
@@ -949,6 +929,7 @@ def _run_optimization_loop(
         #             embedding, available from step 0); takes precedence when enabled.
         #   Phase 2.5 low-mode move -- kick along a data-derived PCA soft mode.
         collective_result = None
+        used_gc = False
         t_collective = 0.0
         if (
             state.category_prob > 0
@@ -992,7 +973,6 @@ def _run_optimization_loop(
                         if state.cert_log is not None else None)
         else:
             # ---- standard BO step (or scheduled graph-subtree crossover) ----
-            used_gc = False
             next_coords = None
             cert_out = {} if state.cert_log is not None else None
             _t0 = time.perf_counter()
@@ -1003,15 +983,10 @@ def _run_optimization_loop(
             ):
                 next_coords = _propose_gc_crossover(state, dihedrals)
                 if next_coords is not None:
+                    # No GP fit ran on a GC step, so cert_out keeps no posterior
+                    # fields; the timings are filled in below as for a BO step.
                     used_gc = True
                     state.gc_count += 1
-                    # No GP fit ran on a GC step, so leave posterior certificate
-                    # fields blank while still recording wall time cleanly.
-                    cert_out = (
-                        {"t_select": 0.0, "t_eval": 0.0, "t_collective": 0.0}
-                        if state.cert_log is not None
-                        else None
-                    )
             if next_coords is None:
                 # Time the two cost centers separately: GP fit/condition + acquisition
                 # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
@@ -1060,7 +1035,7 @@ def _run_optimization_loop(
 
         if rel_energy < state.observed_energies.min().item():
             state.best_step = step
-            if collective_result is None and used_gc:
+            if used_gc:
                 state.gc_best_count += 1
             if out_dir is not None:
                 save_structure(out_dir, cur_atoms, "current_best.xyz")
@@ -1167,27 +1142,26 @@ def _perform_final_relaxation(
     # stepping onto a higher-energy surface while still returning a finite energy
     # below RELAX_FAILURE_ENERGY_EV). Reverting BEFORE releasing constraints lets
     # the unconstrained relaxation start from the clean best observed geometry.
-    if (
-        constrained_energy >= RELAX_FAILURE_ENERGY_EV
-        or constrained_energy > observed_energy + 1e-6
-        or geometry_bond_set(constrained_atoms) != observed_bonds
-    ):
-        if constrained_energy >= RELAX_FAILURE_ENERGY_EV:
-            logger.warning(
-                "Final constrained relaxation failed (calculator error, e.g. SCF "
-                "non-convergence); seeding unconstrained relaxation from best observed."
-            )
-        elif constrained_energy > observed_energy + 1e-6:
-            logger.warning(
-                f"Final constrained relaxation regressed in energy "
-                f"({constrained_energy - observed_energy:+.4f} eV vs best observed); "
-                f"reverting to best observed geometry."
-            )
-        else:
-            logger.warning(
-                "Final constrained relaxation changed connectivity vs best observed; "
-                "reverting to best observed geometry."
-            )
+    if constrained_energy >= RELAX_FAILURE_ENERGY_EV:
+        revert_reason = (
+            "Final constrained relaxation failed (calculator error, e.g. SCF "
+            "non-convergence); seeding unconstrained relaxation from best observed."
+        )
+    elif constrained_energy > observed_energy + 1e-6:
+        revert_reason = (
+            f"Final constrained relaxation regressed in energy "
+            f"({constrained_energy - observed_energy:+.4f} eV vs best observed); "
+            f"reverting to best observed geometry."
+        )
+    elif geometry_bond_set(constrained_atoms) != observed_bonds:
+        revert_reason = (
+            "Final constrained relaxation changed connectivity vs best observed; "
+            "reverting to best observed geometry."
+        )
+    else:
+        revert_reason = None
+    if revert_reason is not None:
+        logger.warning(revert_reason)
         constrained_atoms = observed_atoms.copy()
         constrained_energy = observed_energy
 
@@ -1506,7 +1480,7 @@ def run_optimization(
                 f"screened, H-bond pairs "
                 f"{'excluded' if opts.clash_exclude_hbonds else 'included'})."
             )
-    elif opts.clash_constraint and mol is None:
+    elif opts.clash_constraint:
         logger.info(
             "Clash constraint requested but no RDKit mol was supplied to "
             "run_optimization; searching the unconstrained torsion box."
@@ -1515,7 +1489,7 @@ def run_optimization(
     # Graph-aware genetic subtree crossover (Phase 3): auto-enables at d >= 6
     # when mol is available (or forced via opts.gc_every > 0; 0 disables).
     gc_every = opts.resolve_gc_every(n_dihedrals, has_mol=mol is not None)
-    if gc_every > 0 and mol is not None:
+    if gc_every > 0:
         gc_cuts = build_graph_cuts(mol, dihedrals)
         if gc_cuts:
             state.gc_every = gc_every

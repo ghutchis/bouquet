@@ -34,7 +34,6 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator
 from botorch.models import SingleTaskGP
 from botorch.models.transforms.outcome import Standardize
-from botorch.optim import optimize_acqf
 
 from bouquet.assess import relax_structure
 from bouquet.config import (
@@ -68,6 +67,7 @@ from bouquet.setup import DihedralInfo, geometry_bond_set
 from bouquet.surrogate import (
     _FEASIBLE_MAX_CHUNKS,
     _cert_sobol_pool,
+    _deg_to_unit,
     _fit_value_gp,
     _optimize_acqf_clash_free,
     _periodic_covar_module,
@@ -105,10 +105,7 @@ def _build_selection_gp(
     a ``Standardize`` outcome transform, so the posterior is returned directly
     in eV (relative energies).
     """
-    if torch.is_tensor(periods_deg):
-        train_x = torch.remainder(train_X_deg, periods_deg) / periods_deg
-    else:
-        train_x = train_X_deg.clone() / float(periods_deg)
+    train_x = _deg_to_unit(train_X_deg, periods_deg)
     train_y = train_y_eV.clone().unsqueeze(-1)  # (n, 1), eV, lower = better
     return _fit_value_gp(
         train_x,
@@ -177,11 +174,7 @@ def _select_ensemble_candidates(
                 symmetry_orders=getattr(state, "symmetry_orders", None),
             )
             gp.eval()
-            xq = (
-                torch.remainder(x, periods_t) / periods_t
-                if torch.is_tensor(periods_t)
-                else x / float(periods_t)
-            )
+            xq = _deg_to_unit(x, periods_t)
             with torch.no_grad():
                 post = gp.posterior(xq)
         mu = post.mean.flatten()
@@ -462,21 +455,12 @@ def _select_exploration_point(
         # Level-set exploration deliberately walks *up* to an energy offset, so it
         # is more likely than the main loop to wander into clashed geometry; apply
         # the same feasibility region here.
-        if state.clash_feasibility is not None:
-            candidate = _optimize_acqf_clash_free(
-                acqf, bounds, opts.acq_num_restarts, opts.acq_raw_samples,
-                state.clash_feasibility,
-                seed_offset=feasible_seed_offset,
-                periods_deg=periods_np,
-            )
-        else:
-            candidate, _ = optimize_acqf(
-                acqf,
-                bounds=bounds,
-                q=1,
-                num_restarts=opts.acq_num_restarts,
-                raw_samples=opts.acq_raw_samples,
-            )
+        candidate = _optimize_acqf_clash_free(
+            acqf, bounds, opts.acq_num_restarts, opts.acq_raw_samples,
+            state.clash_feasibility,
+            seed_offset=feasible_seed_offset,
+            periods_deg=periods_np,
+        )
     coords_deg = candidate.detach().cpu().numpy()[0, :] * periods_np
     return coords_deg, gp
 

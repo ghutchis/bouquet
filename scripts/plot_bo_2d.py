@@ -47,6 +47,7 @@ from botorch.models import SingleTaskGP
 from botorch.optim.fit import fit_gpytorch_mll_torch
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
+from bouquet.config import ENERGY_CLIP_OFFSET
 from bouquet.solver import _periodic_covar_module, _fit_gradient_gp
 
 torch.set_default_dtype(torch.float64)
@@ -130,7 +131,7 @@ def fit_arm(
     raw_y = torch.tensor(obs_eV, dtype=torch.float64)  # (n,) eV
     x = train_X / 360.0
 
-    energy_cap = 2.0 + torch.log10(torch.clamp(raw_y, min=1.0))
+    energy_cap = ENERGY_CLIP_OFFSET + torch.log10(torch.clamp(raw_y, min=1.0))
     neg = (-1.0 * torch.minimum(raw_y, energy_cap)).unsqueeze(-1)  # (n,1)
     neg_mean = neg.mean(dim=0, keepdim=True)
     y_std = neg.std(dim=0, keepdim=True)

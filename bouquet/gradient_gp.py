@@ -117,10 +117,11 @@ class GradientEnhancedPeriodicGP(Model):
             )
         self.kernel_arm = kernel_arm
         use_ard = kernel_arm == "ard"
-        self.kernel = (
-            PeriodicKernelGrad(ard_num_dims=d, symmetry_orders=symmetry_orders)
-            if use_ard
-            else PeriodicKernelGrad(symmetry_orders=symmetry_orders)
+        # gpytorch's PeriodicKernel can't take ard_num_dims=None (it sizes the period
+        # from kwargs.get("ard_num_dims", 1)), so the shared case must omit it.
+        ard_kwargs = {"ard_num_dims": d} if use_ard else {}
+        self.kernel = PeriodicKernelGrad(
+            symmetry_orders=symmetry_orders, **ard_kwargs
         ).to(train_X)
         self.kernel.period_length = torch.full((1, 1), float(period)).to(train_X)
         self.kernel.lengthscale = torch.full((1, d if use_ard else 1), 1.0).to(train_X)
@@ -171,10 +172,8 @@ class GradientEnhancedPeriodicGP(Model):
         n, d = self._train_X.shape
         kw = dict(dtype=self._train_X.dtype, device=self._train_X.device)
         return torch.cat([
-            torch.full((n,), value_fill, **kw) if not torch.is_tensor(value_fill)
-            else value_fill.expand(n),
-            torch.full((self._n_grad * d,), grad_fill, **kw)
-            if not torch.is_tensor(grad_fill) else grad_fill.expand(self._n_grad * d),
+            torch.as_tensor(value_fill, **kw).expand(n),
+            torch.as_tensor(grad_fill, **kw).expand(self._n_grad * d),
         ])
 
     # ---- conditioning / fitting ---------------------------------------------

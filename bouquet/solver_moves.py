@@ -31,6 +31,7 @@ from bouquet.config import FAILURE_ENERGY_EV, RELAX_FAILURE_ENERGY_EV
 from bouquet.setup import (
     DihedralInfo,
     _periodic_torsion_rms_deg,
+    ff_optimize_confs,
     bonds_broken,
     bonds_formed,
 )
@@ -111,6 +112,28 @@ def _collective_result(
     on the BO path. A rejected geometry also resets the calculators, since it may
     have left a broken SCF solution that would corrupt every later evaluation.
     """
+    if _species_guard(state, atoms, energy, calc, relaxCalc):
+        return None
+    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
+    return new_coords, atoms, energy
+
+
+def _species_guard(
+    state: OptimizationState,
+    atoms: Atoms,
+    energy: float,
+    *calcs: Calculator | None,
+) -> bool:
+    """Apply the species guard to one evaluated geometry; return True if rejected.
+
+    A relaxed geometry that changed connectivity is a different species, not a
+    conformer. Bond FORMATION is checked by default; bond BREAKING only under
+    --retain-bonds. Rejections bump ``state.n_bond_forms`` / ``n_bond_breaks``.
+
+    A rejected or failed evaluation may have left the calculator holding a broken
+    SCF solution that would corrupt every later point, so ``calcs`` are reset on
+    that path only (the normal path keeps the wavefunction restart and its speedup).
+    """
     rejected = False
     if state.required_bonds is not None and energy < RELAX_FAILURE_ENERGY_EV:
         if state.check_bond_forms and bonds_formed(atoms, state.required_bonds):
@@ -120,11 +143,8 @@ def _collective_result(
             state.n_bond_breaks += 1
             rejected = True
     if rejected or energy >= RELAX_FAILURE_ENERGY_EV:
-        _reset_calculators(*(c for c in (calc, relaxCalc) if c is not None))
-    if rejected:
-        return None
-    new_coords = np.array([di.get_angle(atoms) for di in dihedrals])
-    return new_coords, atoms, energy
+        _reset_calculators(*(c for c in calcs if c is not None))
+    return rejected
 
 
 def _low_mode_move(
@@ -460,9 +480,9 @@ def _propose_gc_crossover(
         return None
 
     # Vectorized novelty filter against every observed point
-    diff = np.abs(cand_arr[:, None, :] - obs_coords[None, :, :]) % periods_deg[None, None, :]
-    diff = np.minimum(diff, periods_deg[None, None, :] - diff)
-    min_rms = np.sqrt(np.mean(diff**2, axis=-1)).min(axis=-1)
+    min_rms = _periodic_torsion_rms_deg(
+        cand_arr[:, None, :], obs_coords[None, :, :], periods_deg
+    ).min(axis=-1)
     pool = cand_arr[min_rms >= _GC_NOVEL_DEG][:_GC_POOL_SIZE]
     if len(pool) == 0:
         return None
@@ -471,8 +491,6 @@ def _propose_gc_crossover(
 
     # Fast MMFF94 (UFF fallback) 20-step quench on 3D offspring coordinates
     from rdkit import Chem
-    from rdkit.Chem import AllChem
-    from rdkit.Geometry import Point3D
 
     from bouquet.clash import TorsionGeometry
 
@@ -489,22 +507,9 @@ def _propose_gc_crossover(
     n_atoms = work.GetNumAtoms()
     for pos in pos_batch:
         conf = Chem.Conformer(n_atoms)
-        for a_idx in range(n_atoms):
-            x, y, z = pos[a_idx]
-            conf.SetAtomPosition(a_idx, Point3D(float(x), float(y), float(z)))
+        conf.SetPositions(np.ascontiguousarray(pos, dtype=np.float64))
         work.AddConformer(conf, assignId=True)
 
-    try:
-        res = AllChem.MMFFOptimizeMoleculeConfs(
-            work, numThreads=1, maxIters=_GC_MMFF_QUENCH_ITERS
-        )
-        if any(rc == -1 for rc, _ in res):
-            res = AllChem.UFFOptimizeMoleculeConfs(
-                work, numThreads=1, maxIters=_GC_MMFF_QUENCH_ITERS
-            )
-    except Exception:
-        res = AllChem.UFFOptimizeMoleculeConfs(
-            work, numThreads=1, maxIters=_GC_MMFF_QUENCH_ITERS
-        )
+    res = ff_optimize_confs(work, max_iters=_GC_MMFF_QUENCH_ITERS)
     energies = [float(e) for _, e in res]
     return pool[int(np.argmin(energies))]

@@ -26,6 +26,12 @@ from ase.io import read
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
 
+from bouquet.config import (
+    DEFAULT_ETKDG_CLUSTER_DEG,
+    DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
+    etkdg_seed_pool_size,
+)
+
 if TYPE_CHECKING:
     from bouquet.calculator import Calculator
 
@@ -876,11 +882,38 @@ def detect_dihedrals(
 
 def _periodic_torsion_rms_deg(
     a: np.ndarray, b: np.ndarray, periods_deg: np.ndarray
-) -> float:
-    """Symmetry-reduced wrapped RMS torsion distance in degrees."""
-    diff = np.abs(a - b) % periods_deg
+) -> float | np.ndarray:
+    """Symmetry-reduced wrapped RMS torsion distance in degrees.
+
+    Reduces over the last axis and broadcasts over the rest, so it returns a float
+    for two torsion vectors and an array for batched (e.g. pairwise) inputs.
+    """
+    diff = np.abs(np.asarray(a) - np.asarray(b)) % periods_deg
     diff = np.minimum(diff, periods_deg - diff)
-    return float(np.sqrt(np.mean(diff**2)))
+    rms = np.sqrt(np.mean(diff**2, axis=-1))
+    return float(rms) if rms.ndim == 0 else rms
+
+
+def ff_optimize_confs(
+    mol: Chem.Mol, max_iters: int, num_threads: int = 1
+) -> list[tuple[int, float]]:
+    """MMFF94-optimize every conformer of ``mol`` in place, falling back to UFF.
+
+    UFF is used when MMFF raises (e.g. unparameterized atoms) or reports a setup
+    failure (``-1``) for any conformer. Returns RDKit's per-conformer
+    ``(status, energy)`` list from whichever force field ran last.
+    """
+    try:
+        res = AllChem.MMFFOptimizeMoleculeConfs(
+            mol, numThreads=num_threads, maxIters=max_iters
+        )
+        if not any(rc == -1 for rc, _ in res):
+            return res
+    except Exception:
+        pass
+    return AllChem.UFFOptimizeMoleculeConfs(
+        mol, numThreads=num_threads, maxIters=max_iters
+    )
 
 
 def plan_etkdg_initial_points(
@@ -890,8 +923,8 @@ def plan_etkdg_initial_points(
     max_points: int,
     seed: int = 42,
     pool_size: int | None = None,
-    cluster_deg: float = 35.0,
-    fallback_cluster_deg: float = 20.0,
+    cluster_deg: float = DEFAULT_ETKDG_CLUSTER_DEG,
+    fallback_cluster_deg: float = DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
     feasible=None,
     num_threads: int = 1,
 ) -> np.ndarray:
@@ -908,8 +941,6 @@ def plan_etkdg_initial_points(
     evaluations on duplicate conformers); returns shape ``(0, d)`` if embedding
     fails or no distinct feasible clusters exist.
     """
-    from bouquet.config import etkdg_seed_pool_size
-
     d_eff = len(dihedrals)
     if d_eff == 0 or max_points <= 0:
         return np.empty((0, d_eff), dtype=float)
@@ -927,33 +958,20 @@ def plan_etkdg_initial_points(
     params.useSmallRingTorsions = True
     params.useMacrocycleTorsions = True
     params.randomSeed = int(seed) + 10007
-    if hasattr(params, "numThreads"):
-        params.numThreads = num_threads
+    params.numThreads = num_threads
     conf_ids = list(AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=params))
     if not conf_ids:
         fallback = AllChem.ETKDGv3()
         fallback.randomSeed = int(seed) + 10007
         fallback.useRandomCoords = True
-        if hasattr(fallback, "numThreads"):
-            fallback.numThreads = num_threads
+        fallback.numThreads = num_threads
         conf_ids = list(
             AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=fallback)
         )
     if not conf_ids:
         return np.empty((0, d_eff), dtype=float)
 
-    try:
-        res = AllChem.MMFFOptimizeMoleculeConfs(
-            work, numThreads=num_threads, maxIters=200
-        )
-        if any(rc == -1 for rc, _ in res):
-            res = AllChem.UFFOptimizeMoleculeConfs(
-                work, numThreads=num_threads, maxIters=200
-            )
-    except Exception:
-        res = AllChem.UFFOptimizeMoleculeConfs(
-            work, numThreads=num_threads, maxIters=200
-        )
+    res = ff_optimize_confs(work, max_iters=200, num_threads=num_threads)
     energies = [float(e) for _, e in res]
 
     raw_angles = np.empty((len(conf_ids), d_eff), dtype=float)

@@ -10,11 +10,12 @@ from typing import Optional
 # CalculatorFactory.available_methods() (the installed subset).
 from bouquet.calculator import MethodType
 
-# Clash-threshold default lives with the code that documents its calibration.
-# bouquet.clash imports nothing from bouquet at runtime, so this is cycle-free.
-from bouquet.clash import DEFAULT_CLASH_RATIO
-
 __all__ = ["Configuration", "MethodType", "RunOptions"]
+
+# Worst permitted non-bonded contact as a fraction of the summed vdW radii. Kept
+# here (not in bouquet.clash, whose module docstring documents the calibration) so
+# importing config/cli for --help does not pull in numpy.
+DEFAULT_CLASH_RATIO = 0.55
 
 
 # Raw energy (eV) returned by assess.evaluate_energy when an energy evaluation

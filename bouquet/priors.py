@@ -677,27 +677,6 @@ class DihedralPriorMatcher:
                 compiled[p.smarts] = mol
         return compiled
 
-    def match_univariate(
-        self,
-        mol: Chem.Mol,
-        dihedral: Tuple[int, int, int, int],
-    ) -> Optional[PriorTypeId]:
-        """Find matching 1D prior type for a dihedral."""
-        for pattern in self.univariate_patterns:
-            smarts_mol = self._compiled_uni.get(pattern.smarts)
-            if smarts_mol is None:
-                continue
-            map_list = self._uni_map_lists[pattern.smarts]
-            if len(map_list) < 4:
-                continue
-
-            for match in mol.GetSubstructMatches(smarts_mol):
-                mapped = tuple(match[x] for x in map_list)
-                if _matches_dihedral(mapped, dihedral):
-                    return pattern.prior_type
-
-        return None
-
     @staticmethod
     def _dihedral_on_bond(
         dihedrals: List[Tuple[int, int, int, int]],

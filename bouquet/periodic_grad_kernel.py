@@ -118,24 +118,26 @@ class PeriodicKernelGrad(PeriodicKernel):
     def value_value(self, x1, x2):
         """cov(f_i, f_j), shape (..., n1, n2).
 
-        Accumulated one torsion at a time rather than via :meth:`_terms`, which
-        would materialize an (n1, n2, d) tensor -- 293 MB at d=8 with n1=n2=2138,
-        several times over for the delta/sin/square chain. This block is the one
-        evaluated on the FULL point set (the others only touch the windowed
-        subset), so it is where that intermediate actually hurts; accumulating
-        costs d passes over an (n1, n2) buffer instead.
+        Uses ``-2 sin^2(u_m) / l_m = (cos(2 u_m) - 1) / l_m`` and the angle-difference
+        identity ``cos(a - b) = cos a cos b + sin a sin b`` to write the exponent as
+        ``F1 @ F2^T - sum_m 1/l_m``, with ``F = [cos(2 pi x / p), sin(2 pi x / p)]``
+        (``F1`` scaled by ``1/l_m``). That is one (n1, 2d) x (2d, n2) GEMM and only
+        (n1, n2) memory -- this block is the one evaluated on the FULL point set
+        (the others only touch the windowed subset), so avoiding both an (n1, n2, d)
+        intermediate (293 MB at d=8, n=2138) and a per-torsion Python loop over
+        (n1, n2) buffers is what keeps it cheap. Agrees with the direct form to
+        ~1e-14.
         """
         d = x1.shape[-1]
         ell, period = self._perdim_params(d)
-        ell_v, per_v = ell[..., 0, 0, :], period[..., 0, 0, :]
-        acc = None
-        for m in range(d):
-            lm = ell_v[..., m % ell_v.shape[-1]][..., None, None]
-            pm = per_v[..., m % per_v.shape[-1]][..., None, None]
-            u = PI * (x1[..., m].unsqueeze(-1) - x2[..., m].unsqueeze(-2)) / pm
-            term = -2.0 * torch.sin(u).pow(2) / lm
-            acc = term if acc is None else acc + term
-        return torch.exp(acc)
+        batch = ell.shape[:-3]
+        inv_l = (1.0 / ell[..., 0, 0, :]).expand(*batch, d)  # (*batch, d)
+        omega = (2.0 * PI / period[..., 0, 0, :]).unsqueeze(-2)  # (*batch, 1, ard)
+        a1, a2 = x1 * omega, x2 * omega
+        scale = torch.cat([inv_l, inv_l], dim=-1).unsqueeze(-2)  # (*batch, 1, 2d)
+        f1 = torch.cat([torch.cos(a1), torch.sin(a1)], dim=-1) * scale
+        f2 = torch.cat([torch.cos(a2), torch.sin(a2)], dim=-1)
+        return torch.exp(f1 @ f2.transpose(-1, -2) - inv_l.sum(-1)[..., None, None])
 
     def value_grad(self, x1, x2):
         """cov(f_i, df_j/dx_m), shape (..., n1, n2*d), columns grouped m-major."""

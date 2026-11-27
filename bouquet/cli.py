@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Optional
 
 from bouquet.calculator import CalculatorFactory
-from bouquet.clash import DEFAULT_CLASH_RATIO
 from bouquet.config import (
+    DEFAULT_CLASH_RATIO,
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
@@ -13,8 +13,6 @@ from bouquet.config import (
     DEFAULT_ENSEMBLE_DIVERSITY,
     DEFAULT_ENSEMBLE_EXPLORE_MODE,
     DEFAULT_ENSEMBLE_STEPS,
-    DEFAULT_ETKDG_CLUSTER_DEG,
-    DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
     DEFAULT_INIT_CONFORMER_CAP,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
@@ -30,6 +28,7 @@ from bouquet.config import (
     GRADIENT_MATRIX_CAP,
     GRADIENT_WINDOW_MIN,
     INIT_METHODS,
+    MAX_AUTO_INIT_STEPS,
     KERNEL_ARMS,
     Configuration,
     RunOptions,
@@ -122,7 +121,7 @@ def build_parser() -> ArgumentParser:
         type=int,
         default=None,
         help="Number of initial guesses to make (default: auto-scaled "
-        f"min({12}, max({DEFAULT_INIT_STEPS}, d + 2)) from the active dihedral count; "
+        f"min({MAX_AUTO_INIT_STEPS}, max({DEFAULT_INIT_STEPS}, d + 2)) from the active dihedral count; "
         "pass an explicit integer to override; ignored if --conformer-file is provided)",
     )
     parser.add_argument(
@@ -869,6 +868,14 @@ def main(argv=None):
     # random leaves initial_dihedrals=None for Gaussian draws around the start.
     init_steps = config.resolve_init_steps(len(dihedrals))
     initial_dihedrals = None
+    # Under --auto, cap the number of seeded points so the initial design can't
+    # consume the whole budget and leave zero BO refinement (worst on small
+    # molecules, where a peak grid can be >= the auto total).
+    auto_init_cap = (
+        max(1, config.auto_total(len(dihedrals)) - DEFAULT_MIN_AUTO_BO_STEPS)
+        if config.auto_steps
+        else None
+    )
     if dihedrals and config.init_method == "etkdg" and initial_conformers is None:
         from bouquet.clash import build_feasibility
 
@@ -883,18 +890,13 @@ def main(argv=None):
             if config.run.clash_constraint
             else None
         )
-        max_init = init_steps
-        if config.auto_steps:
-            total = config.auto_total(len(dihedrals))
-            max_init = min(max_init, max(1, total - DEFAULT_MIN_AUTO_BO_STEPS))
+        max_init = init_steps if auto_init_cap is None else min(init_steps, auto_init_cap)
         planned = plan_etkdg_initial_points(
             mol,
             init_atoms,
             dihedrals,
             max_points=max_init,
             seed=config.seed,
-            cluster_deg=DEFAULT_ETKDG_CLUSTER_DEG,
-            fallback_cluster_deg=DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
             feasible=feasible,
         )
         if len(planned) > 0:
@@ -913,14 +915,9 @@ def main(argv=None):
                 mol=mol, dihedrals=[d.chain for d in dihedrals]
             )
         start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
-        # Under --auto, cap the number of seeded points so a large systematic grid
-        # can't consume the whole budget and leave zero BO refinement (worst on
-        # small molecules, where grid size >= the auto total). The grid is
-        # best-first, so the cap keeps the most probable mode combinations.
-        max_init = None
-        if config.auto_steps:
-            total = config.auto_total(len(dihedrals))
-            max_init = max(1, total - DEFAULT_MIN_AUTO_BO_STEPS)
+        # The grid is best-first, so the --auto cap keeps the most probable mode
+        # combinations.
+        max_init = auto_init_cap
         initial_dihedrals = plan_initial_points(
             planning_module,
             len(dihedrals),

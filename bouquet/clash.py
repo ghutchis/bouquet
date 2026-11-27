@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
+from bouquet.config import DEFAULT_CLASH_RATIO
+
 if TYPE_CHECKING:
     from ase import Atoms
     from rdkit import Chem
@@ -64,8 +66,8 @@ MIN_PATH_LENGTH = 4
 # Elements treated as hydrogen-bond donors/acceptors for the polar-H exclusion.
 POLAR_ELEMENTS = frozenset({7, 8, 9, 16})  # N, O, F, S
 
-# Worst permitted non-bonded contact as a fraction of the summed vdW radii.
-DEFAULT_CLASH_RATIO = 0.55
+# DEFAULT_CLASH_RATIO (worst permitted non-bonded contact as a fraction of the
+# summed vdW radii) is defined in bouquet.config and re-exported here.
 
 # Length (A) below which a projected dihedral reference vector counts as collapsed.
 # See _dihedral_angles_batch for why this is safe to set this tight.

@@ -139,6 +139,7 @@ def _periodic_covar_module(
     num_dims: int,
     lengthscale_prior: str = "none",
     symmetry_orders: Sequence[int] | None = None,
+    ard: bool = False,
 ) -> gpykernels.ScaleKernel:
     """Build the periodic GP covariance module shared by the acquisition GP and
     the ensemble-selection GP (a scaled product of per-dihedral periodic kernels).
@@ -154,16 +155,24 @@ def _periodic_covar_module(
     When ``symmetry_orders`` contains any ``m_j > 1``, uses
     :class:`_SymmetryPeriodicKernel` so dimension ``j`` has effective lengthscale
     ``m_j^2 * l`` (preserving physical angular curvature under ``u_j = m_j * x_j``).
+
+    ``ard=True`` gives each torsion its own lengthscale. ``PeriodicKernel`` with
+    ``ard_num_dims=d`` is already the product form
+    ``exp(-2 sum_m sin^2(pi dx_m / p) / l_m)``; without ARD, the non-symmetric
+    path wraps it in ``ProductStructureKernel`` to share one ``l`` across torsions.
     """
     base_kwargs, loc = _periodic_kernel_kwargs(num_dims, lengthscale_prior)
-    if symmetry_orders is not None and any(m > 1 for m in symmetry_orders):
+    if ard:
+        base_kwargs["ard_num_dims"] = num_dims
+    symmetric = symmetry_orders is not None and any(m > 1 for m in symmetry_orders)
+    if symmetric:
         base_kernel = _SymmetryPeriodicKernel(symmetry_orders, **base_kwargs)
-        if loc is not None:
-            base_kernel.lengthscale = math.exp(loc)
-        return gpykernels.ScaleKernel(base_kernel)
-    base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
+    else:
+        base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
     if loc is not None:
         base_kernel.lengthscale = math.exp(loc)  # start at the prior median
+    if symmetric or ard:
+        return gpykernels.ScaleKernel(base_kernel)
     return gpykernels.ScaleKernel(
         gpykernels.ProductStructureKernel(num_dims=num_dims, base_kernel=base_kernel)
     )
@@ -188,29 +197,6 @@ def _periodic_covar_module(
 COVAR_ARMS = KERNEL_ARMS
 
 
-def _ard_covar_module(
-    num_dims: int,
-    lengthscale_prior: str = "none",
-    symmetry_orders: Sequence[int] | None = None,
-) -> gpykernels.ScaleKernel:
-    """Product periodic kernel with a lengthscale PER torsion.
-
-    ``PeriodicKernel(ard_num_dims=d)`` is already the product form
-    ``exp(-2 sum_m sin^2(pi dx_m / p) / l_m)``; the difference from
-    :func:`_periodic_covar_module` is only that ``ProductStructureKernel`` shares
-    one ``l`` across every torsion.
-    """
-    kwargs, loc = _periodic_kernel_kwargs(num_dims, lengthscale_prior)
-    kwargs["ard_num_dims"] = num_dims
-    if symmetry_orders is not None and any(m > 1 for m in symmetry_orders):
-        base = _SymmetryPeriodicKernel(symmetry_orders, **kwargs)
-    else:
-        base = gpykernels.PeriodicKernel(**kwargs)
-    if loc is not None:
-        base.lengthscale = math.exp(loc)
-    return gpykernels.ScaleKernel(base)
-
-
 def make_covar_module(
     num_dims: int,
     lengthscale_prior: str = "none",
@@ -224,12 +210,9 @@ def make_covar_module(
     """
     if arm not in COVAR_ARMS:
         raise ValueError(f"arm must be one of {COVAR_ARMS}, got {arm!r}")
-    if arm == "ard" and num_dims >= 2:
-        return _ard_covar_module(
-            num_dims, lengthscale_prior, symmetry_orders=symmetry_orders
-        )
     return _periodic_covar_module(
-        num_dims, lengthscale_prior, symmetry_orders=symmetry_orders
+        num_dims, lengthscale_prior, symmetry_orders=symmetry_orders,
+        ard=(arm == "ard" and num_dims >= 2),
     )
 
 
@@ -353,6 +336,17 @@ def _periods_deg_array(
             f"symmetry_orders length {orders.shape} != num_dims ({num_dims},)"
         )
     return 360.0 / orders
+
+
+def _deg_to_unit(x_deg: torch.Tensor, periods_deg: torch.Tensor | float) -> torch.Tensor:
+    """Map torsions in degrees into the symmetry-reduced unit cube.
+
+    With a per-dihedral period tensor, ``u_j = (theta_j mod period_j) / period_j``;
+    with the scalar 360.0 (no symmetry) the input is only rescaled, not wrapped.
+    """
+    if torch.is_tensor(periods_deg):
+        return torch.remainder(x_deg, periods_deg) / periods_deg
+    return x_deg / float(periods_deg)
 
 
 def _fit_gradient_gp(
@@ -544,12 +538,12 @@ def _optimize_acqf_clash_free(
     refinement inside the feasible set, and the constraint is worthless if the
     optimizer can walk back out of it.
 
-    Falls back to the unconstrained optimizer when no feasible point is found, so
-    a molecule whose box is (by this criterion) entirely clashed still makes
-    progress.
+    Falls back to the unconstrained optimizer when ``feasible`` is None or no
+    feasible point is found, so a molecule whose box is (by this criterion)
+    entirely clashed still makes progress.
     """
     num_dims = bounds.shape[1]
-    pool = _draw_feasible_pool(
+    pool = None if feasible is None else _draw_feasible_pool(
         feasible, num_dims, num_restarts, bounds.dtype, bounds.device,
         seed_offset=seed_offset, periods_deg=periods_deg,
     )
@@ -692,8 +686,7 @@ def _select_next_points_botorch(
         kernel_arm: Which covariance to use (see :data:`COVAR_ARMS`), on both the
             value-only and gradient-enhanced paths. "product" is the shipped
             kernel: a product of per-torsion periodic kernels sharing ONE
-            lengthscale. Held-out cross-validation found that too rigid across
-            every d and n tested; "additive" and "ard" relax it in different ways.
+            lengthscale; "ard" gives each torsion its own lengthscale.
         feasible: Optional steric-clash feasibility test restricting the
             acquisition domain to the clash-free region. Called with a batch of
             dihedral vectors in DEGREES, shape (n_candidates, n_dims), and must
@@ -709,11 +702,11 @@ def _select_next_points_botorch(
     num_dims = train_X.shape[1]
     has_symmetry = symmetry_orders is not None and any(m > 1 for m in symmetry_orders)
     periods_deg = _periods_deg_array(num_dims, symmetry_orders) if has_symmetry else 360.0
-    if has_symmetry:
-        periods_t = torch.as_tensor(periods_deg, dtype=train_X.dtype, device=train_X.device)
-        train_x = torch.remainder(train_X, periods_t) / periods_t
-    else:
-        train_x = train_X.clone() / 360.0
+    train_x = _deg_to_unit(
+        train_X,
+        torch.as_tensor(periods_deg, dtype=train_X.dtype, device=train_X.device)
+        if has_symmetry else 360.0,
+    )
 
     # Clip the energies if needed
     raw_y = train_y  # relative energies (eV), positive = worse
@@ -801,19 +794,10 @@ def _select_next_points_botorch(
         # bounds are [0, 1] for each dihedral since we standardized above
         bounds = torch.zeros(2, train_x.shape[1], dtype=train_x.dtype, device=train_x.device)
         bounds[1, :] = 1.0
-        if feasible is not None:
-            candidate = _optimize_acqf_clash_free(
-                acqf, bounds, acq_num_restarts, acq_raw_samples, feasible,
-                seed_offset=feasible_seed_offset, periods_deg=periods_deg,
-            )
-        else:
-            candidate, _ = optimize_acqf(
-                acqf,
-                bounds=bounds,
-                q=1,  # q = 1: no batching
-                num_restarts=acq_num_restarts,
-                raw_samples=acq_raw_samples,
-            )
+        candidate = _optimize_acqf_clash_free(
+            acqf, bounds, acq_num_restarts, acq_raw_samples, feasible,
+            seed_offset=feasible_seed_offset, periods_deg=periods_deg,
+        )
         t_acq = time.perf_counter() - _t_acq0
 
     # Stopping-rule certificate: evaluate the just-fitted GP (and the unwrapped

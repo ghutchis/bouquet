@@ -29,7 +29,11 @@ import numpy as np
 from bouquet.rings.harvest import (
     HarvestResult, harvest, quench, stereo_retained, stereo_signature,
 )
-from bouquet.rings.systems import perceive_ring_systems, ring_state_distance
+from bouquet.rings.systems import (
+    _kabsch_rmsd,
+    perceive_ring_systems,
+    ring_state_distance,
+)
 
 
 @dataclass
@@ -98,9 +102,7 @@ def _inflate_h(atoms, h_mass: float) -> None:
 
 
 def _group_rmsds(pos, pos0, systems) -> list[float]:
-    from bouquet.rings.bias import rmsd_sq_and_grad
-    return [float(np.sqrt(rmsd_sq_and_grad(pos[s.bias_idx], pos0[s.bias_idx])[0]))
-            for s in systems]
+    return [_kabsch_rmsd(pos[s.bias_idx], pos0[s.bias_idx]) for s in systems]
 
 
 def calibrate_alpha(atoms, calc, systems, cfg: RingMTDConfig, rng=None) -> np.ndarray:

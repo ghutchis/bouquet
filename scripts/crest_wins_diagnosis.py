@@ -80,20 +80,10 @@ from ase import Atoms
 # beside this file); reuse its GFN2 relaxation + CREST-cell + trail readers verbatim.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reference as ref  # noqa: E402  (_gfnff_calc, _optimize, _read_refined_xyz, _read_trail, KCAL)
+from bouquet.ensemble import _HAVE_IRMSD  # noqa: E402
 from bouquet.ensemble import _rmsd as full_irmsd  # noqa: E402  (iRMSD, Kabsch fallback)
 
 KCAL = ref.KCAL
-
-# The project's rotation+permutation-invariant RMSD backend, used here on ring-atom
-# substructures. Mirrors bouquet.ensemble's guarded import so this degrades to a
-# Kabsch fallback if the optional wheel is missing (with a loud caveat at runtime).
-try:
-    import irmsd as _irmsd  # noqa: E402
-    _HAVE_IRMSD = hasattr(_irmsd, "get_irmsd_ase")
-except ImportError:  # pragma: no cover
-    _irmsd = None
-    _HAVE_IRMSD = False
-
 
 # --------------------------------------------------------------------------- #
 # Geometry helpers
@@ -122,26 +112,13 @@ def _subset(atoms, idx: list[int]) -> Atoms:
     return Atoms(symbols=[sym[i] for i in idx], positions=atoms.get_positions()[idx])
 
 
-def _kabsch_rmsd(P: np.ndarray, Q: np.ndarray) -> float:
-    """Rotation-only RMSD; the fallback when the iRMSD wheel is unavailable. Note
-    this CANNOT superpose a pucker onto its mirror-image embedding, so ring calls
-    may over-report differences without iRMSD -- hence the runtime caveat."""
-    Pc, Qc = P - P.mean(axis=0), Q - Q.mean(axis=0)
-    V, _, Wt = np.linalg.svd(Pc.T @ Qc)
-    d = np.sign(np.linalg.det(V @ Wt))
-    R = V @ np.diag([1.0, 1.0, d]) @ Wt
-    diff = Pc @ R - Qc
-    return float(np.sqrt((diff * diff).sum() / len(P)))
-
-
 def ring_rmsd(atoms_a, atoms_b, ring_idx: list[int]) -> float:
     """iRMSD over the flexible-ring HEAVY atoms of two geometries of the same
     molecule (shared atom indexing). Permutation invariance collapses mirror-image
-    embeddings of one pucker to ~0; falls back to Kabsch only without the wheel."""
-    sa, sb = _subset(atoms_a, ring_idx), _subset(atoms_b, ring_idx)
-    if _HAVE_IRMSD:
-        return float(_irmsd.get_irmsd_ase(sa, sb)[0])
-    return _kabsch_rmsd(sa.get_positions(), sb.get_positions())
+    embeddings of one pucker to ~0; falls back to Kabsch only without the wheel,
+    which CANNOT superpose a pucker onto its mirror-image embedding -- hence the
+    runtime caveat when ``_HAVE_IRMSD`` is False."""
+    return full_irmsd(_subset(atoms_a, ring_idx), _subset(atoms_b, ring_idx))
 
 
 def circular_diff_deg(a: float, b: float) -> float:
