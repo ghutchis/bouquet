@@ -174,65 +174,157 @@ def num_initial_embeddings(mol: Chem.Mol, cap: int) -> int:
     return max(1, min(cap, 1 + count_flexible_ring_atoms(mol)))
 
 
-def get_initial_candidates(
-    smiles: str, seed: int = 42, max_confs: int = 32
-) -> tuple[list[Atoms], Chem.Mol]:
-    """Generate several ETKDG conformers as initial-structure candidates.
+def _kabsch_rmsd(p: np.ndarray, q: np.ndarray) -> float:
+    """Heavy-atom Kabsch RMSD (Angstrom) between two coordinate arrays ``(N, 3)``."""
+    pc = p - p.mean(axis=0)
+    qc = q - q.mean(axis=0)
+    h = pc.T @ qc
+    u, _, vt = np.linalg.svd(h)
+    d = np.linalg.det(vt.T @ u.T)
+    s = np.diag([1.0, 1.0, -1.0 if d < 0 else 1.0])
+    r = vt.T @ s @ u.T
+    diff = pc @ r.T - qc
+    return float(np.sqrt(np.mean(np.sum(diff**2, axis=1))))
 
-    The number of embeddings scales with ring flexibility (see
-    :func:`num_initial_embeddings`), capped at ``max_confs``; every conformer is
-    MMFF94-optimized (UFF fallback). Because the BO loop perturbs rotatable
-    dihedrals only, these embeddings are the main way to sample distinct ring
-    puckers, and scoring them with the run's energy calculator lets the caller
-    start from the lowest-energy basin rather than a seed-dependent one.
+
+def _embed_mmff_pool(
+    mol: Chem.Mol,
+    num_confs: int,
+    seed: int,
+    num_threads: int = 1,
+) -> tuple[list[int], list[float]]:
+    """Embed ``num_confs`` ETKDGv3 conformers into ``mol`` in-place, optimize
+    with MMFF94 (UFF fallback), and stamp each conformer's ``ff_energy`` prop."""
+    mol.RemoveAllConformers()
+    params = AllChem.ETKDGv3()
+    params.useSmallRingTorsions = True
+    params.useMacrocycleTorsions = True
+    params.randomSeed = int(seed)
+    if hasattr(params, "numThreads"):
+        params.numThreads = num_threads
+    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, params=params))
+
+    if not conf_ids:
+        logger.warning("ETKDG embedding failed, trying with random coordinates")
+        fallback = AllChem.ETKDGv3()
+        fallback.randomSeed = int(seed)
+        fallback.useRandomCoords = True
+        if hasattr(fallback, "numThreads"):
+            fallback.numThreads = num_threads
+        conf_ids = list(
+            AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, params=fallback)
+        )
+
+    if not conf_ids:
+        return [], []
+
+    results = ff_optimize_confs(mol, max_iters=200, num_threads=num_threads)
+    energies = [float(e) for _, e in results]
+    for cid, energy in zip(conf_ids, energies):
+        mol.GetConformer(cid).SetDoubleProp("ff_energy", energy)
+    return conf_ids, energies
+
+
+def _dedup_mmff_conformers(
+    mol: Chem.Mol,
+    conf_ids: list[int],
+    energies: list[float],
+    max_keep: int,
+    rmsd_thr: float = 0.20,
+) -> list[int]:
+    """Select up to ``max_keep`` geometrically distinct low-MMFF conformer IDs.
+
+    Sorts conformers by ascending force-field energy and greedily keeps each
+    candidate whose heavy-atom Kabsch RMSD to every already-kept conformer is
+    at least ``rmsd_thr`` Angstroms.
+    """
+    if not conf_ids or max_keep <= 0:
+        return []
+    order = sorted(range(len(conf_ids)), key=lambda i: energies[i])
+    if max_keep == 1:
+        return [conf_ids[order[0]]]
+
+    heavy_idx = [a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() > 1]
+    if len(heavy_idx) < 3:
+        heavy_idx = list(range(mol.GetNumAtoms()))
+
+    kept_ids: list[int] = []
+    kept_pos: list[np.ndarray] = []
+    for idx in order:
+        if len(kept_ids) >= max_keep:
+            break
+        cid = conf_ids[idx]
+        pos = np.asarray(mol.GetConformer(cid).GetPositions(), dtype=float)[heavy_idx]
+        if all(_kabsch_rmsd(pos, prev) >= rmsd_thr for prev in kept_pos):
+            kept_ids.append(cid)
+            kept_pos.append(pos)
+    return kept_ids
+
+
+def get_initial_candidates(
+    smiles: str,
+    seed: int = 42,
+    max_confs: int = 32,
+    *,
+    pool_size: int | None = None,
+    dedup_rmsd: float = 0.20,
+    num_threads: int = 1,
+) -> tuple[list[Atoms], Chem.Mol]:
+    """Generate ETKDG conformers as initial-structure candidates.
+
+    The number of candidates returned for energy-calculator scoring scales with
+    ring flexibility (see :func:`num_initial_embeddings`), capped at
+    ``max_confs``. Every conformer is MMFF94-optimized (UFF fallback) with its
+    force-field energy stored on the RDKit conformer as ``"ff_energy"``.
+
+    When ``pool_size`` is provided (and exceeds ``n_score``), a larger cheap
+    RDKit ETKDGv3 + MMFF94 pool of ``max(n_score, pool_size)`` conformers is
+    embedded into ``mol`` and RMSD-deduplicated down to up to ``n_score``
+    distinct low-MMFF candidates for scoring -- giving much broader ring-pucker
+    coverage at zero extra QM cost, while leaving the full pool on ``mol`` for
+    :func:`plan_etkdg_initial_points` to reuse without re-embedding.
 
     Args:
         smiles: SMILES string.
         seed: ETKDG random seed (the run seed, so different seeds explore
             different embeddings).
-        max_confs: Upper bound on the number of conformers to generate.
+        max_confs: Upper bound on the number of candidates returned for scoring.
+        pool_size: Optional larger RDKit ETKDGv3 + MMFF94 pool size to embed
+            before RMSD-deduplicating down to ``<= n_score`` candidates.
+            ``None`` (default) embeds exactly ``num_initial_embeddings``
+            conformers without deduplication (historical behavior).
+        dedup_rmsd: Heavy-atom Kabsch RMSD threshold (Angstrom) used when
+            deduplicating a larger ``pool_size`` down to ``n_score`` candidates.
+        num_threads: RDKit thread count (1 = deterministic, Slurm-safe).
 
     Returns:
-        Tuple of (list of ASE Atoms, one per generated conformer, in conformer
-        order) and the RDKit Mol carrying every embedded conformer.
+        Tuple of (list of ASE Atoms candidates to score) and the RDKit Mol
+        carrying all embedded conformers.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Could not parse SMILES: {smiles}")
     mol = Chem.AddHs(mol)
 
-    n_confs = num_initial_embeddings(mol, max_confs)
+    n_score = num_initial_embeddings(mol, max_confs)
+    n_embed = max(n_score, int(pool_size)) if pool_size is not None else n_score
 
-    # ETKDG embedding (seed-dependent). EmbedMultipleConfs returns the IDs of the
-    # conformers it managed to embed (may be fewer than requested).
-    params = AllChem.ETKDGv3()
-    params.useSmallRingTorsions = True
-    params.useMacrocycleTorsions = True
-    params.randomSeed = seed
-    conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=params))
-
+    conf_ids, energies = _embed_mmff_pool(mol, n_embed, seed=seed, num_threads=num_threads)
     if not conf_ids:
-        logger.warning("ETKDG embedding failed, trying with random coordinates")
-        fallback = AllChem.ETKDGv3()
-        fallback.randomSeed = seed
-        fallback.useRandomCoords = True
-        conf_ids = list(
-            AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, params=fallback)
-        )
-
-    if mol.GetNumConformers() == 0:
         raise ValueError(f"Could not generate 3D coordinates for: {smiles}")
 
-    # Optimize each conformer with MMFF94 (UFF fallback for unparameterized atoms).
-    try:
-        results = AllChem.MMFFOptimizeMoleculeConfs(mol, maxIters=200)
-        if any(rc == -1 for rc, _ in results):
-            logger.warning("MMFF optimization failed for a conformer, trying UFF")
-            AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=200)
-    except Exception as e:
-        logger.warning(f"Force field optimization failed: {e}")
+    if pool_size is not None and len(conf_ids) > n_score:
+        selected_ids = _dedup_mmff_conformers(
+            mol, conf_ids, energies, max_keep=n_score, rmsd_thr=dedup_rmsd
+        )
+        logger.info(
+            f"Initial conformer pool: embedded {len(conf_ids)} ETKDG+MMFF conformers, "
+            f"selected {len(selected_ids)} distinct low-MMFF candidate(s) for scoring."
+        )
+    else:
+        selected_ids = conf_ids
 
-    candidates = [mol_to_ase_atoms(mol, conf_id=cid) for cid in conf_ids]
+    candidates = [mol_to_ase_atoms(mol, conf_id=cid) for cid in selected_ids]
     return candidates, mol
 
 
@@ -1022,13 +1114,17 @@ def plan_etkdg_initial_points(
     fallback_cluster_deg: float = DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
     feasible=None,
     num_threads: int = 1,
+    reuse_conformers: bool = True,
 ) -> np.ndarray:
     """Generate distinct low-energy initial dihedral seeds via ETKDGv3 + MMFF94.
 
-    Embeds a dimension-scaled pool of ETKDGv3 conformers, optimizes them with
-    MMFF94 (UFF fallback), filters out any torsion vector that clashes when
-    applied to ``start_atoms``, sorts feasible conformers by force-field energy,
-    and greedily selects up to ``max_points`` distinct clusters separated in
+    Reuses the MMFF-optimized conformers already stored on ``mol`` (when
+    ``reuse_conformers=True`` and ``mol`` carries at least ``pool_size``
+    conformers with ``"ff_energy"`` properties from :func:`get_initial_candidates`),
+    otherwise embeds a fresh dimension-scaled ETKDGv3 + MMFF94 pool on a working
+    copy. Filters out any torsion vector that clashes when applied to
+    ``start_atoms``, sorts feasible conformers by force-field energy, and
+    greedily selects up to ``max_points`` distinct clusters separated in
     symmetry-reduced wrapped torsion RMSD from ``start_atoms`` and each other.
 
     If a small molecule genuinely has fewer than ``max_points`` distinct
@@ -1047,27 +1143,22 @@ def plan_etkdg_initial_points(
         % periods_deg
     )
 
-    work = Chem.Mol(mol)
-    work.RemoveAllConformers()
-    params = AllChem.ETKDGv3()
-    params.useSmallRingTorsions = True
-    params.useMacrocycleTorsions = True
-    params.randomSeed = int(seed) + 10007
-    params.numThreads = num_threads
-    conf_ids = list(AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=params))
-    if not conf_ids:
-        fallback = AllChem.ETKDGv3()
-        fallback.randomSeed = int(seed) + 10007
-        fallback.useRandomCoords = True
-        fallback.numThreads = num_threads
-        conf_ids = list(
-            AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=fallback)
-        )
-    if not conf_ids:
-        return np.empty((0, d_eff), dtype=float)
+    reused = False
+    if reuse_conformers and mol.GetNumConformers() >= n_pool:
+        confs = list(mol.GetConformers())
+        if all(c.HasProp("ff_energy") for c in confs):
+            work = mol
+            conf_ids = [c.GetId() for c in confs]
+            energies = [c.GetDoubleProp("ff_energy") for c in confs]
+            reused = True
 
-    res = ff_optimize_confs(work, max_iters=200, num_threads=num_threads)
-    energies = [float(e) for _, e in res]
+    if not reused:
+        work = Chem.Mol(mol)
+        conf_ids, energies = _embed_mmff_pool(
+            work, n_pool, seed=int(seed) + 10007, num_threads=num_threads
+        )
+        if not conf_ids:
+            return np.empty((0, d_eff), dtype=float)
 
     raw_angles = np.empty((len(conf_ids), d_eff), dtype=float)
     chains = [di.chain for di in dihedrals]
@@ -1112,8 +1203,9 @@ def plan_etkdg_initial_points(
         if len(selected) >= max_points:
             break
 
+    src = "reused pool" if reused else "fresh embeddings"
     logger.info(
         f"ETKDG cluster seeding: selected {len(selected)}/{max_points} distinct "
-        f"cluster(s) from {len(conf_ids)} embeddings ({int(ok_mask.sum())} clash-free)"
+        f"cluster(s) from {len(conf_ids)} conformers ({src}, {int(ok_mask.sum())} clash-free)"
     )
     return np.asarray(selected, dtype=float) if selected else np.empty((0, d_eff), dtype=float)

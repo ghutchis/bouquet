@@ -98,3 +98,30 @@ def test_cli_init_method_default_and_choices():
     )
     assert parser.parse_args(["--smiles", "CCCC"]).init_steps is None
     assert parser.parse_args(["--smiles", "CCCC", "--init-steps", "7"]).init_steps == 7
+
+
+def test_unified_pool_dedups_rings_and_reuses_conformers_without_reembedding():
+    """get_initial_candidates(pool_size=...) dedups to <= n_score distinct
+    low-MMFF structures while leaving the full ff_energy-stamped pool on mol
+    for plan_etkdg_initial_points to reuse directly."""
+    from bouquet.setup import get_initial_candidates, num_initial_embeddings
+
+    smiles = "O[C@@H]1CCCC[C@H]1CCC(=O)Nc1ccccc1"
+    candidates, mol = get_initial_candidates(
+        smiles, seed=5, max_confs=16, pool_size=64
+    )
+    n_score = num_initial_embeddings(mol, 16)
+    assert mol.GetNumConformers() == 64
+    assert 1 <= len(candidates) <= n_score
+    assert all(c.HasProp("ff_energy") for c in mol.GetConformers())
+
+    # plan_etkdg_initial_points reuses the 64 conformers already on mol cleanly
+    dihs = detect_dihedrals(mol, drop_h_c3=True)
+    feas = build_feasibility(candidates[0], mol, dihs)
+    pts = plan_etkdg_initial_points(
+        mol, candidates[0], dihs, max_points=5, seed=5, pool_size=64, feasible=feas
+    )
+    assert pts.shape[1] == len(dihs)
+    assert 1 <= len(pts) <= 5
+    # Original mol conformer count was untouched (reused in place, no re-embed)
+    assert mol.GetNumConformers() == 64

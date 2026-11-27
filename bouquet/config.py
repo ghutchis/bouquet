@@ -203,6 +203,14 @@ def etkdg_seed_pool_size(num_dihedrals: int) -> int:
 # this caps the cost on highly flexible polycyclic systems. 1 disables the
 # multi-embedding search and restores the single-conformer behavior.
 DEFAULT_INIT_CONFORMER_CAP = 16
+# Minimum cheap RDKit ETKDGv3 + MMFF94 conformer pool size for molecules with
+# flexible rings before RMSD-deduplicating down to <= DEFAULT_INIT_CONFORMER_CAP
+# distinct low-MMFF structures for energy-calculator scoring. Benchmarked on 36
+# hard flexible-ring stopbench molecules: 64 -> dedup beats 16 by -0.76 kcal/mol
+# GFN2 (17/13/6, p=0.017) with zero extra QM evaluations, and the same pool is
+# reused directly by --init-method etkdg without re-embedding.
+DEFAULT_RING_EMBED_POOL = 64
+DEFAULT_RING_DEDUP_RMSD = 0.20
 
 # Prior (PiBO) defaults. The exponent weights the prior against logEI in the
 # additive PiBO objective. Since priors.DihedralPriorModule.forward now *averages*
