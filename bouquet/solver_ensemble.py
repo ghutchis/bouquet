@@ -25,7 +25,7 @@ __lazy_modules__ = [
 ]
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -212,6 +212,8 @@ def _perform_ensemble_relaxation(
     calc: Calculator,
     relaxCalc: Calculator,
     extra_candidates: list[Atoms] | None = None,
+    graft_candidates: list[Atoms] | None = None,
+    graft_validator: Callable[[Atoms], str | None] | None = None,
 ) -> list[tuple[Atoms, float, float]]:
     """Select -> tight (unconstrained) optimize -> dedup -> Boltzmann weight.
 
@@ -226,6 +228,11 @@ def _perform_ensemble_relaxation(
     (not their dihedral angles, which is all the BO path keeps) is the only way those
     ring conformations enter the ensemble. Unconstrained tight-opt keeps each in its
     own basin; the dedup below merges any that collapse together.
+
+    ``graft_candidates`` (post-BO ring grafts) are optimized the same way, but each
+    relaxed graft must also pass ``graft_validator`` (returns a rejection reason, or
+    ``None`` to accept) -- e.g. connectivity vs. the start structure and retained
+    stereochemistry, which the per-candidate pre/post bond check cannot see.
 
     TODO(longer-term): systematically enumerate ring conformers rather than relying
     on whatever ETKDG happened to embed -- see the ensemble ring-coverage plan.
@@ -243,10 +250,20 @@ def _perform_ensemble_relaxation(
 
     # GP-selected observed points (dihedral basins) + the seed full geometries (ring
     # puckers). Tight, UNCONSTRAINED optimization of each, then dedup + weight.
-    to_optimize = list(extra_candidates or []) + [atoms for _, atoms in candidates]
+    extras = list(extra_candidates or [])
+    grafts = list(graft_candidates or [])
+    to_optimize = extras + grafts + [atoms for _, atoms in candidates]
+
+    validate = None
+    if grafts and graft_validator is not None:
+        graft_range = range(len(extras), len(extras) + len(grafts))
+
+        def validate(k: int, relaxed: Atoms) -> str | None:
+            return graft_validator(relaxed) if k in graft_range else None
+
     return tight_optimize_and_weight(
         to_optimize, calc, relaxCalc, state.start_energy,
-        dihedrals=dihedrals, add_entry=state.add_entry,
+        dihedrals=dihedrals, add_entry=state.add_entry, validate=validate,
     )
 
 
@@ -257,6 +274,7 @@ def tight_optimize_and_weight(
     start_energy: float,
     dihedrals: list[DihedralInfo] | None = None,
     add_entry=None,
+    validate: Callable[[int, Atoms], str | None] | None = None,
 ) -> list[tuple[Atoms, float, float]]:
     """Tight (unconstrained) optimize each candidate -> dedup -> Boltzmann weight.
 
@@ -266,7 +284,9 @@ def tight_optimize_and_weight(
     puckers -- and returns ``[(atoms, relative_energy_eV, weight)]`` sorted by energy
     ascending, with energies relative to ``start_energy``. Candidates whose
     unconstrained relaxation exceeds the failure cutoff or changes connectivity are
-    dropped. ``add_entry`` (if given) records each surviving optimum in the run state.
+    dropped. ``validate(k, relaxed)`` (if given) is an extra post-relaxation check on
+    candidate ``k``: a non-``None`` return is the rejection reason and drops it.
+    ``add_entry`` (if given) records each surviving optimum in the run state.
     """
     window_eV = ENSEMBLE_WINDOW_KCAL * KCAL_TO_EV
     e_tol_eV = ENSEMBLE_ENERGY_TOL_KCAL * KCAL_TO_EV
@@ -289,6 +309,13 @@ def tight_optimize_and_weight(
                 f"(formed/broke a bond); discarding."
             )
             continue
+        if validate is not None:
+            reason = validate(k, a)
+            if reason is not None:
+                logger.info(
+                    f"Tight opt {k+1}/{len(to_optimize)}: {reason}; discarding."
+                )
+                continue
         optimized.append((a, rel))
         if add_entry is not None:
             add_entry(

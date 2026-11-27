@@ -24,6 +24,9 @@ from bouquet.config import (
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
     DEFAULT_PRIOR_MAX_CONCENTRATION,
+    DEFAULT_RING_DEDUP_RMSD,
+    DEFAULT_RING_EMBED_POOL,
+    DEFAULT_RING_GRAFTS,
     ENSEMBLE_EXPLORE_MODES,
     GRADIENT_MATRIX_CAP,
     GRADIENT_WINDOW_MIN,
@@ -32,6 +35,7 @@ from bouquet.config import (
     KERNEL_ARMS,
     Configuration,
     RunOptions,
+    etkdg_seed_pool_size,
     format_certificate_betas,
     parse_certificate_betas,
 )
@@ -522,6 +526,14 @@ def build_parser() -> ArgumentParser:
         "at any d >= 2).",
     )
     parser.add_argument(
+        "--ring-grafts",
+        type=int,
+        default=DEFAULT_RING_GRAFTS,
+        help="Post-BO alternate-ring x best-exocyclic grafts to relax on "
+        f"flexible-ring molecules (default: {DEFAULT_RING_GRAFTS}; 0 disables). "
+        "Reuses alternate ring puckers already embedded in the initial ETKDG pool.",
+    )
+    parser.add_argument(
         "--retain-bonds",
         action="store_true",
         help="Also reject any evaluated geometry that BROKE a bond relative to the "
@@ -620,6 +632,7 @@ def main(argv=None):
             category_warmup=args.category_warmup,
             category_min_moves=args.category_min_moves,
             gc_every=args.gc_every,
+            ring_grafts=args.ring_grafts,
             initial_prior_exponent=args.prior_exponent,
             prior_exponent_decay=args.prior_decay,
             cert_log_path=Path(args.certificate_log) if args.certificate_log else None,
@@ -683,6 +696,7 @@ def main(argv=None):
     from bouquet.setup import (
         align_conformers_to_mol,
         apply_charge_spin,
+        count_flexible_ring_atoms,
         default_multiplicity,
         detect_dihedrals,
         get_conformers_from_file,
@@ -750,17 +764,40 @@ def main(argv=None):
 
     # Make the initial guess
     if config.input_file is None:
-        # this will do some initial cleanup from the SMILES string. Seed the ETKDG
-        # embedding from the run seed so different seeds start from different 3D
-        # geometries. We generate several embeddings (count scales with ring
-        # flexibility) and pick the lowest-energy one below -- this is the only
-        # way to sample distinct ring puckers, since the BO loop perturbs
-        # rotatable dihedrals only, never ring bonds.
+        # Embed a single unified ETKDGv3 + MMFF94 conformer pool so both
+        # flexible-ring initial structure selection (deduped to <= candidate_cap
+        # distinct low-MMFF structures before scoring with calc) and Phase 4
+        # --init-method etkdg BO cluster seeding share the exact same embeddings
+        # without re-running RDKit twice.
         candidate_cap = (
             1 if config.conformer_file is not None else config.init_conformer_cap
         )
+        pool_size = None
+        if config.conformer_file is None and (
+            candidate_cap > 1 or config.init_method == "etkdg"
+        ):
+            preview = Chem.MolFromSmiles(config.smiles)
+            if preview is not None:
+                preview = Chem.AddHs(preview)
+                n_flex = count_flexible_ring_atoms(preview)
+                n_active = len(
+                    detect_dihedrals(
+                        preview, drop_h_c3=config.drop_h_c3 and config.relax
+                    )
+                )
+                target = 0
+                if candidate_cap > 1 and n_flex > 0:
+                    target = max(target, DEFAULT_RING_EMBED_POOL)
+                if config.init_method == "etkdg" and n_active > 0:
+                    target = max(target, etkdg_seed_pool_size(n_active))
+                if target > 0:
+                    pool_size = target
         candidates, mol = get_initial_candidates(
-            config.smiles, seed=config.seed, max_confs=candidate_cap
+            config.smiles,
+            seed=config.seed,
+            max_confs=candidate_cap,
+            pool_size=pool_size,
+            dedup_rmsd=DEFAULT_RING_DEDUP_RMSD,
         )
     else:
         # this will just read the geometry from the file (single candidate)
