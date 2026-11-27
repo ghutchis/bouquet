@@ -48,21 +48,27 @@ Call `bouquet --help` for the full list. The most useful flags:
 | `--file` | — | Read the starting structure from a file instead of a SMILES string |
 | `--conformer-file` | — | File of multiple conformers to use as initial guesses (overrides `--init-steps`) |
 | `--name` | SMILES / file name | Output name for the run directory |
+| `--out-dir` | `solutions/…` | Explicit output directory |
 | `--seed` | random | Random seed for reproducible runs |
 
-**Search budget**
+**Search budget & outputs**
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--auto` | off | Scale the number of steps to the number of detected dihedrals |
 | `--num-steps` | `32` | Number of Bayesian-optimization steps |
 | `--init-steps` | `5` | Number of initial guesses before optimization begins |
+| `--ensemble` | off | Harvest and tightly optimize a Boltzmann conformer ensemble (`ensemble_final.xyz` + `ensemble.csv`) |
+| `--use-gradients` | off | Use analytic torsion gradients (`dE/dtheta`) in the GP surrogate |
+| `--priors` | off | Enable PiBO torsion priors (bare flag uses bundled `gfn2_priors.json`, or pass a custom JSON) |
 
 **Energy / geometry**
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--energy` | `gfn2` | Energy method (`aimnet2`, `ani`, `b3lyp`, `b97`, `gfn0`, `gfn2`, `gfnff`, `mmff`, `uff`) |
+| `--method` | — | Shorthand setting both `--energy` and `--optimizer` |
+| `--energy` | `gfn2` | Energy method (`aimnet2`, `ani`, `b3lyp`, `b973c`, `gfn0`, `gfn2`, `gfnff`, `hf3c`, `mmff`, `mp2`, `r2scan3c`, `uff`, `wb97x`; run `--list-methods` for installed ones) |
 | `--optimizer` | `gfnff` | Method used for geometry relaxation |
-| `--relax` | on | Relax non-dihedral degrees of freedom before scoring each energy |
-
+| `--relax` / `--no-relax` | on | Relax non-dihedral degrees of freedom before scoring each energy |
+| `--charge` / `--spin` | auto | Total molecular charge and spin multiplicity (`2S+1`) |
+| `--solvent` | gas phase | Implicit solvent model (e.g. `water`; supported by `gfn2`, `gfnff`, and Psi4 methods) |

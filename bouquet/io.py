@@ -18,7 +18,7 @@ from csv import DictWriter
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from ase import Atoms
 from ase.io.xyz import simple_write_xyz
@@ -96,7 +96,9 @@ def create_output_directory(name: str, seed: int, energy_method: str, args_dict:
     Returns:
         Path to the created output directory
     """
-    params_hash = hashlib.sha256(str(args_dict).encode()).hexdigest()
+    params_hash = hashlib.sha256(
+        json.dumps(args_dict, sort_keys=True, default=str).encode()
+    ).hexdigest()
     # Sanitize the display name before putting it in a path: raw names/SMILES can
     # contain path separators and other filesystem-hostile characters (e.g.
     # r"C/C=C\C" would otherwise create nested "solutions/C/C=C\C-..." dirs). The
@@ -116,7 +118,7 @@ def save_run_parameters(out_dir: Path, args_dict: dict) -> None:
         args_dict: Dictionary of arguments to save
     """
     with (out_dir / "run_params.json").open("w") as fp:
-        json.dump(args_dict, fp)
+        json.dump(args_dict, fp, default=str)
 
 
 def save_structure(out_dir: Path, atoms: Atoms, filename: str, comment: str = "") -> None:
@@ -139,6 +141,7 @@ def append_xyz_frame(path: Path, atoms: Atoms, comment: str = "") -> None:
     improvement, plus the final relaxed best); writing incrementally means a
     timed-out/censored run still keeps the improvements it found before the kill.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fp:
         simple_write_xyz(fp, [atoms], comment=comment)
 
@@ -157,19 +160,31 @@ def atoms_to_xyz_string(atoms: Atoms) -> str:
     return xyz.getvalue()
 
 
-def initialize_structure_log(out_dir: Path) -> tuple[Path, Path]:
+def initialize_structure_log(
+    out_dir: Path, log_path: Path | None = None
+) -> tuple[Path, Path]:
     """Initialize the structure logging files.
 
     Creates the CSV log file with headers and returns paths for logging.
 
     Args:
-        out_dir: Output directory
+        out_dir: Output directory.
+        log_path: Optional explicit path for the per-evaluation CSV, overriding
+            ``out_dir/structures.csv``. Benchmarks use this to collect every
+            trial's (coords, energy) trail into one place instead of hunting
+            through per-run solution directories; the ensemble XYZ stays beside
+            it. Parent directories are created.
 
     Returns:
         Tuple of (log_path, ensemble_path)
     """
-    log_path = out_dir / "structures.csv"
-    ens_path = out_dir / "ensemble.xyz"
+    if log_path is not None:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        ens_path = log_path.with_suffix(".ensemble.xyz")
+    else:
+        log_path = out_dir / "structures.csv"
+        ens_path = out_dir / "ensemble.xyz"
 
     with log_path.open("w", newline="") as fp:
         writer = DictWriter(fp, ["time", "coords", "xyz", "energy", "ediff"])
@@ -180,7 +195,7 @@ def initialize_structure_log(out_dir: Path) -> tuple[Path, Path]:
 
 def create_structure_logger(
     log_path: Path, ens_path: Path, start_energy: float
-) -> Callable[[any, Atoms, float], None]:
+) -> Callable[[Any, Atoms, float], None]:
     """Create a function to log structure entries.
 
     Args:
@@ -258,6 +273,7 @@ def create_certificate_logger(
     """
     lb_cols = [certificate_lb_column(b) for b in betas]
     fieldnames = CERTIFICATE_BASE_FIELDNAMES + lb_cols
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", newline="") as fp:
         DictWriter(fp, fieldnames).writeheader()
 

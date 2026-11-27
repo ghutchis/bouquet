@@ -26,12 +26,14 @@ module docstring of ``periodic_grad_kernel`` and the project notes.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from collections.abc import Sequence
 
 import torch
 from botorch.models.model import Model
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from gpytorch.distributions import MultivariateNormal
+
+from bouquet.config import KERNEL_ARMS as GRAD_KERNEL_ARMS
 from bouquet.periodic_grad_kernel import PeriodicKernelGrad
 
 _JITTER = 1e-6
@@ -68,6 +70,9 @@ class GradientEnhancedPeriodicGP(Model):
         period: float = 1.0,
         value_noise: float = 1e-2,
         grad_noise: float = 1e-2,
+        kernel_arm: str = "product",
+        condition: bool = True,
+        symmetry_orders: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
         train_Y = train_Y.reshape(-1, 1)
@@ -86,23 +91,43 @@ class GradientEnhancedPeriodicGP(Model):
         # Zero out excluded (possibly NaN) gradient rows so they can't poison the
         # stack even though _keep drops them anyway.
         train_grad = torch.where(grad_mask.unsqueeze(-1), train_grad, 0.0)
-        # Interleaved targets [y_0, g_0,1..d, y_1, ...] matching the kernel layout.
-        self._train_stack = torch.cat([train_Y, train_grad], dim=1).reshape(-1, 1)
-        # Indices into the full interleaved vector that we actually condition on.
-        blk = d + 1
-        keep = []
-        for i in range(n):
-            keep.append(i * blk)  # value entry (always kept)
-            if bool(grad_mask[i]):
-                keep.extend(range(i * blk + 1, i * blk + blk))  # gradient entries
-        self._keep = torch.tensor(keep, dtype=torch.long, device=train_X.device)
+        # Conditioning set, ordered [values of ALL points; gradients of the kept
+        # points]. The old layout interleaved [y_i, g_i] per point and then indexed
+        # a full n(d+1) matrix, which forced the whole matrix to be built before
+        # most of it was thrown away. A GP is invariant to permutation of the
+        # conditioned entries, so this reordering changes nothing statistically --
+        # it just lets the covariance be assembled block-wise (see _kept_train_cov).
+        self._grad_idx = torch.nonzero(grad_mask, as_tuple=False).squeeze(-1)
+        self._n_grad = int(self._grad_idx.numel())
+        # Gradient entries are ordered M-MAJOR (dim 0 for every kept point, then
+        # dim 1, ...) because that is the layout the kernel's block accessors emit --
+        # `forward` only reaches the per-point interleaved layout by applying
+        # _shuffle_index afterwards, and the block path deliberately skips that. A
+        # point-major stack here silently pairs each target with the wrong column.
+        self._train_stack = torch.cat(
+            [train_Y.reshape(-1, 1),
+             train_grad[self._grad_idx].transpose(0, 1).reshape(-1, 1)], dim=0
+        )
 
-        self.kernel = PeriodicKernelGrad().to(train_X)
+        # Covariance arm: "product" shares one lengthscale across every torsion,
+        # "ard" gives each its own. See surrogate.COVAR_ARMS for what else was tried.
+        if kernel_arm not in GRAD_KERNEL_ARMS:
+            raise ValueError(
+                f"kernel_arm must be one of {GRAD_KERNEL_ARMS}, got {kernel_arm!r}"
+            )
+        self.kernel_arm = kernel_arm
+        use_ard = kernel_arm == "ard"
+        # gpytorch's PeriodicKernel can't take ard_num_dims=None (it sizes the period
+        # from kwargs.get("ard_num_dims", 1)), so the shared case must omit it.
+        ard_kwargs = {"ard_num_dims": d} if use_ard else {}
+        self.kernel = PeriodicKernelGrad(
+            symmetry_orders=symmetry_orders, **ard_kwargs
+        ).to(train_X)
         self.kernel.period_length = torch.full((1, 1), float(period)).to(train_X)
-        self.kernel.lengthscale = torch.full((1, 1), 1.0).to(train_X)
-        # The /360 input normalization fixes the period exactly (full turn = 1.0),
-        # and the gradient unit-scaling in the solver assumes it, so the period is
-        # a structural constant, not a fitted hyperparameter -- freeze it.
+        self.kernel.lengthscale = torch.full((1, d if use_ard else 1), 1.0).to(train_X)
+        # The /360 input normalization fixes the period exactly (full turn = 1.0), and
+        # the gradient unit-scaling in the solver assumes it, so the period is a
+        # structural constant, not a fitted hyperparameter.
         self.kernel.raw_period_length.requires_grad_(False)
 
         # Free hyperparameters (softplus for the positive ones). The noises seed
@@ -122,12 +147,16 @@ class GradientEnhancedPeriodicGP(Model):
         )
         self.mean_const = torch.nn.Parameter(torch.zeros(()))
         self.to(train_X)
-        self._condition()
+        self._L: torch.Tensor | None = None
+        self._alpha: torch.Tensor | None = None
+        if condition:
+            self._condition()
 
     # ---- hyperparameter accessors -------------------------------------------
     @property
     def outputscale(self) -> torch.Tensor:
         return torch.nn.functional.softplus(self.raw_outputscale)
+
 
     @property
     def value_noise(self) -> torch.Tensor:
@@ -138,32 +167,41 @@ class GradientEnhancedPeriodicGP(Model):
         return torch.nn.functional.softplus(self.raw_grad_noise)
 
     # ---- covariance helpers --------------------------------------------------
-    def _aug(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        """Outputscale-scaled augmented covariance, shape (|A|(d+1), |B|(d+1))."""
-        return self.outputscale * self.kernel.forward(A, B)
-
     def _kept_column(self, value_fill, grad_fill) -> torch.Tensor:
-        """Per-kept-entry vector with ``value_fill`` on value entries and
-        ``grad_fill`` on gradient entries (used for the noise and mean stacks)."""
+        """Per-entry vector matching the [values; kept gradients] conditioning order."""
         n, d = self._train_X.shape
-        col = torch.empty(n, d + 1, dtype=self._train_X.dtype, device=self._train_X.device)
-        col[:, 0] = value_fill
-        col[:, 1:] = grad_fill
-        return col.reshape(-1)[self._keep]
+        kw = dict(dtype=self._train_X.dtype, device=self._train_X.device)
+        return torch.cat([
+            torch.as_tensor(value_fill, **kw).expand(n),
+            torch.as_tensor(grad_fill, **kw).expand(self._n_grad * d),
+        ])
 
     # ---- conditioning / fitting ---------------------------------------------
     def _kept_train_cov(self) -> torch.Tensor:
         """Augmented training covariance restricted to the kept entries, with
         per-entry observation noise and jitter added to the diagonal."""
-        keep = self._keep
-        K = self._aug(self._train_X, self._train_X)[keep][:, keep]
+        X, Xg = self._train_X, self._train_X[self._grad_idx]
+        n, d = X.shape
+        s = self.outputscale
+        # Assemble ONLY the conditioned sub-matrix. Building the full n(d+1) square
+        # and slicing it costs 2.76 GB at d=8, n=2138 (plus a 2.18 GB Hessian
+        # intermediate) regardless of how small the window is -- which is what
+        # OOM-killed the first window benchmark. Block-wise the peak is ~0.3 GB.
+        vv = s * self.kernel.value_value(X, X)                      # (n, n)
+        if self._n_grad:
+            vg = s * self.kernel.value_grad(X, Xg)                  # (n, n_grad*d)
+            gg = s * self.kernel.grad_grad(Xg, Xg)                  # (n_grad*d, ...)
+            K = torch.cat([torch.cat([vv, vg], dim=-1),
+                           torch.cat([vg.transpose(-1, -2), gg], dim=-1)], dim=-2)
+        else:
+            K = vv
         K.diagonal().add_(self._kept_column(self.value_noise, self.grad_noise) + _JITTER)
         return K
 
     def _factorize(self):
         """Cholesky factor, residual, and alpha for the current hyperparameters."""
         L = torch.linalg.cholesky(self._kept_train_cov())
-        resid = self._train_stack[self._keep] - self._kept_column(self.mean_const, 0.0).unsqueeze(-1)
+        resid = self._train_stack - self._kept_column(self.mean_const, 0.0).unsqueeze(-1)
         alpha = torch.cholesky_solve(resid, L)
         return L, resid, alpha
 
@@ -194,6 +232,8 @@ class GradientEnhancedPeriodicGP(Model):
         posterior_transform=None,
         **kwargs,
     ) -> GPyTorchPosterior:
+        if self._L is None or self._alpha is None:
+            self._condition()
         d = self._d
         # Acquisition optimizers may hand us inputs in a different dtype (e.g.
         # float32 bounds); compute in the training dtype to avoid mismatches.
@@ -203,15 +243,29 @@ class GradientEnhancedPeriodicGP(Model):
         Xf = X.reshape(-1, d)  # (M, d), M = prod(bshape) * q
         M = Xf.shape[0]
 
-        # cross-cov between test VALUES and the kept training [value, grad] entries.
-        kc = self._aug(Xf, self._train_X)[0 :: (d + 1), :][:, self._keep]  # (M, Nkeep)
+        # Cross-covariance between test VALUES and the conditioned training entries.
+        # Only the value ROWS are needed, so build those blocks directly rather than
+        # forming the full M(d+1) x n(d+1) matrix and slicing: the stopping-rule
+        # certificate alone evaluates a 1024-point pool, which would allocate ~1.4 GB
+        # per call at d=8, n=2138.
+        s = self.outputscale
+        kc = s * self.kernel.value_value(Xf, self._train_X)  # (M, n)
+        if self._n_grad:
+            kc = torch.cat(
+                [kc, s * self.kernel.value_grad(Xf, self._train_X[self._grad_idx])],
+                dim=-1,
+            )  # (M, n + n_grad*d)
         mean = self.mean_const + (kc @ self._alpha).reshape(M)  # (M,)
 
         # Acquisition uses q=1, so only the marginal value variance is needed.
         # The periodic value self-covariance is 1, so the prior variance is the
-        # outputscale; this avoids forming the full M x M posterior covariance.
-        v = torch.cholesky_solve(kc.transpose(-1, -2), self._L)  # (Nkeep, M)
-        var = self.outputscale - (kc * v.transpose(-1, -2)).sum(-1)  # (M,)
+        # outputscale; a single forward triangular solve L z = kc^T computes
+        # kc (L L^T)^{-1} kc^T = ||z||^2 (half the work of cholesky_solve and
+        # guaranteed non-negative).
+        z = torch.linalg.solve_triangular(
+            self._L, kc.transpose(-1, -2), upper=False
+        )  # (Nkeep, M)
+        var = self.outputscale - z.pow(2).sum(dim=-2)  # (M,)
         if observation_noise:
             var = var + self.value_noise
         var = var.clamp_min(_JITTER)

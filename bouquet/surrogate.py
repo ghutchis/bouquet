@@ -27,6 +27,7 @@ __lazy_modules__ = [
 import math
 import time
 import warnings
+from collections.abc import Sequence
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -47,8 +48,10 @@ from bouquet.config import (
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
+    ENERGY_CLIP_OFFSET,
     GP_PERIOD_LENGTH_MEAN,
     GP_PERIOD_LENGTH_STD,
+    KERNEL_ARMS,
 )
 from bouquet.gradient_gp import GradientEnhancedPeriodicGP
 
@@ -75,8 +78,68 @@ def _suppress_fit_warnings():
 _GP_FIT_STEPS = 100
 
 
+def _periodic_kernel_kwargs(
+    num_dims: int, lengthscale_prior: str
+) -> tuple[dict, float | None]:
+    """Shared PeriodicKernel kwargs and optional LogNormal prior median."""
+    kwargs: dict = dict(
+        period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD)
+    )
+    loc = None
+    if lengthscale_prior == "dim_scaled":
+        loc = math.sqrt(2.0) + 0.5 * math.log(num_dims)
+        kwargs["lengthscale_prior"] = LogNormalPrior(loc, math.sqrt(3.0))
+    elif lengthscale_prior != "none":
+        raise ValueError(
+            f"lengthscale_prior must be 'none' or 'dim_scaled', got {lengthscale_prior!r}"
+        )
+    return kwargs, loc
+
+
+class _SymmetryPeriodicKernel(gpykernels.PeriodicKernel):
+    """PeriodicKernel with per-dimension ``m_j^2`` lengthscale compensation.
+
+    In symmetry-folded coordinates ``u_j = (m_j * theta_j / 360) mod 1``, sharing
+    one lengthscale ``l`` magnifies the local angular curvature of a symmetric
+    rotor by ``m_j^2`` (9x for a C3 methyl, 4x for a C2 phenyl), causing low-
+    barrier methyls to dominate the GP distance metric over backbone torsions.
+    Scaling dimension ``j``'s effective lengthscale to ``m_j^2 * l`` preserves
+    the exact physical angular curvature locally while keeping exact
+    ``360 / m_j`` periodicity globally. Works with both shared ``l`` and ARD.
+    """
+
+    def __init__(self, symmetry_orders: Sequence[int], **kwargs):
+        super().__init__(**kwargs)
+        self.register_buffer(
+            "_sym_sq",
+            torch.tensor([float(m * m) for m in symmetry_orders], dtype=torch.float64),
+        )
+
+    def forward(self, x1, x2, diag=False, **params):
+        last_dim_is_batch = params.pop("last_dim_is_batch", False)
+        x1_ = x1.div(self.period_length / math.pi)
+        x2_ = x2.div(self.period_length / math.pi)
+        diff = self.covar_dist(x1_, x2_, diag=diag, last_dim_is_batch=True, **params)
+
+        sym_sq = self._sym_sq.to(diff)
+        lengthscale = self.lengthscale[..., 0, :] * sym_sq  # (*batch, d)
+        if diag:
+            lengthscale = lengthscale[..., :, None]
+        else:
+            lengthscale = lengthscale[..., :, None, None]
+        exp_term = diff.sin().pow(2.0).div(lengthscale).mul(-2.0)
+
+        if not last_dim_is_batch:
+            exp_term = exp_term.sum(dim=(-2 if diag else -3))
+
+        return exp_term.exp()
+
+
 def _periodic_covar_module(
-    num_dims: int, lengthscale_prior: str = "none"
+    num_dims: int,
+    lengthscale_prior: str = "none",
+    symmetry_orders: Sequence[int] | None = None,
+    ard: bool = False,
 ) -> gpykernels.ScaleKernel:
     """Build the periodic GP covariance module shared by the acquisition GP and
     the ensemble-selection GP (a scaled product of per-dihedral periodic kernels).
@@ -86,28 +149,77 @@ def _periodic_covar_module(
       the lengthscale is a free MLL fit.
     - ``"dim_scaled"``: the Hvarfner et al. (ICML 2024) dimensionality-scaled
       LogNormal prior, ``LogNormal(sqrt(2) + 0.5*ln d, sqrt(3))``, biasing the GP
-      toward smoother fits as ``d`` grows. NOTE: those constants were calibrated for
-      an RBF/Matern kernel; this PeriodicKernel uses ``exp(-2 sin^2(.)/l)`` (l at
-      first power over a bounded sin^2 term), so the *location offset* likely needs
-      recalibration -- the smoke test measures whether the canonical constants help
-      or over-smooth. The lengthscale is also initialized at the prior median.
+      toward smoother fits as ``d`` grows. The lengthscale is also initialized at
+      the prior median.
+
+    When ``symmetry_orders`` contains any ``m_j > 1``, uses
+    :class:`_SymmetryPeriodicKernel` so dimension ``j`` has effective lengthscale
+    ``m_j^2 * l`` (preserving physical angular curvature under ``u_j = m_j * x_j``).
+
+    ``ard=True`` gives each torsion its own lengthscale. ``PeriodicKernel`` with
+    ``ard_num_dims=d`` is already the product form
+    ``exp(-2 sum_m sin^2(pi dx_m / p) / l_m)``; without ARD, the non-symmetric
+    path wraps it in ``ProductStructureKernel`` to share one ``l`` across torsions.
     """
-    base_kwargs = dict(
-        period_length_prior=NormalPrior(GP_PERIOD_LENGTH_MEAN, GP_PERIOD_LENGTH_STD)
-    )
-    loc = None
-    if lengthscale_prior == "dim_scaled":
-        loc = math.sqrt(2.0) + 0.5 * math.log(num_dims)
-        base_kwargs["lengthscale_prior"] = LogNormalPrior(loc, math.sqrt(3.0))
-    elif lengthscale_prior != "none":
-        raise ValueError(
-            f"lengthscale_prior must be 'none' or 'dim_scaled', got {lengthscale_prior!r}"
-        )
-    base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
+    base_kwargs, loc = _periodic_kernel_kwargs(num_dims, lengthscale_prior)
+    if ard:
+        base_kwargs["ard_num_dims"] = num_dims
+    symmetric = symmetry_orders is not None and any(m > 1 for m in symmetry_orders)
+    if symmetric:
+        # Folded inputs span exactly one irreducible period per dimension, so the
+        # period is a structural constant (1.0), not a fitted hyperparameter --
+        # matching the gradient GP. A fitted period would break the exact 360/m_j
+        # periodicity the folding relies on.
+        base_kwargs.pop("period_length_prior", None)
+        base_kernel = _SymmetryPeriodicKernel(symmetry_orders, **base_kwargs)
+        base_kernel.period_length = 1.0
+        base_kernel.raw_period_length.requires_grad_(False)
+    else:
+        base_kernel = gpykernels.PeriodicKernel(**base_kwargs)
     if loc is not None:
         base_kernel.lengthscale = math.exp(loc)  # start at the prior median
+    if symmetric or ard:
+        return gpykernels.ScaleKernel(base_kernel)
     return gpykernels.ScaleKernel(
         gpykernels.ProductStructureKernel(num_dims=num_dims, base_kernel=base_kernel)
+    )
+
+
+# Covariance arms. The shipped kernel is a product of per-torsion periodic kernels
+# sharing ONE lengthscale ("product"); "ard" is the same product form with a
+# lengthscale per torsion.
+#
+# A first-order ADDITIVE component and two pairwise ("trellis") variants were also
+# built and measured, and all were removed. They are worth not re-deriving:
+#   * pairwise psi+- terms lost to a plain no-pairwise control (-0.119 nats), and the
+#     fitted sum/difference weights came out symmetric, i.e. no directional structure
+#     was ever used;
+#   * the additive term won held-out prediction decisively (+0.25 to +0.30 nats, 93%
+#     of 509 trials, uniform in d and n) and then made the SEARCH WORSE end-to-end
+#     (+0.41 kcal/mol vs product, 63% of paired trials worse), with the deficit
+#     GROWING with budget -- the over-exploitation signature, since a sharper
+#     posterior shrinks sigma and EI stops exploring.
+# Predictive accuracy and search utility turned out anti-correlated here. Keep that
+# in mind before trusting a cross-validation result about this surrogate again.
+COVAR_ARMS = KERNEL_ARMS
+
+
+def make_covar_module(
+    num_dims: int,
+    lengthscale_prior: str = "none",
+    arm: str = "product",
+    symmetry_orders: Sequence[int] | None = None,
+):
+    """Build the surrogate covariance for one arm (see :data:`COVAR_ARMS`).
+
+    ``"product"`` shares one lengthscale across every torsion; ``"ard"`` gives each
+    torsion its own lengthscale (for ``num_dims >= 2``; 1D falls back to shared).
+    """
+    if arm not in COVAR_ARMS:
+        raise ValueError(f"arm must be one of {COVAR_ARMS}, got {arm!r}")
+    return _periodic_covar_module(
+        num_dims, lengthscale_prior, symmetry_orders=symmetry_orders,
+        ard=(arm == "ard" and num_dims >= 2),
     )
 
 
@@ -142,6 +254,37 @@ def _fit_value_gp(
     return gp
 
 
+def resolve_gradient_window(
+    n_points: int, num_dims: int, window: int, matrix_cap: int, window_min: int
+) -> int:
+    """Effective gradient window W for an augmented GP of size ``N = n + W*d``.
+
+    Capping N rather than W is what actually bounds cost: a fixed W leaves N growing
+    linearly in d, and measured per-step acquisition time is ~linear in N. The rule is
+
+        W = clamp((matrix_cap - n) / d,  window_min,  n)
+
+    with two escapes. ``window > 0`` pins W explicitly and ignores the cap (benchmark
+    arms and anyone who wants a fixed W). ``matrix_cap <= 0`` disables capping, the
+    pre-cap keep-all behaviour.
+
+    Returns 0 -- meaning "keep every gradient", the no-op ``_restrict_gradient_mask``
+    understands -- whenever the budget is already wide enough to cover all n points, so
+    low-d runs are untouched. When ``n >= matrix_cap`` the budget goes negative and
+    ``window_min`` takes over; that is not a failure but the regime where the step
+    budget simply exceeds the cap (e.g. C(12) = 5215 > 4000), and no window can honour
+    it.
+    """
+    if window > 0:
+        return window
+    if matrix_cap <= 0 or num_dims <= 0:
+        return 0
+    budget = (matrix_cap - n_points) // num_dims
+    if budget >= n_points:
+        return 0  # cap not binding at this n: every gradient fits
+    return max(window_min, int(budget))
+
+
 def _restrict_gradient_mask(
     mask: torch.Tensor, raw_y: torch.Tensor, window: int, mode: str
 ) -> torch.Tensor:
@@ -170,6 +313,50 @@ def _restrict_gradient_mask(
     return new_mask
 
 
+class _SymmetryScaledPrior(torch.nn.Module):
+    """Score symmetry-folded ``u in [0, 1]^d`` under a ``DihedralPriorModule`` built
+    in the ``[0, 1] = [0, 360 deg)`` convention.
+
+    A folded ``u_j`` stands for all ``m_j`` equivalent full-turn angles
+    ``(u_j + k) / m_j``; scoring only one of them (``u / m``) would ignore prior mass
+    at the others and make the boundaries u=0 and u=1 -- the same physical angle --
+    score differently. The prior module therefore combines every representative per
+    factor (jointly for bivariate pairs); order-1 dimensions are unchanged."""
+
+    def __init__(self, prior_module: torch.nn.Module, sym_orders: Sequence[int]):
+        super().__init__()
+        self.prior_module = prior_module
+        self.sym_orders = tuple(int(m) for m in sym_orders)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return self.prior_module(X, symmetry_orders=self.sym_orders)
+
+
+def _periods_deg_array(
+    num_dims: int, symmetry_orders: Sequence[int] | None
+) -> np.ndarray:
+    """Per-dihedral irreducible period in degrees (``360 / m_j``)."""
+    if symmetry_orders is None:
+        return np.full(num_dims, 360.0, dtype=float)
+    orders = np.asarray(symmetry_orders, dtype=float)
+    if orders.shape != (num_dims,):
+        raise ValueError(
+            f"symmetry_orders length {orders.shape} != num_dims ({num_dims},)"
+        )
+    return 360.0 / orders
+
+
+def _deg_to_unit(x_deg: torch.Tensor, periods_deg: torch.Tensor | float) -> torch.Tensor:
+    """Map torsions in degrees into the symmetry-reduced unit cube.
+
+    With a per-dihedral period tensor, ``u_j = (theta_j mod period_j) / period_j``;
+    with the scalar 360.0 (no symmetry) the input is only rescaled, not wrapped.
+    """
+    if torch.is_tensor(periods_deg):
+        return torch.remainder(x_deg, periods_deg) / periods_deg
+    return x_deg / float(periods_deg)
+
+
 def _fit_gradient_gp(
     train_x: torch.Tensor,
     train_y: torch.Tensor,
@@ -179,7 +366,11 @@ def _fit_gradient_gp(
     y_std: torch.Tensor,
     frozen_hypers: dict | None = None,
     gradient_window: int = 0,
+    gradient_matrix_cap: int = 0,
+    gradient_window_min: int = 1,
     gradient_keep: str = "recent",
+    kernel_arm: str = "product",
+    symmetry_orders: Sequence[int] | None = None,
 ) -> GradientEnhancedPeriodicGP:
     """Build and fit the gradient-enhanced periodic GP on standardized data.
 
@@ -196,30 +387,45 @@ def _fit_gradient_gp(
     expressible behavior.
 
     The acquisition GP fits standardized values ``y' = (-clamp(E) - mean)/std``
-    over inputs ``x' = degrees / 360``. The stored gradients are ``dE/dtheta`` in
-    eV/rad, so the chain rule for the matching gradient observation is
+    over symmetry-folded inputs ``u_j = (m_j * degrees / 360) mod 1`` where
+    ``m_j`` is the dihedral's rotational symmetry order (1 for asymmetric rotors).
+    The stored gradients are ``dE/dtheta`` in eV/rad, so the chain rule for the
+    matching gradient observation is
 
-        dy'/dx' = -(2*pi / std) * dE/dtheta           [clamp inactive]
+        dy'/du_j = -(2*pi / (m_j * std)) * dE/dtheta_j   [clamp inactive]
 
-    (``x_rad = 2*pi * x'``; the maximization sign flip contributes the minus).
-    ``y_std`` is the standardization std the caller applied to the values, so the
-    gradients are scaled by exactly the same factor. Points where the energy
-    clamp is active or whose gradient is NaN (failed evaluation) are dropped from
-    the gradient observations via the mask, but still contribute their value.
+    (``theta_rad_j = (2*pi / m_j) * u_j``; the maximization sign flip contributes
+    the minus). ``y_std`` is the standardization std the caller applied to the
+    values, so the gradients are scaled by exactly the same factor. Points where
+    the energy clamp is active or whose gradient is NaN (failed evaluation) are
+    dropped from the gradient observations via the mask, but still contribute
+    their value.
     """
     grad = observed_gradients.to(train_x)  # (n, d), eV/rad
-    grad_scaled = -(2.0 * math.pi / y_std) * grad  # (n, d)
+    if symmetry_orders is not None:
+        sym = torch.as_tensor(symmetry_orders, dtype=train_x.dtype, device=train_x.device)
+        grad_scaled = -(2.0 * math.pi / (y_std * sym)) * grad  # (n, d)
+    else:
+        grad_scaled = -(2.0 * math.pi / y_std) * grad  # (n, d)
 
     clamp_inactive = raw_y <= energy_cap  # (n,)
     grad_valid = ~torch.isnan(grad).any(dim=1)  # (n,)
     mask = clamp_inactive & grad_valid
-    # High-leverage subset: optionally keep gradients for only a window of points
-    # (caps the augmented matrix at n + window*d -- the main high-d/late cost).
-    mask = _restrict_gradient_mask(mask, raw_y, gradient_window, gradient_keep)
+    # High-leverage subset: keep gradients for only a window of points (caps the
+    # augmented matrix at n + window*d -- the main high-d/late cost). The window is
+    # resolved PER FIT, not once at setup, because it depends on the current n: the
+    # cap keeps everything early and tightens as observations accumulate.
+    window = resolve_gradient_window(
+        train_x.shape[0], train_x.shape[1],
+        gradient_window, gradient_matrix_cap, gradient_window_min,
+    )
+    mask = _restrict_gradient_mask(mask, raw_y, window, gradient_keep)
     grad_scaled = torch.nan_to_num(grad_scaled, nan=0.0)
 
     gp = GradientEnhancedPeriodicGP(
-        train_x, train_y, grad_scaled, grad_mask=mask, period=1.0
+        train_x, train_y, grad_scaled, grad_mask=mask, period=1.0,
+        kernel_arm=kernel_arm, condition=False,
+        symmetry_orders=symmetry_orders,
     )
     if frozen_hypers is None:
         gp.fit(steps=_GP_FIT_STEPS, lr=0.05)  # cold fit: optimize fresh hypers
@@ -263,6 +469,113 @@ def _cert_sobol_pool(
     return draw_sobol_samples(
         bounds=bounds, n=_CERT_POOL_SIZE, q=1, seed=_CERT_POOL_SEED
     ).squeeze(1)
+
+
+# Feasible-pool sizing for the clash-constrained acquisition. The pool is drawn in
+# chunks until enough clash-free points are found (or the draw budget runs out),
+# because the feasible fraction of the box collapses with dihedral count -- roughly
+# 40% at d=5 but a few percent by d=12 (see bouquet.clash).
+_FEASIBLE_CHUNK = 512
+_FEASIBLE_MAX_CHUNKS = 8
+_FEASIBLE_POOL_SEED = 4242
+
+
+def _draw_feasible_pool(
+    feasible,
+    num_dims: int,
+    n_target: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed_offset: int = 0,
+    periods_deg: np.ndarray | float = 360.0,
+) -> torch.Tensor | None:
+    """Sobol points in [0, 1]^num_dims whose 3D geometry is clash-free.
+
+    Draws in chunks until at least ``n_target`` feasible points are in hand or the
+    chunk budget is exhausted. ``seed_offset`` advances the Sobol scramble across
+    BO steps so each step explores a fresh feasible pool (while staying
+    reproducible at a fixed run seed). ``periods_deg`` scales ``[0, 1]`` to the
+    irreducible symmetry period ``[0, 360 / m_j)`` for each dihedral. Returns None
+    if nothing feasible turned up, which tells the caller to fall back to the
+    unconstrained optimizer rather than stall.
+    """
+    bounds = torch.stack(
+        [
+            torch.zeros(num_dims, device=device, dtype=dtype),
+            torch.ones(num_dims, device=device, dtype=dtype),
+        ]
+    )
+    kept: list[torch.Tensor] = []
+    found = 0
+    base_seed = _FEASIBLE_POOL_SEED + seed_offset
+    for chunk in range(_FEASIBLE_MAX_CHUNKS):
+        x = draw_sobol_samples(
+            bounds=bounds, n=_FEASIBLE_CHUNK, q=1, seed=base_seed + chunk
+        ).squeeze(1)
+        mask = feasible(x.detach().cpu().numpy() * periods_deg)
+        n_ok = int(mask.sum())
+        if n_ok:
+            kept.append(x[torch.as_tensor(mask, device=x.device)])
+            found += n_ok
+        if found >= n_target:
+            break
+    return torch.cat(kept) if kept else None
+
+
+def _optimize_acqf_clash_free(
+    acqf,
+    bounds: torch.Tensor,
+    num_restarts: int,
+    raw_samples: int,
+    feasible,
+    seed_offset: int = 0,
+    periods_deg: np.ndarray | float = 360.0,
+) -> torch.Tensor:
+    """``optimize_acqf`` restricted to the clash-free region of the torsion box.
+
+    botorch's ``nonlinear_inequality_constraints`` path wants a differentiable
+    constraint and switches the inner solver to SLSQP; the clash test is a
+    non-differentiable geometry build, so it is applied by construction instead:
+
+      1. draw a Sobol pool and keep only the clash-free points,
+      2. seed the L-BFGS-B restarts from the best-acquisition ones,
+      3. accept the refined candidate only if it is *still* clash-free, otherwise
+         return the best feasible pool point.
+
+    Step 3 matters: seeding from a feasible point does not keep the local
+    refinement inside the feasible set, and the constraint is worthless if the
+    optimizer can walk back out of it.
+
+    Falls back to the unconstrained optimizer when ``feasible`` is None or no
+    feasible point is found, so a molecule whose box is (by this criterion)
+    entirely clashed still makes progress.
+    """
+    num_dims = bounds.shape[1]
+    pool = None if feasible is None else _draw_feasible_pool(
+        feasible, num_dims, num_restarts, bounds.dtype, bounds.device,
+        seed_offset=seed_offset, periods_deg=periods_deg,
+    )
+    if pool is None:
+        candidate, _ = optimize_acqf(
+            acqf, bounds=bounds, q=1,
+            num_restarts=num_restarts, raw_samples=raw_samples,
+        )
+        return candidate
+
+    with torch.no_grad():
+        values = acqf(pool.unsqueeze(1))
+    n_ic = min(num_restarts, len(pool))
+    top = torch.topk(values, n_ic).indices
+    best_pool_point = pool[top[0]].unsqueeze(0)
+
+    candidate, _ = optimize_acqf(
+        acqf, bounds=bounds, q=1,
+        num_restarts=n_ic,
+        batch_initial_conditions=pool[top].unsqueeze(1),
+    )
+    if bool(feasible(candidate.detach().cpu().numpy() * periods_deg)[0]):
+        return candidate
+    return best_pool_point
 
 
 def _compute_certificate(
@@ -344,8 +657,14 @@ def _select_next_points_botorch(
     acq_num_restarts: int = ACQ_NUM_RESTARTS,
     acq_raw_samples: int = ACQ_RAW_SAMPLES,
     gradient_window: int = 0,
-    gradient_keep: str = "recent",
+    gradient_matrix_cap: int = 0,
+    gradient_window_min: int = 1,
+    gradient_keep: str = "both",
     lengthscale_prior: str = "none",
+    feasible=None,
+    kernel_arm: str = "product",
+    feasible_seed_offset: int = 0,
+    symmetry_orders: Sequence[int] | None = None,
 ) -> np.ndarray:
     """
     Selects the next dihedral coordinate to evaluate by fitting a Gaussian process to the observed data and optimizing a BOTorch acquisition function.
@@ -372,17 +691,34 @@ def _select_next_points_botorch(
         cert_betas: Confidence multipliers for the certificate lower bound ``lb``
             (``mu - beta*sigma``); one bound is computed per beta so the offline
             replay can calibrate beta. Only used when ``cert_out`` is provided.
+        kernel_arm: Which covariance to use (see :data:`COVAR_ARMS`), on both the
+            value-only and gradient-enhanced paths. "product" is the shipped
+            kernel: a product of per-torsion periodic kernels sharing ONE
+            lengthscale; "ard" gives each torsion its own lengthscale.
+        feasible: Optional steric-clash feasibility test restricting the
+            acquisition domain to the clash-free region. Called with a batch of
+            dihedral vectors in DEGREES, shape (n_candidates, n_dims), and must
+            return a boolean mask of the same length. None searches the full box.
+            See :mod:`bouquet.clash`.
 
     Returns:
         np.ndarray: A 1-D array of length n_dims containing the proposed dihedral coordinates in degrees.
     """
-    # make a copy of the train_X to standardize
-    # we know these are in degrees already
-    train_x = train_X.clone() / 360.0
+    # Normalize degrees into the symmetry-reduced irreducible unit cube [0, 1)^d:
+    # each dihedral j with symmetry order m_j has period 360 / m_j degrees, so
+    # u_j = (theta_j mod period_j) / period_j has exact unit period 1.0 in the GP.
+    num_dims = train_X.shape[1]
+    has_symmetry = symmetry_orders is not None and any(m > 1 for m in symmetry_orders)
+    periods_deg = _periods_deg_array(num_dims, symmetry_orders) if has_symmetry else 360.0
+    train_x = _deg_to_unit(
+        train_X,
+        torch.as_tensor(periods_deg, dtype=train_X.dtype, device=train_X.device)
+        if has_symmetry else 360.0,
+    )
 
     # Clip the energies if needed
     raw_y = train_y  # relative energies (eV), positive = worse
-    energy_cap = 2 + torch.log10(torch.clamp(raw_y, min=1))
+    energy_cap = ENERGY_CLIP_OFFSET + torch.log10(torch.clamp(raw_y, min=1))
 
     # Negate (minimize -> maximize) and standardize (matching botorch.standardize).
     # Keep the std so the gradient observations can be scaled by exactly the same
@@ -401,7 +737,12 @@ def _select_next_points_botorch(
             gp = _fit_gradient_gp(
                 train_x, train_y, raw_y, energy_cap, observed_gradients, y_std,
                 frozen_hypers=gp_frozen_hypers,
-                gradient_window=gradient_window, gradient_keep=gradient_keep,
+                gradient_window=gradient_window,
+                gradient_matrix_cap=gradient_matrix_cap,
+                gradient_window_min=gradient_window_min,
+                gradient_keep=gradient_keep,
+                kernel_arm=kernel_arm,
+                symmetry_orders=symmetry_orders if has_symmetry else None,
             )
             # Snapshot the fitted hyperparameters only when the caller asks (cold-fit
             # steps), so frozen condition-only steps don't clone them needlessly.
@@ -414,8 +755,11 @@ def _select_next_points_botorch(
             gp = _fit_value_gp(
                 train_x,
                 train_y,
-                covar_module=_periodic_covar_module(
-                    train_x.shape[1], lengthscale_prior=lengthscale_prior
+                covar_module=make_covar_module(
+                    train_x.shape[1],
+                    lengthscale_prior=lengthscale_prior,
+                    arm=kernel_arm,
+                    symmetry_orders=symmetry_orders if has_symmetry else None,
                 ),
             )
         t_gp_fit = time.perf_counter() - _t_fit0
@@ -441,9 +785,14 @@ def _select_next_points_botorch(
             # log probability, so log=True makes botorch combine them additively
             # (logEI + exponent * log_prior) -- the correct PiBO form. Without log=True
             # botorch would multiply logEI by prior**exponent, inverting the prior.
+            effective_prior = (
+                _SymmetryScaledPrior(prior_module, symmetry_orders)
+                if has_symmetry
+                else prior_module
+            )
             acqf = PriorGuidedAcquisitionFunction(
                 acq_function=base_acqf,
-                prior_module=prior_module,
+                prior_module=effective_prior,
                 log=True,
                 prior_exponent=prior_exponent,
             )
@@ -451,14 +800,11 @@ def _select_next_points_botorch(
             acqf = base_acqf
 
         # bounds are [0, 1] for each dihedral since we standardized above
-        bounds = torch.zeros(2, train_x.shape[1], device=train_x.device)
+        bounds = torch.zeros(2, train_x.shape[1], dtype=train_x.dtype, device=train_x.device)
         bounds[1, :] = 1.0
-        candidate, _ = optimize_acqf(
-            acqf,
-            bounds=bounds,
-            q=1,  # q = 1: no batching
-            num_restarts=acq_num_restarts,
-            raw_samples=acq_raw_samples,
+        candidate = _optimize_acqf_clash_free(
+            acqf, bounds, acq_num_restarts, acq_raw_samples, feasible,
+            seed_offset=feasible_seed_offset, periods_deg=periods_deg,
         )
         t_acq = time.perf_counter() - _t_acq0
 
@@ -475,6 +821,6 @@ def _select_next_points_botorch(
             )
         )
 
-    # make sure to convert the candidate back to degrees (.cpu() so a CUDA run
-    # can hand the array back to numpy).
-    return candidate.detach().cpu().numpy()[0, :] * 360.0
+    # Convert the candidate from [0, 1]^d back to degrees in [0, 360 / m_j)
+    # (.cpu() so a CUDA run can hand the array back to numpy).
+    return candidate.detach().cpu().numpy()[0, :] * periods_deg

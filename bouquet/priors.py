@@ -12,9 +12,9 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 try:
     from rdkit import Chem
+    from rdkit.Chem import rdMolTransforms
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
@@ -59,18 +60,28 @@ class BivariateTopology(Enum):
         ADJACENT: 5 atoms, dihedrals share 3 atoms (1-2-3-4 and 2-3-4-5)
         SKIP_ONE: 6 atoms, dihedrals share central bond only (1-2-3-4 and 3-4-5-6)
         W_SHAPE: 6 atoms, branched/W pattern (1-2-3-4 and 4-3-5-6)
+        Y_SHAPE: 6 atoms, adjacent bonds off a branch point (1-2-3-4 and 5-4-3-6)
+
+    The order of the two dihedrals is part of the topology: a fitted bivariate
+    mixture is generally not symmetric under swapping phi1 and phi2, so
+    ``match_bivariate`` preserves this orientation rather than sorting.
     """
 
     ADJACENT = "adjacent"
     SKIP_ONE = "skip_one"
     W_SHAPE = "w_shape"
+    Y_SHAPE = "y_shape"
 
 
-# Mapping from topology to (min_atoms, dihedral1_indices, dihedral2_indices)
+# Mapping from topology to (min_atoms, dihedral1_indices, dihedral2_indices).
+# These mirror the PAIRS table in the torsion-library generator
+# (~/torsions/rdtorsion2d-parallel.py) that the fitted priors are measured with,
+# so the atom ordering here must not be "tidied".
 TOPOLOGY_DEFINITIONS: Dict[BivariateTopology, Tuple[int, Tuple[int, ...], Tuple[int, ...]]] = {
     BivariateTopology.ADJACENT: (5, (0, 1, 2, 3), (1, 2, 3, 4)),
     BivariateTopology.SKIP_ONE: (6, (0, 1, 2, 3), (2, 3, 4, 5)),
     BivariateTopology.W_SHAPE: (6, (0, 1, 2, 3), (3, 2, 4, 5)),
+    BivariateTopology.Y_SHAPE: (6, (0, 1, 2, 3), (4, 3, 2, 5)),
 }
 
 
@@ -84,8 +95,33 @@ def _try_int(value: Any) -> PriorTypeId:
 
 
 def _matches_dihedral(match: Tuple, dihedral: Tuple) -> bool:
-    """Check if match equals dihedral in either direction."""
+    """Check if match equals dihedral in either direction.
+
+    Reversing a quartet leaves the dihedral angle unchanged, so both directions
+    describe the same coordinate.
+    """
     return match == dihedral or match[::-1] == dihedral
+
+
+@dataclass(frozen=True)
+class BivariateAssignment:
+    """A matched correlated pair, with the offsets that put it in bouquet's frame.
+
+    A fitted prior is measured on the quartets its SMARTS names, but bouquet
+    searches over one canonical quartet per rotatable bond -- usually a
+    *different* terminal atom, and never a hydrogen. The two choices differ by a
+    constant: the four atoms of a quartet are joined by direct bonds, so no
+    rotatable bond lies between them and torsional motion cannot change their
+    relative geometry. Measured over a full rotation of the bond, the offset
+    holds to ~1e-14 deg.
+
+    ``offset_deg`` is ``angle(bouquet quartet) - angle(SMARTS quartet)``, so the
+    angle the prior was fitted on is ``X[dim] - offset_deg``.
+    """
+
+    prior_type: PriorTypeId
+    offset1_deg: float = 0.0
+    offset2_deg: float = 0.0
 
 
 # ============================================================================
@@ -295,10 +331,28 @@ class DihedralPriorModule(nn.Module):
         self.max_concentration = max_concentration
         self.background_weight = background_weight
         self.univariate_assignments = univariate_assignments
-        self.bivariate_assignments = bivariate_assignments
+        # Values may be a bare prior id or a BivariateAssignment carrying the
+        # terminal-atom offsets; normalise to (prior_id, offsets) once here so
+        # forward() and peak_modes() do not each have to branch.
+        self.bivariate_assignments = {
+            dims: (a.prior_type if isinstance(a, BivariateAssignment) else a)
+            for dims, a in bivariate_assignments.items()
+        }
+        self.bivariate_offsets: Dict[Tuple[int, int], Tuple[float, float]] = {
+            dims: (
+                (a.offset1_deg, a.offset2_deg)
+                if isinstance(a, BivariateAssignment)
+                else (0.0, 0.0)
+            )
+            for dims, a in bivariate_assignments.items()
+        }
 
-        # Merge built-in with custom priors
+        # Merge built-in with custom priors. There are no built-in bivariate
+        # priors, but the dict still has to be stored: _build_bivariate and
+        # describe() both read it, so without this any non-empty
+        # bivariate_assignments raised AttributeError at construction.
         self.univariate_priors = {**BUILTIN_UNIVARIATE_PRIORS, **univariate_priors}
+        self.bivariate_priors = dict(bivariate_priors)
 
         # Build distributions
         self._build_univariate()
@@ -358,6 +412,8 @@ class DihedralPriorModule(nn.Module):
     def _build_bivariate(self):
         """Build 2D bivariate von Mises distributions."""
         self.bivariate_dists: Dict[Tuple[int, int], BivariateVonMisesMixture] = {}
+        # Register as a ModuleDict too so .to(device) moves bivariate buffers.
+        self._bivariate_modules = nn.ModuleDict()
 
         for (d1, d2), type_id in self.bivariate_assignments.items():
             type_def = self.bivariate_priors.get(type_id)
@@ -366,22 +422,54 @@ class DihedralPriorModule(nn.Module):
                 logger.warning(f"Unknown bivariate type '{type_id}' for dims ({d1}, {d2})")
                 continue
 
-            self.bivariate_dists[(d1, d2)] = BivariateVonMisesMixture(
+            mod = BivariateVonMisesMixture(
                 components=type_def["components"],
                 weights=type_def["weights"],
                 max_concentration=self.max_concentration,
             )
+            self.bivariate_dists[(d1, d2)] = mod
+            self._bivariate_modules[f"{d1}_{d2}"] = mod
 
     def _to_radians(self, x: Tensor) -> Tensor:
-        """Convert input to radians in [-π, π]."""
+        """Convert a dihedral value to radians, wrapped to [-π, π).
+
+        The input is the *dihedral angle itself* -- the same value that is handed
+        to ``set_dihedral`` when the geometry is built -- so 0 in must map to 0
+        radians. This previously computed ``(x / 180 - 1) * pi``, i.e.
+        ``radians(x) - pi``, while the component means went in unshifted via
+        ``math.radians(mu)``: every prior mode was therefore scored 180 deg away
+        from where it was declared (the built-in sp3_sp3 means 60/180/300 peaked
+        at 240/0/120, putting gauche minima on eclipsed positions), and
+        ``peak_modes`` -- which reports ``degrees(mu)`` unshifted -- disagreed
+        with ``forward`` by half a turn.
+        """
         if self.input_in_degrees:
             # Input is [0, 360) degrees
-            return (x / 180.0 - 1.0) * math.pi
+            theta = x * (math.pi / 180.0)
         else:
             # Input is [0, 1) normalized
-            return (x * 2.0 - 1.0) * math.pi
+            theta = x * (2.0 * math.pi)
+        # Only cosine differences are used downstream, so wrapping is cosmetic --
+        # but it keeps the documented range honest.
+        return torch.remainder(theta + math.pi, 2.0 * math.pi) - math.pi
 
-    def forward(self, X: Tensor) -> Tensor:
+    def _representatives(self, X: Tensor, d: int, orders) -> Tensor:
+        """Full-turn representatives of dim ``d``, shape (..., q, m_d).
+
+        Without ``orders`` (or for an order-1 rotor) X is already the full-turn angle
+        and there is a single representative. For a symmetry-folded ``u`` in one
+        irreducible period, the m physically equivalent full-turn angles are
+        ``(u + k) / m`` for ``k = 0..m-1`` (in the module's input units).
+        """
+        x = X[..., d].unsqueeze(-1)
+        m = 1 if orders is None else int(orders[d])
+        if m <= 1:
+            return x
+        full_turn = 360.0 if self.input_in_degrees else 1.0
+        k = torch.arange(m, dtype=X.dtype, device=X.device) * full_turn
+        return (x + k) / m
+
+    def forward(self, X: Tensor, symmetry_orders: Optional[Sequence[int]] = None) -> Tensor:
         """
         Compute the LOG probability of X under the prior.
 
@@ -398,6 +486,14 @@ class DihedralPriorModule(nn.Module):
 
         Args:
             X: Shape (..., q, dim) - dihedral values
+            symmetry_orders: Optional per-dihedral symmetry order ``m_d``. When
+                given, ``X[..., d]`` is a symmetry-folded coordinate covering one
+                irreducible period (``360 / m_d`` degrees), and each factor scores
+                the MEAN density over all ``m_d`` equivalent full-turn angles (all
+                ``m_d1 * m_d2`` angle pairs jointly for a bivariate factor, which
+                keeps its fitted correlation), so equivalent angles -- including the
+                period boundaries u=0 and u=1 -- score identically. Order-1
+                dihedrals are unchanged.
 
         The per-dihedral log-densities are *averaged*, not summed: the joint
         log-prior is ``mean_d log p_d(x_d)`` over the informative dihedrals
@@ -425,20 +521,45 @@ class DihedralPriorModule(nn.Module):
         for d, dist in self.univariate_dists.items():
             if dist is None:
                 continue
-            angle = self._to_radians(X[..., d])
+            reps = self._representatives(X, d, symmetry_orders)
+            angle = self._to_radians(reps)
+            # Move univariate distribution tensors lazily if X lives on another device (e.g. CUDA).
+            if dist.component_distribution.loc.device != angle.device:
+                dist = MixtureSameFamily(
+                    Categorical(dist.mixture_distribution.probs.to(angle.device)),
+                    VonMises(
+                        dist.component_distribution.loc.to(angle.device),
+                        dist.component_distribution.concentration.to(angle.device),
+                    ),
+                )
+                self.univariate_dists[d] = dist
             vm_lp = dist.log_prob(angle)
             if w_bg > 0.0:
                 bg_lp = torch.full_like(vm_lp, log_w + log_uniform)
                 vm_lp = torch.logaddexp(log_one_minus_w + vm_lp, bg_lp)
+            # Mean density over the equivalent representatives (exactly vm_lp for m=1).
+            vm_lp = torch.logsumexp(vm_lp, dim=-1) - math.log(reps.shape[-1])
             log_prob = log_prob + vm_lp
 
         # Bivariate contributions. These factors are *unnormalized*, so the uniform
         # background (which needs a normalized density to mix against) is not applied
         # here; they keep the hard clamp below as their floor.
         for (d1, d2), dist in self.bivariate_dists.items():
-            angle1 = self._to_radians(X[..., d1])
-            angle2 = self._to_radians(X[..., d2])
-            log_prob = log_prob + dist.log_prob(angle1, angle2)
+            # The prior was fitted on the SMARTS pattern's own quartets; subtract
+            # the constant offset (stored in degrees) AFTER converting X to radians
+            # so both input_in_degrees=True and input_in_degrees=False shift identically.
+            if dist.mu1.device != X.device:
+                dist.to(X.device)
+            off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
+            reps1 = self._representatives(X, d1, symmetry_orders)  # (..., q, m1)
+            reps2 = self._representatives(X, d2, symmetry_orders)  # (..., q, m2)
+            # Every (k1, k2) combination jointly, so the fitted correlation holds.
+            angle1 = (self._to_radians(reps1) - math.radians(off1)).unsqueeze(-1)
+            angle2 = (self._to_radians(reps2) - math.radians(off2)).unsqueeze(-2)
+            pair_lp = dist.log_prob(angle1, angle2).flatten(-2)  # (..., q, m1*m2)
+            log_prob = log_prob + (
+                torch.logsumexp(pair_lp, dim=-1) - math.log(pair_lp.shape[-1])
+            )
 
         # Average over informative dihedrals (mean, not sum) so the prior's
         # magnitude is O(1) in dim. n_active_dims == 0 means an all-uniform prior
@@ -500,11 +621,15 @@ class DihedralPriorModule(nn.Module):
             mu1 = dist.mu1.detach().cpu().numpy()
             mu2 = dist.mu2.detach().cpu().numpy()
             probs = dist.weights.detach().cpu().numpy()
+            # Peaks are reported in X's frame, so the offset that forward()
+            # subtracts has to be added back here -- otherwise seeding and
+            # scoring would disagree.
+            off1, off2 = self.bivariate_offsets.get((d1, d2), (0.0, 0.0))
             candidates = [
                 (
                     (
-                        float(math.degrees(m1) % 360.0),
-                        float(math.degrees(m2) % 360.0),
+                        float((math.degrees(m1) + off1) % 360.0),
+                        float((math.degrees(m2) + off2) % 360.0),
                     ),
                     float(w),
                 )
@@ -557,9 +682,23 @@ class DihedralPriorMatcher:
         self.univariate_patterns = sorted(univariate_smarts, key=lambda p: p.priority, reverse=True)
         self.bivariate_patterns = sorted(bivariate_smarts, key=lambda p: p.priority, reverse=True)
 
-        # Compile patterns
+        # Compile patterns (and precompute atom-map index lists once per pattern)
         self._compiled_uni = self._compile_patterns(self.univariate_patterns)
         self._compiled_bi = self._compile_patterns(self.bivariate_patterns)
+        self._uni_map_lists = {
+            smarts: self._atom_map_list(smarts_mol)
+            for smarts, smarts_mol in self._compiled_uni.items()
+        }
+
+    @staticmethod
+    def _atom_map_list(smarts_mol: Chem.Mol) -> List[int]:
+        """Precompute the atom-index permutation for atom-mapped SMARTS."""
+        index_map = {}
+        for atom in smarts_mol.GetAtoms():
+            map_num = atom.GetAtomMapNum()
+            if map_num:
+                index_map[map_num - 1] = atom.GetIdx()
+        return [index_map[x] for x in sorted(index_map)]
 
     @staticmethod
     def _compile_patterns(patterns: List) -> Dict[str, Chem.Mol]:
@@ -571,40 +710,81 @@ class DihedralPriorMatcher:
                 compiled[p.smarts] = mol
         return compiled
 
-    def match_univariate(
-        self,
-        mol: Chem.Mol,
-        dihedral: Tuple[int, int, int, int],
-    ) -> Optional[PriorTypeId]:
-        """Find matching 1D prior type for a dihedral."""
-        for pattern in self.univariate_patterns:
-            smarts_mol = self._compiled_uni.get(pattern.smarts)
-            if smarts_mol is None:
-                continue
-
-            for match in mol.GetSubstructMatches(smarts_mol):
-                # these SMARTS have atom maps, so convert them
-                # http://www.rdkit.org/docs/GettingStartedInPython.html#atom-map-indices-in-smarts
-                index_map = {}
-                for atom in smarts_mol.GetAtoms():
-                    map_num = atom.GetAtomMapNum()
-                    if map_num:
-                        index_map[map_num-1] = atom.GetIdx()
-                map_list = [index_map[x] for x in sorted(index_map)]
-                mapped = tuple(match[x] for x in map_list)
-
-                if len(mapped) >= 4 and _matches_dihedral(mapped, dihedral):
-                    return pattern.prior_type
-
+    @staticmethod
+    def _dihedral_on_bond(
+        dihedrals: List[Tuple[int, int, int, int]],
+        quartet: Tuple[int, ...],
+    ) -> Optional[int]:
+        """Index of the dihedral rotating the same bond as ``quartet``, if any."""
+        bond = frozenset(quartet[1:3])
+        for i, dih in enumerate(dihedrals):
+            if frozenset(dih[1:3]) == bond:
+                return i
         return None
+
+    @staticmethod
+    def _terminal_offset(
+        conf, quartet: Tuple[int, ...], bouquet_quartet: Tuple[int, ...]
+    ) -> Optional[float]:
+        """``angle(bouquet quartet) - angle(SMARTS quartet)``, in degrees.
+
+        Both quartets turn about the same bond, so this is fixed by the rigid
+        local geometry and is invariant to every torsion in the molecule.
+        """
+        if _matches_dihedral(tuple(bouquet_quartet), tuple(quartet)):
+            return 0.0
+        if conf is None:
+            return None
+        try:
+            a_bq = rdMolTransforms.GetDihedralDeg(conf, *bouquet_quartet)
+            a_hist = rdMolTransforms.GetDihedralDeg(conf, *quartet)
+        except (ValueError, RuntimeError):
+            # A planar inner angle leaves the torsion undefined; there is no
+            # offset to measure, so decline the match rather than guess one.
+            return None
+        offset = a_bq - a_hist
+        if offset != offset:  # NaN from a degenerate geometry
+            return None
+        return (offset + 180.0) % 360.0 - 180.0
 
     def match_bivariate(
         self,
         mol: Chem.Mol,
         dihedrals: List[Tuple[int, int, int, int]],
-    ) -> Dict[Tuple[int, int], PriorTypeId]:
-        """Find correlated pairs among dihedrals."""
-        results = {}
+        conf_id: int = -1,
+    ) -> Dict[Tuple[int, int], BivariateAssignment]:
+        """Find correlated pairs among dihedrals.
+
+        Keys are ``(dim_of_dihedral1, dim_of_dihedral2)`` in the topology's own
+        order, *not* sorted: ``DihedralPriorModule.forward`` feeds ``X[..., d1]``
+        to the mixture as phi1, and a fitted mixture is not in general symmetric
+        under transposing phi1/phi2 (the two arms of a w_shape or y_shape pattern
+        are usually chemically distinct). Sorting the key here silently applied
+        the transposed prior whenever the second dihedral happened to come first
+        in ``dihedrals``.
+
+        A pattern is matched on the *central bond* of each of its two dihedrals,
+        not on the exact quartet. The fitted priors name particular terminal
+        atoms -- often a hydrogen -- while bouquet searches one canonical quartet
+        per rotatable bond, so requiring an exact quartet left most priors unable
+        to fire at all (on 150 ZINC leads: 22% of dihedral slots matched exactly,
+        while a further 64% were the right rotor with a different terminal). The
+        constant difference between the two terminal choices is measured off the
+        conformer and carried on the assignment; see ``BivariateAssignment``.
+
+        Without a conformer only exact-quartet matches can be resolved, since
+        there is no geometry to measure the offset from.
+        """
+        conf = mol.GetConformer(conf_id) if mol.GetNumConformers() else None
+
+        results: Dict[Tuple[int, int], BivariateAssignment] = {}
+        # Each dihedral joins at most ONE pair: a dihedral shared by two pairs would
+        # become two independent joint axes (double-counted in ``forward`` and set to
+        # conflicting values by ``peak_modes``). Patterns run highest priority first,
+        # so the higher-priority pair keeps a contested dihedral; a pair that loses
+        # one falls back to univariate priors for its other dihedral (assign_all).
+        # This also dedups a physical pair matched in both orientations.
+        claimed: Set[int] = set()
 
         for pattern in self.bivariate_patterns:
             smarts_mol = self._compiled_bi.get(pattern.smarts)
@@ -622,18 +802,23 @@ class DihedralPriorMatcher:
                 dih1 = tuple(match[i] for i in dih1_indices)
                 dih2 = tuple(match[i] for i in dih2_indices)
 
-                # Find indices in our dihedral list
-                idx1 = idx2 = None
-                for i, dih in enumerate(dihedrals):
-                    if _matches_dihedral(dih, dih1):
-                        idx1 = i
-                    if _matches_dihedral(dih, dih2):
-                        idx2 = i
+                idx1 = self._dihedral_on_bond(dihedrals, dih1)
+                idx2 = self._dihedral_on_bond(dihedrals, dih2)
+                if idx1 is None or idx2 is None or idx1 == idx2:
+                    continue
 
-                if idx1 is not None and idx2 is not None:
-                    pair = (min(idx1, idx2), max(idx1, idx2))
-                    if pair not in results:
-                        results[pair] = pattern.prior_type
+                off1 = self._terminal_offset(conf, dih1, dihedrals[idx1])
+                off2 = self._terminal_offset(conf, dih2, dihedrals[idx2])
+                if off1 is None or off2 is None:
+                    continue
+
+                if idx1 not in claimed and idx2 not in claimed:
+                    claimed.update((idx1, idx2))
+                    results[(idx1, idx2)] = BivariateAssignment(
+                        prior_type=pattern.prior_type,
+                        offset1_deg=off1,
+                        offset2_deg=off2,
+                    )
 
         return results
 
@@ -655,14 +840,37 @@ class DihedralPriorMatcher:
             bivariate_dims.add(d1)
             bivariate_dims.add(d2)
 
-        # Then assign univariate to remaining
-        univariate = {}
+        # Then assign univariate to remaining in a single pass per pattern
+        # (highest-priority pattern wins; each pattern runs GetSubstructMatches once).
+        remaining: Dict[Tuple[int, int, int, int], List[int]] = {}
         for i, dih in enumerate(dihedrals):
             if i in bivariate_dims:
                 continue
-            type_id = self.match_univariate(mol, dih)
-            if type_id is not None:
-                univariate[i] = type_id
+            key = tuple(dih)
+            remaining.setdefault(key, []).append(i)
+            rev = key[::-1]
+            if rev != key:
+                remaining.setdefault(rev, []).append(i)
+
+        univariate: Dict[int, PriorTypeId] = {}
+        n_unassigned = sum(1 for i in range(len(dihedrals)) if i not in bivariate_dims)
+        if n_unassigned > 0:
+            for pattern in self.univariate_patterns:
+                if len(univariate) >= n_unassigned:
+                    break
+                smarts_mol = self._compiled_uni.get(pattern.smarts)
+                if smarts_mol is None:
+                    continue
+                map_list = self._uni_map_lists[pattern.smarts]
+                if len(map_list) < 4:
+                    continue
+                for match in mol.GetSubstructMatches(smarts_mol):
+                    mapped = tuple(match[x] for x in map_list)
+                    idxs = remaining.get(mapped)
+                    if idxs is not None:
+                        for idx in idxs:
+                            if idx not in univariate:
+                                univariate[idx] = pattern.prior_type
 
         return univariate, bivariate
 
@@ -963,6 +1171,15 @@ def load_torlib_smarts(
     return patterns
 
 
+@lru_cache(maxsize=4)
+def _cached_torlib_matcher(resolved_path: Path) -> DihedralPriorMatcher:
+    """Compile and cache the torsion-library SMARTS matcher for ``resolved_path``."""
+    from rdkit import rdBase
+
+    with rdBase.BlockLogs():
+        return DihedralPriorMatcher(load_torlib_smarts(resolved_path), [])
+
+
 def assign_categories(
     mol: "Chem.Mol",
     dihedrals: List[Tuple[int, int, int, int]],
@@ -985,14 +1202,7 @@ def assign_categories(
         pattern (unmatched dihedrals are absent and become their own singleton group
         downstream).
     """
-    # Some torlib rows use recursive-SMARTS label syntax RDKit can't parse; the matcher
-    # skips any pattern that fails to compile, but RDKit logs each failure to stderr.
-    # Silence those while compiling so a normal run isn't spammed. BlockLogs saves and
-    # restores the prior log state on exit, so we don't clobber a caller that had already
-    # disabled (or enabled) rdApp.error.
-    from rdkit import rdBase
-
-    with rdBase.BlockLogs():
-        matcher = DihedralPriorMatcher(load_torlib_smarts(torlib_path), [])
+    path = Path(torlib_path).resolve() if torlib_path is not None else default_torlib_path().resolve()
+    matcher = _cached_torlib_matcher(path)
     univariate, _bivariate = matcher.assign_all(mol, dihedrals)
     return univariate

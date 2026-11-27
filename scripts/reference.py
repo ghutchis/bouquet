@@ -100,17 +100,19 @@ def _gfnff_calc(method, mol, charge):
 
 
 def _optimize(atoms, calc, fmax=0.05, steps=300):
-    """Unconstrained local optimization; returns (atoms, E_eV) or None on failure."""
-    from ase.optimize import LBFGS
-    a = atoms.copy()
-    a.calc = calc
-    try:
-        with _suppress_c_stdout():
-            LBFGS(a, logfile=None).run(fmax=fmax, steps=steps)
-            e = float(a.get_potential_energy())
-        return a, e
-    except Exception:
-        return None
+    """Unconstrained local optimization; returns (atoms, E_eV) or None on failure.
+
+    ONE `calc` is built per molecule (see the caller) and reused for the start proxy
+    and every pool member, so a failure must not just lose this structure: xtb keeps
+    the non-converged SCF as its restart guess and every LATER member of the same pool
+    inherits it. That is how a009_d02 came back with E_star = -97283 kcal/mol: not one
+    bad structure, a bad pool. ``quench`` resets the calculator on failure, as the
+    handlers in bouquet/assess.py do.
+    """
+    from bouquet.rings.harvest import quench
+
+    with _suppress_c_stdout():
+        return quench(atoms, calc, fmax=fmax, steps=steps, require_convergence=False)
 
 
 def _etkdg_confs(mol, n, seed):
@@ -221,6 +223,63 @@ def _bond_fingerprint(atoms, mult: float = CONNECTIVITY_MULT):
                 pair = tuple(sorted((syms[i], syms[j])))
                 counts[pair] = counts.get(pair, 0) + 1
     return frozenset(counts.items())
+
+
+def _drop_stereoisomers(pools: dict, molh, rejected: dict | None = None):
+    """Drop pool members that are a different STEREOISOMER of the input molecule.
+
+    The connectivity guards above cannot see this: E/Z isomers and epimers have identical
+    bond graphs, so an isomerised structure passes every fingerprint check and can become
+    the reference global minimum. CREST's iMTD-GC runs hot with an RMSD bias and will cross
+    a conjugated C=N or C=C isomerisation barrier, so this is not hypothetical -- measured on
+    stopbench-500, 5 of the 30 molecules with a stereo-specified double bond had a FLIPPED
+    reference minimum, and 3 of those were scored as CREST wins bouquet could not win by
+    construction (m105_d05 was even diagnosed as a dihedral search failure when no dihedral
+    value could close it; correcting the reference takes its 1.93 kcal gap to 0.00).
+
+    This is a CONFORMER benchmark: the reference must be the same stereoisomer as the input.
+    A structure-search comparison would want the opposite policy and a bouquet move that can
+    flip a double bond -- neither exists today.
+
+    Reference stereochemistry comes from the input SMILES via ``molh``, not from a pool
+    member, so a pool that is entirely isomerised (it happens -- m276_d12) is emptied rather
+    than silently re-baselined onto the wrong isomer.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import rdCIPLabeler
+
+    from bouquet.rings.harvest import stereo_signature
+
+    # Reference signature comes from the SMILES-derived graph, not from a pool member.
+
+    ref_mol = Chem.Mol(molh)
+    Chem.AssignStereochemistry(ref_mol, cleanIt=True, force=True)
+    rdCIPLabeler.AssignCIPLabels(ref_mol)
+    # Both atom (R/S, catches epimers) and bond (E/Z) requirements. Centres the SMILES
+    # leaves unspecified carry no CIP label, so they stay unrestricted.
+    want_atoms = {a.GetIdx(): a.GetProp("_CIPCode")
+                  for a in ref_mol.GetAtoms() if a.HasProp("_CIPCode")}
+    want_bonds = {tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx()))): b.GetProp("_CIPCode")
+                  for b in ref_mol.GetBonds() if b.HasProp("_CIPCode")}
+    if not want_atoms and not want_bonds:   # nothing stereo-specified -> nothing to enforce
+        return pools, {src: 0 for src in pools}
+
+    def _matches(got: dict, want: dict) -> bool:
+        return all(got.get(k) is None or got[k] == v for k, v in want.items())
+
+    n_rej = {src: 0 for src in pools}
+    out: dict = {src: [] for src in pools}
+    for src, res in pools.items():
+        for a, e in res:
+            got_atoms, got_bonds = stereo_signature(molh, a)
+            if _matches(got_atoms, want_atoms) and _matches(got_bonds, want_bonds):
+                out[src].append((a, e))
+            else:
+                n_rej[src] += 1
+    if rejected is not None:
+        for src, n in n_rej.items():
+            rejected[src] = rejected.get(src, 0) + n
+    return out, n_rej
 
 
 def _drop_off_species(pools: dict, mult: float = CONNECTIVITY_MULT):
@@ -384,6 +443,9 @@ def build_one(task):
         # this a single proton-transferred/ring-closed structure can sit thousands of
         # kcal below the real conformers and become a spurious E*.
         raw, species_rej = _drop_off_species(raw)
+        # Third guard: a different STEREOISOMER has the same bond graph, so neither check
+        # above can see it. Conformer benchmark -> the reference must match the input.
+        raw, stereo_rej = _drop_stereoisomers(raw, molh)
         opt = {src: _dedup(res, task["rmsd_thr"], task["e_tol"] / KCAL)
                for src, res in raw.items()}
 
@@ -449,14 +511,18 @@ def cmd_build(args):
     geom_dir = args.geom_dir
     angles = [float(a) for a in args.angles.split(",")]
 
-    crest_dir = args.crest_dir
+    crest_dirs = args.crest_dir or []
     tasks = []
+    n_crest = 0
     for _, r in man.iterrows():
         mid = r.mol_id
         trails = sorted(glob.glob(str(geom_dir / f"*_{mid}_seed*.xyz"))) if geom_dir else []
         # ensemble_bench layout: <crest-dir>/<mol_id>/<crest-glob> (crest_*/refined.xyz).
-        crest_files = (sorted(glob.glob(str(crest_dir / mid / args.crest_glob)))
-                       if crest_dir else [])
+        # Unioned over every --crest-dir: the combined manifest's cells were built by
+        # separate per-manifest jobs, each into its own tree.
+        crest_files = sorted(f for cd in crest_dirs
+                             for f in glob.glob(str(cd / mid / args.crest_glob)))
+        n_crest += bool(crest_files)
         # skip molecules already done (resume)
         if args.resume and (args.out_dir / f"{mid}.json").exists():
             continue
@@ -472,6 +538,16 @@ def cmd_build(args):
         })
     print(f"Building references for {len(tasks)} molecules "
           f"({args.method}, {args.workers} workers)...")
+    if crest_dirs:
+        # CREST is the strong bouquet-independent source; a molecule missing its cell
+        # falls back to the orthogonal pool and gets a systematically weaker E*. Say so
+        # loudly rather than letting it average into the result.
+        missing = [t["mol_id"] for t in tasks if not t["crest_files"]]
+        print(f"  CREST cells found for {n_crest}/{len(man)} manifest molecules "
+              f"across {len(crest_dirs)} dir(s)")
+        if missing:
+            print(f"  WARNING: {len(missing)} molecule(s) have NO CREST cell, e.g. "
+                  f"{', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
 
     done = 0
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -591,10 +667,16 @@ def main():
                    help="select_smiles.py manifest CSV (mol_id, raw_smiles, d)")
     b.add_argument("--geom-dir", type=Path, default=None,
                    help="Geometry-trail dir (*_geom) for the BO pool; optional")
-    b.add_argument("--crest-dir", type=Path, default=None,
-                   help="ensemble_bench workdir holding CREST cells "
+    b.add_argument("--crest-dir", type=Path, nargs="+", default=None,
+                   help="ensemble_bench workdir(s) holding CREST cells "
                    "(<crest-dir>/<mol_id>/crest_*/refined.xyz); adds them to the "
-                   "reference pool as the strong bouquet-independent source. Optional.")
+                   "reference pool as the strong bouquet-independent source. Optional. "
+                   "Accepts SEVERAL dirs, unioned per mol_id -- the combined manifest's "
+                   "CREST cells were produced by separate per-manifest jobs that each "
+                   "wrote their own tree (stopbench-500 -> ensemble_bench, autosteps-calib "
+                   "-> autosteps_ensemble, stopbench-extras -> its own), so one reference "
+                   "over combined-gfnff.csv needs all of them. Cells are re-optimized on "
+                   "--method, so dirs built on different surfaces can safely be mixed.")
     b.add_argument("--crest-glob", default="crest_*/refined.xyz",
                    help="Glob under <crest-dir>/<mol_id>/ for CREST refined cells "
                    "(default crest_*/refined.xyz).")

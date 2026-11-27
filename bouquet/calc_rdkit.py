@@ -11,7 +11,6 @@ __lazy_modules__ = [
 ]
 
 from abc import ABC, abstractmethod
-from typing import List
 
 import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
@@ -19,6 +18,16 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from bouquet.config import KCAL_TO_EV
+
+
+# The force field is built ONCE (on the molecule's embedded conformer) and reused for
+# every geometry. RDKit decides which nonbonded pairs to include from distances in the
+# BUILD geometry (MMFF ``nonBondedThresh``, in A; UFF ``vdwThresh``, a multiple of the vdW
+# distance), so with the defaults a pair that is far apart there -- e.g. the two ends of
+# an extended chain -- would be silently missing once the molecule folds. A threshold
+# this large includes every pair, so the cached terms are geometry-independent and
+# match a fresh build at any geometry.
+_ALL_PAIRS_THRESH = 1.0e6
 
 
 class RDKitCalculator(Calculator, ABC):
@@ -54,7 +63,13 @@ class RDKitCalculator(Calculator, ABC):
                     "Ensure the molecule has valid connectivity."
                 )
         # Subclasses should initialize their force field properties
+        self._conf_id = self.mol.GetConformer(-1).GetId()
         self._setup_force_field()
+        self._ff = self._create_force_field(conf_id=self._conf_id)
+        if self._ff is None:
+            raise ValueError(
+                f"Could not create {self.__class__.__name__} force field for molecule"
+            )
 
     @abstractmethod
     def _setup_force_field(self) -> None:
@@ -90,27 +105,15 @@ class RDKitCalculator(Calculator, ABC):
             properties = ["energy"]
         super().calculate(atoms, properties, system_changes)
 
-        # Update RDKit conformer with current ASE positions
-        conf = self.mol.GetConformer(0)
-        positions = self.atoms.get_positions()
-        for i, pos in enumerate(positions):
-            conf.SetAtomPosition(i, pos.tolist())
-
-        # Create force field with current geometry
-        ff = self._create_force_field(conf_id=0)
-        if ff is None:
-            raise ValueError(
-                f"Could not create {self.__class__.__name__} force field for current geometry"
-            )
-
-        # Energy in kcal/mol, convert to eV for ASE consistency
-        energy_kcal = ff.CalcEnergy()
+        # Evaluate directly on the cached RDKit ForceField without mutating the
+        # conformer or rebuilding the C++ force-field object each step.
+        flat_pos = self.atoms.get_positions().ravel().tolist()
+        energy_kcal = self._ff.CalcEnergy(flat_pos)
         self.results["energy"] = energy_kcal * KCAL_TO_EV
 
         if "forces" in properties:
             # RDKit returns gradient (dE/dx), forces are negative gradient
-            grad = ff.CalcGrad()
-            grad = np.array(grad).reshape(-1, 3)
+            grad = np.asarray(self._ff.CalcGrad(flat_pos), dtype=float).reshape(-1, 3)
             # Convert kcal/(mol·Å) to eV/Å and negate for forces
             self.results["forces"] = -grad * KCAL_TO_EV
 
@@ -144,7 +147,7 @@ class RDKitMMFFCalculator(RDKitCalculator):
     def _create_force_field(self, conf_id: int = 0):
         """Create an MMFF force field instance."""
         return AllChem.MMFFGetMoleculeForceField(
-            self.mol, self.mmff_props, confId=conf_id
+            self.mol, self.mmff_props, nonBondedThresh=_ALL_PAIRS_THRESH, confId=conf_id
         )
 
 
@@ -164,4 +167,6 @@ class RDKitUFFCalculator(RDKitCalculator):
 
     def _create_force_field(self, conf_id: int = 0):
         """Create a UFF force field instance."""
-        return AllChem.UFFGetMoleculeForceField(self.mol, confId=conf_id)
+        return AllChem.UFFGetMoleculeForceField(
+            self.mol, vdwThresh=_ALL_PAIRS_THRESH, confId=conf_id
+        )

@@ -50,6 +50,18 @@ class TestBoltzmannWeights:
         assert w_low.argmax() == 0 and w_high.argmax() == 0
 
 
+def test_diversity_factor_has_finite_gradient_at_known_basin():
+    """Evaluating _diversity_factor exactly on a known basin must not produce NaN grad."""
+    from bouquet.ensemble import _diversity_factor
+
+    minima_deg = torch.tensor([[60.0, 180.0]], dtype=torch.float64)
+    x = torch.tensor([[[60.0 / 360.0, 180.0 / 360.0]]], dtype=torch.float64, requires_grad=True)
+    val = _diversity_factor(x, minima_deg, diversity_lambda=0.5)
+    val.sum().backward()
+    assert torch.isfinite(x.grad).all()
+    assert torch.allclose(x.grad, torch.zeros_like(x.grad))
+
+
 class TestRmsdAndDedup:
     def test_rmsd_invariant_to_rotation_and_translation(self):
         a = _mol()

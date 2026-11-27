@@ -5,6 +5,7 @@ from __future__ import annotations
 # With annotations as strings, networkx/ase/rdkit are only used inside function
 # bodies, so defer them until a structure is actually parsed (Python 3.15+).
 __lazy_modules__ = [
+    "numpy",
     "networkx",
     "ase",
     "ase.io",
@@ -13,15 +14,23 @@ __lazy_modules__ = [
 ]
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING
 
 import networkx as nx
+import numpy as np
 from ase import Atoms
 from ase.io import read
 from rdkit import Chem
-from rdkit.Chem import AllChem, rdDetermineBonds
+from rdkit.Chem import AllChem, rdDetermineBonds, rdMolTransforms
+
+from bouquet.config import (
+    DEFAULT_ETKDG_CLUSTER_DEG,
+    DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
+    etkdg_seed_pool_size,
+)
 
 if TYPE_CHECKING:
     from bouquet.calculator import Calculator
@@ -304,7 +313,7 @@ def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:
             logger.warning(f"Bond determination failed: {e}. Trying with charge=0")
             rdDetermineBonds.DetermineBonds(mol, charge=0)
 
-    elif ext in (".mol", ".sdf"):
+    elif ext in (".mol", ".sdf", ".mdl"):
         mol = Chem.MolFromMolFile(str(filepath), removeHs=False, sanitize=True)
         if mol is None:
             # Try without sanitization
@@ -358,12 +367,19 @@ def get_initial_structure_from_file(filename: str) -> tuple[Atoms, Chem.Mol]:
     return atoms, mol
 
 
-def get_conformers_from_file(filename: str) -> list[Atoms]:
+def get_conformers_from_file(
+    filename: str, max_conformers: int = 0, select_rule: str = "energy"
+) -> list[Atoms]:
     """Read multiple conformers from a file.
 
     Args:
         filename: Path to a file containing multiple structures
                   (e.g., multi-frame XYZ or multi-molecule SDF)
+        max_conformers: Cap on how many conformers to return (0 = all). Only the
+                  ring-seed ``.json`` format selects intelligently under a cap -- the
+                  other formats have no ranking to select on and are simply truncated.
+        select_rule: Selection rule for ring-seed files under ``max_conformers``; see
+                  :func:`bouquet.rings.select.select_seeds`.
 
     Returns:
         List of Atoms objects, one for each conformer
@@ -402,14 +418,143 @@ def get_conformers_from_file(filename: str) -> list[Atoms]:
         atoms, _ = get_initial_structure_from_file(filename)
         conformers = [atoms]
 
+    elif ext == ".json":
+        # Ring-MTD seed file (ring_seeds schema). The seed geometries are in the atom order
+        # of the SMILES the seeds were generated from, which need not match the run's
+        # molecule (the stored SMILES is canonical, so it often does not): the caller maps
+        # them with align_conformers_to_mol. Charge/spin are (re)stamped by the caller,
+        # matching the other branches.
+        #
+        # CAUTION: conformers loaded here do NOT carry their ring pucker into the search.
+        # `solver._evaluate_point` reads each conformer's DIHEDRAL ANGLES and applies them to
+        # the single `state.start_atoms` geometry, so only torsions transfer; the geometries
+        # themselves reach `ensemble_seed_geometries`, which feeds the returned ensemble and
+        # only under --ensemble. To actually start a search FROM a ring state, make it the
+        # start structure (`--file`). See RING_MTD_BENCH §9.17.
+        #
+        # The file holds every ring state the metadynamics found (up to ~100 on a spiro
+        # product) and bouquet runs one BO per conformer, so a cap is applied HERE rather
+        # than when the file is written: the file stays the complete, energy-ranked record
+        # that any selection rule can be re-scored against offline.
+        from bouquet.rings.seeds import read_seeds
+        seeds = read_seeds(str(filepath))
+        conformers = (seeds.select(max_conformers, select_rule) if max_conformers
+                      else seeds.conformers())
+        for atoms in conformers:
+            atoms.charge = 0
+            atoms.info["charge"] = 0
+            atoms.set_initial_charges([0] * len(atoms))
+
     else:
         raise ValueError(f"Unsupported file format for conformers: {ext}")
+
+    # Formats without a ranking get a plain truncation; the ring-seed branch above has
+    # already applied its rule and is left alone.
+    if max_conformers and ext != ".json" and len(conformers) > max_conformers:
+        logger.info(
+            "Truncating %d conformers from %s to %d", len(conformers), filepath, max_conformers
+        )
+        conformers = conformers[:max_conformers]
 
     if len(conformers) == 0:
         raise ValueError(f"No conformers found in file: {filepath}")
 
     logger.info(f"Read {len(conformers)} conformers from {filepath}")
     return conformers
+
+
+def _connectivity_graph(atomic_numbers, bonds) -> Chem.Mol:
+    """Element + bond-topology-only molecule (no bond orders, charges or implicit H)."""
+    rw = Chem.RWMol()
+    for z in atomic_numbers:
+        atom = Chem.Atom(int(z))
+        atom.SetNoImplicit(True)
+        rw.AddAtom(atom)
+    for i, j in bonds:
+        rw.AddBond(int(i), int(j), Chem.BondType.SINGLE)
+    graph = rw.GetMol()
+    graph.UpdatePropertyCache(strict=False)
+    Chem.FastFindRings(graph)
+    return graph
+
+
+def _perceived_bonds(atoms: Atoms) -> set[tuple[int, int]] | None:
+    """Bond graph perceived from a geometry (RDKit connectivity), or None on failure."""
+    xyz = f"{len(atoms)}\n\n" + "\n".join(
+        f"{s} {x:.8f} {y:.8f} {w:.8f}"
+        for s, (x, y, w) in zip(atoms.get_chemical_symbols(), atoms.get_positions())
+    )
+    perceived = Chem.MolFromXYZBlock(xyz)
+    try:
+        rdDetermineBonds.DetermineConnectivity(perceived)
+    except Exception:
+        return None
+    return {
+        tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+        for b in perceived.GetBonds()
+    }
+
+
+def align_conformers_to_mol(
+    conformers: list[Atoms], mol: Chem.Mol, reference_atoms: Atoms | None = None
+) -> list[Atoms]:
+    """Map each conformer's atoms onto ``mol``'s atom order, dropping unmappable ones.
+
+    Bouquet's torsions index atoms in ``mol``'s order, so a conformer whose atoms are
+    ordered differently (e.g. a ring-seed file written from a different SMILES
+    spelling) would silently put every torsion on the wrong atoms. Each conformer's
+    connectivity is perceived from its geometry and compared to ``mol``'s bond graph:
+    an already aligned conformer (same elements, same bonds, same order) is returned
+    unchanged; otherwise its atoms are reordered by a graph isomorphism onto ``mol``.
+    A conformer with no such correspondence is rejected with a warning.
+
+    ``reference_atoms`` (the start geometry, in ``mol``'s atom order) supplies the
+    reference graph when given, so both sides are perceived the same way: geometric
+    perception can disagree with the SMILES graph (e.g. the ~1.85 A bridgehead
+    contact of a bicyclo[1.1.1]pentane reads as a bond), which would otherwise reject
+    correctly aligned conformers.
+
+    Raises:
+        ValueError: if no conformer can be mapped onto ``mol``.
+    """
+    ref_z = [a.GetAtomicNum() for a in mol.GetAtoms()]
+    ref_bonds = _perceived_bonds(reference_atoms) if reference_atoms is not None else None
+    if ref_bonds is None:
+        ref_bonds = {
+            tuple(sorted((b.GetBeginAtomIdx(), b.GetEndAtomIdx())))
+            for b in mol.GetBonds()
+        }
+    ref_graph = None
+    aligned = []
+    for i, conf in enumerate(conformers):
+        z = [int(v) for v in conf.get_atomic_numbers()]
+        if len(z) != len(ref_z):
+            raise ValueError(f"Conformer {i} has {len(z)} atoms, expected {len(ref_z)}")
+        bonds = _perceived_bonds(conf)
+        if bonds is None:
+            logger.warning(f"Conformer {i}: connectivity perception failed; rejected")
+            continue
+        if z == ref_z and bonds == ref_bonds:
+            aligned.append(conf)
+            continue
+        match = ()
+        if len(bonds) == len(ref_bonds):
+            if ref_graph is None:
+                ref_graph = _connectivity_graph(ref_z, ref_bonds)
+            # Same atom and bond counts, so a full-graph substructure match is an
+            # isomorphism: match[k] is the conformer atom playing mol's atom k.
+            match = _connectivity_graph(z, bonds).GetSubstructMatch(ref_graph)
+        if not match:
+            logger.warning(
+                f"Conformer {i}: atoms do not correspond to the start molecule "
+                f"(different elements or connectivity); rejected"
+            )
+            continue
+        logger.info(f"Conformer {i}: reordered atoms to match the start molecule")
+        aligned.append(conf[list(match)])
+    if not aligned:
+        raise ValueError("No conformer could be mapped onto the start molecule's atoms")
+    return aligned
 
 
 @dataclass(slots=True)
@@ -426,6 +571,19 @@ class DihedralInfo:
     """Prior type ID for PiBO (assigned by SMARTS matching)"""
     correlated_with: int | None = None
     """Index of correlated dihedral (for bivariate priors)"""
+    symmetry_order: int = 1
+    """Exact local rotational symmetry order m (period = 360 / m degrees).
+
+    1 for an asymmetric rotor (360 deg), 2 for a rigid planar C2 group (phenyl,
+    para-Cl/F/CN-phenyl, -NO2, -CO2-; 180 deg), 3 for a tetrahedral C3 terminal
+    top (-CH3, -CF3, -NH3+; 120 deg), or lcm(m_u, m_v) when both sides are
+    symmetric (e.g. 6 for toluene / N-methylpyridinium; 60 deg).
+    """
+
+    @property
+    def period_deg(self) -> float:
+        """Irreducible angular period in degrees (360 / symmetry_order)."""
+        return 360.0 / self.symmetry_order
 
     def get_angle(self, atoms: Atoms) -> float:
         """Get the value of the specified dihedral angle.
@@ -485,7 +643,7 @@ def geometry_bond_set(atoms: Atoms, tol: float = 1.3) -> set[tuple[int, int]]:
 
     z = atoms.get_atomic_numbers()
     pos = atoms.get_positions()
-    rcov = np.array([covalent_radii[zi] for zi in z])
+    rcov = covalent_radii[z]
     d = np.linalg.norm(pos[:, None, :] - pos[None, :, :], axis=-1)
     cutoff = tol * (rcov[:, None] + rcov[None, :])
     iu = np.triu_indices(len(z), k=1)
@@ -511,6 +669,50 @@ def bonds_broken(atoms: Atoms, required_bonds: set[tuple[int, int]],
     bridgeheads) are legitimate conformations, not connectivity changes, so they are
     deliberately ignored. This is the "retain the molecule's bonds" criterion."""
     return bool(set(required_bonds) - geometry_bond_set(atoms, tol))
+
+
+# Bond-*formation* tolerance for the species guard: a non-bonded contact counts as
+# a newly formed bond only inside this multiple of the summed covalent radii. Much
+# stricter than the 1.3 breaking tolerance -- see species_changed.
+BOND_FORMATION_TOL = 1.0
+
+
+def bonds_formed(atoms: Atoms, reference_bonds: set[tuple[int, int]],
+                 tol: float = BOND_FORMATION_TOL) -> bool:
+    """True if the geometry has a covalent contact absent from ``reference_bonds``
+    -- atoms drove into each other and made a new bond.
+
+    The counterpart to :func:`bonds_broken`, and deliberately much stricter: a
+    legitimately strained or folded conformer can push non-bonded atoms close
+    (bicyclo[1.1.1] bridgeheads sit near 1.2x the summed covalent radii), so only
+    a contact inside genuine covalent-bond range (``tol`` 1.0) counts. That
+    asymmetry is what makes this safe to apply to every evaluation.
+
+    The failure it catches is not subtle. In the d=8-12 stopbench runs the
+    collapsed geometries formed 4-42 bonds at once with *zero* broken, at
+    contacts of 0.9-1.2 A between heavy atoms -- one relaxation had driven atoms
+    straight through each other. :func:`bonds_broken` is blind to that by
+    construction, which is why those runs were never rejected and instead became
+    absorbing states that consumed the rest of the budget.
+
+    ``reference_bonds`` should be perceived at the *looser* breaking tolerance
+    (as :func:`geometry_bond_set` defaults to). A pair that is already close in
+    the reference -- e.g. a 1-3 Cl...Cl contact perceived as bonded -- is then in
+    the reference set and cannot be reported as newly formed.
+    """
+    return bool(geometry_bond_set(atoms, tol) - set(reference_bonds))
+
+
+def species_changed(atoms: Atoms, required_bonds: set[tuple[int, int]],
+                    tol_break: float = 1.3,
+                    tol_form: float = BOND_FORMATION_TOL) -> bool:
+    """True if the geometry is no longer the same species -- a bond broke OR formed.
+
+    The union of :func:`bonds_broken` and :func:`bonds_formed`; see those for why
+    the two directions use different tolerances.
+    """
+    return (bonds_broken(atoms, required_bonds, tol_break)
+            or bonds_formed(atoms, required_bonds, tol_form))
 
 
 def connectivity_changed(atoms: Atoms, mol: Chem.Mol, tol: float = 1.3) -> bool:
@@ -563,13 +765,10 @@ def get_dihedral_info(
     h = graph.copy()
     h.remove_edge(*bond)
 
-    try:
-        components = list(nx.connected_components(h))
-        if len(components) != 2:
-            return None
-        a, b = components
-    except ValueError:
+    components = list(nx.connected_components(h))
+    if len(components) != 2:
         return None
+    a, b = components
 
     # Determine which component rotates
     if bond[1] in a:
@@ -578,7 +777,141 @@ def get_dihedral_info(
         return DihedralInfo(chain=tuple(points), group=b, type="backbone")
 
 
-def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
+def _side_symmetry_order(
+    mol: Chem.Mol,
+    anchor_idx: int,
+    other_idx: int,
+    comp_atoms: set[int],
+    ranks: list[int],
+    rot_bonds: set[tuple[int, int]],
+) -> int:
+    """Exact rigid C_m rotational symmetry order of fragment ``comp_atoms``
+    around the ``other_idx -> anchor_idx`` bond axis.
+
+    Conservative by design (zero false positives): returns ``m > 1`` only when
+    rotating ``comp_atoms`` by ``360 / m`` degrees is an exact symmetry of the
+    3D geometry regardless of the rest of the molecule (no internal rotatable
+    bonds, no non-aromatic puckerable rings, and no pyramidal lone-pair traps
+    such as neutral -NH2).
+    """
+    anchor = mol.GetAtomWithIdx(anchor_idx)
+    nbrs = [n for n in anchor.GetNeighbors() if n.GetIdx() != other_idx]
+    k = len(nbrs)
+    if k < 2:
+        return 1
+
+    # Internal rotatable bonds or puckerable non-aromatic rings break exact
+    # invariance under a rigid rotation of this fragment.
+    for i, j in rot_bonds:
+        if i in comp_atoms and j in comp_atoms:
+            return 1
+    for idx in comp_atoms:
+        at = mol.GetAtomWithIdx(idx)
+        if at.IsInRing() and not at.GetIsAromatic():
+            return 1
+
+    hyb = anchor.GetHybridization()
+
+    # Case 1: Tetrahedral sp3 terminal C3 top (-CH3, -CF3, -CCl3, -NH3+, -SiH3).
+    if k == 3 and hyb == Chem.HybridizationType.SP3:
+        if all(n.GetDegree() == 1 for n in nbrs):
+            sigs = {(n.GetAtomicNum(), n.GetFormalCharge(), n.GetIsotope()) for n in nbrs}
+            if len(sigs) == 1:
+                return 3
+        return 1
+
+    # Case 2: Planar sp2 C2 rotor.
+    if k == 2 and hyb == Chem.HybridizationType.SP2:
+        n0, n1 = nbrs
+        # (a) Terminal planar C2 group: resonance-symmetric -NO2, -CO2-, -CS2-
+        # (exclude neutral N/P which pyramidalize, e.g. -NH2).
+        if n0.GetDegree() == 1 and n1.GetDegree() == 1:
+            if (
+                n0.GetAtomicNum() == n1.GetAtomicNum()
+                and n0.GetIsotope() == n1.GetIsotope()
+            ):
+                if ranks[n0.GetIdx()] == ranks[n1.GetIdx()]:
+                    if anchor.GetAtomicNum() == 6 or (
+                        anchor.GetAtomicNum() == 7 and anchor.GetFormalCharge() == 1
+                    ):
+                        return 2
+                elif n0.GetAtomicNum() in (8, 16):
+                    b0 = mol.GetBondBetweenAtoms(anchor_idx, n0.GetIdx()).GetBondType()
+                    b1 = mol.GetBondBetweenAtoms(anchor_idx, n1.GetIdx()).GetBondType()
+                    pair = {(b0, n0.GetFormalCharge()), (b1, n1.GetFormalCharge())}
+                    if pair == {
+                        (Chem.BondType.DOUBLE, 0),
+                        (Chem.BondType.SINGLE, -1),
+                    }:
+                        return 2
+
+        # (b) Rigid planar aromatic ring with graph-equivalent ortho neighbors
+        # (phenyl, para-F/Cl/Br/CN-phenyl, 3,5-disubstituted phenyl, 4-pyridyl,
+        # 9-anthryl, etc.): no chiral centers and no out-of-plane sp3 atoms.
+        if anchor.GetIsAromatic() and ranks[n0.GetIdx()] == ranks[n1.GetIdx()]:
+            if any(
+                mol.GetAtomWithIdx(i).GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+                for i in comp_atoms
+            ):
+                return 1
+            if all(
+                mol.GetAtomWithIdx(i).GetDegree() == 1
+                or mol.GetAtomWithIdx(i).GetHybridization()
+                in (Chem.HybridizationType.SP2, Chem.HybridizationType.SP)
+                for i in comp_atoms
+            ):
+                return 2
+
+    return 1
+
+
+def assign_dihedral_symmetries(
+    mol: Chem.Mol, dihedrals: list[DihedralInfo]
+) -> None:
+    """Compute and store exact ``symmetry_order`` on each :class:`DihedralInfo`."""
+    if not dihedrals:
+        return
+    ranks = list(
+        Chem.CanonicalRankAtoms(mol, breakTies=False, includeChirality=True)
+    )
+    rot_bonds = {tuple(sorted((d.chain[1], d.chain[2]))) for d in dihedrals}
+    all_atoms = set(range(mol.GetNumAtoms()))
+    for d in dihedrals:
+        u, v = d.chain[1], d.chain[2]
+        comp_v = set(d.group)
+        comp_u = all_atoms - comp_v
+        mu = _side_symmetry_order(mol, u, v, comp_u, ranks, rot_bonds)
+        mv = _side_symmetry_order(mol, v, u, comp_v, ranks, rot_bonds)
+        d.symmetry_order = math.lcm(mu, mv)
+
+
+def is_trivial_h_c3_rotor(mol: Chem.Mol, dihedral: DihedralInfo) -> bool:
+    """Return True if either side of the rotatable bond is a terminal tetrahedral
+    sp3 hydrogen-only C3 top (e.g. ``-CH3``, ``-NH3+``, ``-SiH3``).
+
+    All three staggered orientations of such a top are symmetry-identical and
+    separated by a low barrier, so local relaxation (``--relax``) places the
+    hydrogens without needing a dedicated BO dimension. Mixed-isotope tops
+    (e.g. ``-CH2D``) and heavy tops (e.g. ``-CF3``) return False.
+    """
+    u, v = dihedral.chain[1], dihedral.chain[2]
+    for anchor_idx, other_idx in ((u, v), (v, u)):
+        anchor = mol.GetAtomWithIdx(anchor_idx)
+        if anchor.GetHybridization() != Chem.HybridizationType.SP3:
+            continue
+        nbrs = [n for n in anchor.GetNeighbors() if n.GetIdx() != other_idx]
+        if (
+            len(nbrs) == 3
+            and all(n.GetAtomicNum() == 1 and n.GetDegree() == 1 for n in nbrs)
+            and len({n.GetIsotope() for n in nbrs}) == 1
+        ):
+            return True
+    return False
+
+
+def detect_dihedrals(
+    mol: Chem.Mol, *, drop_h_c3: bool = False
+) -> list[DihedralInfo]:
     """Detect the bonds to be treated as rotors.
 
     Uses the RDKit definition of rotatable bonds:
@@ -587,6 +920,10 @@ def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
 
     Args:
         mol: RDKit Mol object
+        drop_h_c3: If True, exclude trivial terminal H-only C3 tops
+            (``-CH3``, ``-NH3+``, ``-SiH3``; see :func:`is_trivial_h_c3_rotor`)
+            from the returned list, reducing BO dimensionality when local
+            relaxation is enabled.
 
     Returns:
         List of DihedralInfo objects describing each rotatable dihedral
@@ -615,5 +952,168 @@ def detect_dihedrals(mol: Chem.Mol) -> list[DihedralInfo]:
         if info is not None:
             dihedrals.append(info)
 
-    logger.info(f"Detected {len(dihedrals)} rotatable dihedral angles")
+    assign_dihedral_symmetries(mol, dihedrals)
+    n_total = len(dihedrals)
+    n_dropped = 0
+    if drop_h_c3:
+        dihedrals = [d for d in dihedrals if not is_trivial_h_c3_rotor(mol, d)]
+        n_dropped = n_total - len(dihedrals)
+
+    n_sym = sum(1 for d in dihedrals if d.symmetry_order > 1)
+    parts = []
+    if n_dropped:
+        parts.append(f"dropped {n_dropped} H-only C3 rotor(s) -> {len(dihedrals)} active")
+    if n_sym:
+        vol_cut = math.prod(d.symmetry_order for d in dihedrals)
+        parts.append(f"{n_sym} symmetric; {vol_cut}x search-volume reduction")
+    if parts:
+        logger.info(
+            f"Detected {n_total} rotatable dihedral angles ({'; '.join(parts)})"
+        )
+    else:
+        logger.info(f"Detected {n_total} rotatable dihedral angles")
     return dihedrals
+
+
+def _periodic_torsion_rms_deg(
+    a: np.ndarray, b: np.ndarray, periods_deg: np.ndarray
+) -> float | np.ndarray:
+    """Symmetry-reduced wrapped RMS torsion distance in degrees.
+
+    Reduces over the last axis and broadcasts over the rest, so it returns a float
+    for two torsion vectors and an array for batched (e.g. pairwise) inputs.
+    """
+    diff = np.abs(np.asarray(a) - np.asarray(b)) % periods_deg
+    diff = np.minimum(diff, periods_deg - diff)
+    rms = np.sqrt(np.mean(diff**2, axis=-1))
+    return float(rms) if rms.ndim == 0 else rms
+
+
+def ff_optimize_confs(
+    mol: Chem.Mol, max_iters: int, num_threads: int = 1
+) -> list[tuple[int, float]]:
+    """MMFF94-optimize every conformer of ``mol`` in place, falling back to UFF.
+
+    UFF is used when MMFF raises (e.g. unparameterized atoms) or reports a setup
+    failure (``-1``) for any conformer. Returns RDKit's per-conformer
+    ``(status, energy)`` list from whichever force field ran last.
+    """
+    try:
+        res = AllChem.MMFFOptimizeMoleculeConfs(
+            mol, numThreads=num_threads, maxIters=max_iters
+        )
+        if not any(rc == -1 for rc, _ in res):
+            return res
+    except Exception:
+        pass
+    return AllChem.UFFOptimizeMoleculeConfs(
+        mol, numThreads=num_threads, maxIters=max_iters
+    )
+
+
+def plan_etkdg_initial_points(
+    mol: Chem.Mol,
+    start_atoms: Atoms,
+    dihedrals: list[DihedralInfo],
+    max_points: int,
+    seed: int = 42,
+    pool_size: int | None = None,
+    cluster_deg: float = DEFAULT_ETKDG_CLUSTER_DEG,
+    fallback_cluster_deg: float = DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG,
+    feasible=None,
+    num_threads: int = 1,
+) -> np.ndarray:
+    """Generate distinct low-energy initial dihedral seeds via ETKDGv3 + MMFF94.
+
+    Embeds a dimension-scaled pool of ETKDGv3 conformers, optimizes them with
+    MMFF94 (UFF fallback), filters out any torsion vector that clashes when
+    applied to ``start_atoms``, sorts feasible conformers by force-field energy,
+    and greedily selects up to ``max_points`` distinct clusters separated in
+    symmetry-reduced wrapped torsion RMSD from ``start_atoms`` and each other.
+
+    If a small molecule genuinely has fewer than ``max_points`` distinct
+    rotamers, returns only the unique clusters found (avoiding wasted
+    evaluations on duplicate conformers); returns shape ``(0, d)`` if embedding
+    fails or no distinct feasible clusters exist.
+    """
+    d_eff = len(dihedrals)
+    if d_eff == 0 or max_points <= 0:
+        return np.empty((0, d_eff), dtype=float)
+
+    n_pool = pool_size if pool_size is not None else etkdg_seed_pool_size(d_eff)
+    periods_deg = np.array([di.period_deg for di in dihedrals], dtype=float)
+    start_coords = (
+        np.array([di.get_angle(start_atoms) for di in dihedrals], dtype=float)
+        % periods_deg
+    )
+
+    work = Chem.Mol(mol)
+    work.RemoveAllConformers()
+    params = AllChem.ETKDGv3()
+    params.useSmallRingTorsions = True
+    params.useMacrocycleTorsions = True
+    params.randomSeed = int(seed) + 10007
+    params.numThreads = num_threads
+    conf_ids = list(AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=params))
+    if not conf_ids:
+        fallback = AllChem.ETKDGv3()
+        fallback.randomSeed = int(seed) + 10007
+        fallback.useRandomCoords = True
+        fallback.numThreads = num_threads
+        conf_ids = list(
+            AllChem.EmbedMultipleConfs(work, numConfs=n_pool, params=fallback)
+        )
+    if not conf_ids:
+        return np.empty((0, d_eff), dtype=float)
+
+    res = ff_optimize_confs(work, max_iters=200, num_threads=num_threads)
+    energies = [float(e) for _, e in res]
+
+    raw_angles = np.empty((len(conf_ids), d_eff), dtype=float)
+    chains = [di.chain for di in dihedrals]
+    for idx, cid in enumerate(conf_ids):
+        conf = work.GetConformer(cid)
+        raw_angles[idx] = (
+            np.array(
+                [rdMolTransforms.GetDihedralDeg(conf, *c) for c in chains],
+                dtype=float,
+            )
+            % periods_deg
+        )
+
+    if feasible is not None:
+        ok_mask = np.asarray(feasible(raw_angles), dtype=bool)
+    else:
+        ok_mask = np.ones(len(conf_ids), dtype=bool)
+
+    feas_idx = np.nonzero(ok_mask)[0]
+    if feas_idx.size == 0:
+        return np.empty((0, d_eff), dtype=float)
+    order = feas_idx[np.argsort([energies[i] for i in feas_idx])]
+
+    selected: list[np.ndarray] = []
+    thresholds = (
+        (cluster_deg, fallback_cluster_deg)
+        if fallback_cluster_deg < cluster_deg
+        else (cluster_deg,)
+    )
+    for thresh in thresholds:
+        for i in order:
+            if len(selected) >= max_points:
+                break
+            cand = raw_angles[i]
+            if _periodic_torsion_rms_deg(cand, start_coords, periods_deg) < thresh:
+                continue
+            if all(
+                _periodic_torsion_rms_deg(cand, prev, periods_deg) >= thresh
+                for prev in selected
+            ):
+                selected.append(cand)
+        if len(selected) >= max_points:
+            break
+
+    logger.info(
+        f"ETKDG cluster seeding: selected {len(selected)}/{max_points} distinct "
+        f"cluster(s) from {len(conf_ids)} embeddings ({int(ok_mask.sum())} clash-free)"
+    )
+    return np.asarray(selected, dtype=float) if selected else np.empty((0, d_eff), dtype=float)

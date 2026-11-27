@@ -1,0 +1,412 @@
+"""Tests for exact graph-symmetry rotor periodicity across setup, surrogate, and ensemble."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pytest
+import torch
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+from bouquet.calc_rdkit import RDKitMMFFCalculator
+from bouquet.ensemble import _diversity_factor, _periodic_min_dist
+from bouquet.priors import DihedralPriorModule
+from bouquet.setup import detect_dihedrals, mol_to_ase_atoms
+from bouquet.solver import plan_initial_points
+from bouquet.subspace import LowEnergySubspace
+from bouquet.surrogate import (
+    _SymmetryScaledPrior,
+    _fit_gradient_gp,
+    _select_next_points_botorch,
+)
+
+
+def _orders_by_bond(smiles: str) -> dict[tuple[str, str], list[int]]:
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    dihs = detect_dihedrals(mol)
+    out: dict[tuple[str, str], list[int]] = {}
+    for d in dihs:
+        u, v = d.chain[1], d.chain[2]
+        key = tuple(sorted((mol.GetAtomWithIdx(u).GetSymbol(), mol.GetAtomWithIdx(v).GetSymbol())))
+        out.setdefault(key, []).append(d.symmetry_order)
+    return out
+
+
+def _orders(smiles: str) -> list[int]:
+    mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+    return sorted(d.symmetry_order for d in detect_dihedrals(mol))
+
+
+class TestSymmetryDetection:
+    def test_c3_terminal_tops(self):
+        # Butane: two terminal -CH3 (C3) + one central C-C (C1)
+        assert _orders("CCCC") == [1, 3, 3]
+        # Ethylammonium: -CH3 (C3) + -NH3+ (C3)
+        assert _orders("CC[NH3+]") == [3, 3]
+        # Trifluoroethane: -CH3 (C3) and -CF3 (C3) on the same bond -> lcm(3, 3) = 3
+        assert _orders("CC(F)(F)F") == [3]
+
+    def test_c2_planar_and_aromatic_rotors(self):
+        # Biphenyl: both sides C2 -> lcm(2, 2) = 2
+        assert _orders("c1ccccc1-c2ccccc2") == [2]
+        # para-Cl-biphenyl: both sides C2 -> 2
+        assert _orders("Clc1ccc(-c2ccccc2)cc1") == [2]
+        # para-CN-phenyl-ethane: -CH3 (3), Et-Ph (2)
+        assert _orders("CCc1ccc(C#N)cc1") == [2, 3]
+        # 9-anthryl-ethane: -CH3 (3), Et-anthryl (2)
+        assert _orders("CCc1c2ccccc2cc2ccccc12") == [2, 3]
+        # 4-pyridyl-phenyl: both sides C2 -> 2
+        assert _orders("c1ccc(-c2ccncc2)cc1") == [2]
+        # Nitrobenzene & benzoate: -NO2 / -CO2- (2) + Ph (2) -> 2
+        assert _orders("O=[N+]([O-])c1ccccc1") == [2]
+        assert _orders("O=C([O-])c1ccccc1") == [2]
+
+    def test_c6_combined_c2_and_c3(self):
+        assert _orders("Cc1ccccc1") == [6]          # toluene
+        assert _orders("FC(F)(F)c1ccccc1") == [6]   # benzotrifluoride
+        assert _orders("[n+]1(ccccc1)C") == [6]     # N-methylpyridinium
+
+    def test_negative_controls_stay_order_1(self):
+        # meta-Cl-phenyl & 2-naphthyl & 2-pyridyl are NOT C2 symmetric
+        assert _orders("Clc1cccc(-c2ccccc2)c1") == [2]  # unsubstituted Ph side is still C2!
+        assert _orders("CCc1cccc(Cl)c1") == [1, 3]      # m-Cl-Ph is 1, -CH3 is 3
+        assert _orders("CCc1ccc2ccccc2c1") == [1, 3]    # 2-naphthyl is 1, -CH3 is 3
+        assert _orders("CCc1ccccn1") == [1, 3]          # 2-pyridyl is 1, -CH3 is 3
+        # para-OH and para-Me have internal rotatable bonds -> phenyl bond stays 1
+        assert _orders("CCc1ccc(O)cc1") == [1, 1, 3]
+        assert _orders("CCc1ccc(C)cc1") == [1, 3, 3]
+        # Neutral cysteine: pyramidal -NH2 must stay 1; -COOH has -OH rotor -> 1
+        assert _orders("C([C@@H](C(=O)O)N)S") == [1, 1, 1, 1, 1]
+        # Zwitterionic cysteine: -CO2- is 2, -NH3+ is 3
+        assert _orders("C([C@@H](C(=O)[O-])[NH3+])S") == [1, 1, 2, 3]
+        # Neutral aniline: pyramidal-prone -NH2 stays 1 (phenyl side is C2 -> 2)
+        assert _orders("Nc1ccccc1") == [2]
+        # t-Bu-benzene: 3 methyls (3), stem bond has C2 from phenyl side -> [2, 3, 3, 3]
+        assert _orders("CC(C)(C)c1ccccc1") == [2, 3, 3, 3]
+        # Chiral center next to phenyl: phenyl flip is STILL exact C2
+        assert _orders("C[C@H](O)c1ccccc1") == [1, 2, 3]
+
+    @pytest.mark.parametrize(
+        "smiles",
+        [
+            "CCCC",
+            "Cc1ccccc1",
+            "C[C@H](O)c1ccccc1",
+            "O=[N+]([O-])c1ccccc1",
+            "O=C([O-])c1ccccc1",
+            "C([C@@H](C(=O)[O-])[NH3+])S",
+        ],
+    )
+    def test_detected_symmetries_preserve_mmff_energy(self, smiles):
+        """Rotating any symmetric dihedral by 360/m leaves the relaxed energy invariant."""
+        from bouquet.assess import relax_structure
+
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        params = AllChem.ETKDGv3()
+        params.randomSeed = 7
+        AllChem.EmbedMolecule(mol, params)
+        AllChem.MMFFOptimizeMolecule(mol)
+        dihs = detect_dihedrals(mol)
+        calc = RDKitMMFFCalculator(mol)
+        atoms = mol_to_ase_atoms(mol)
+        e0, atoms = relax_structure(atoms, calc, calc, steps=None)
+
+        sym_dihs = [d for d in dihs if d.symmetry_order > 1]
+        assert sym_dihs
+        for d in sym_dihs:
+            rot = atoms.copy()
+            rot.set_dihedral(*d.chain, d.get_angle(rot) + d.period_deg, indices=d.group)
+            e1, _ = relax_structure(rot, calc, calc, steps=None)
+            assert abs(e1 - e0) < 1e-4
+
+
+class TestSymmetryInSurrogateAndEnsemble:
+    def test_select_next_points_stays_in_irreducible_domain(self):
+        """Proposals for symmetric rotors stay inside [0, 360 / m_j)."""
+        torch.manual_seed(0)
+        sym = (1, 2, 3)
+        X = torch.tensor(
+            [[10.0, 20.0, 30.0], [180.0, 90.0, 60.0], [270.0, 150.0, 110.0], [50.0, 10.0, 5.0]],
+            dtype=torch.float64,
+        )
+        y = torch.tensor([0.0, -0.2, 0.3, -0.1], dtype=torch.float64)
+        cand = _select_next_points_botorch(
+            X, y, acq_num_restarts=4, acq_raw_samples=8, symmetry_orders=sym
+        )
+        assert 0.0 <= cand[0] <= 360.0
+        assert 0.0 <= cand[1] <= 180.0
+        assert 0.0 <= cand[2] <= 120.0
+
+    def test_gradient_gp_chain_rule_with_symmetry_order(self):
+        """Gradient GP with m=3 matches exact derivative scaling for E(theta) = -cos(3*theta)."""
+        # E(theta) = -cos(3*theta_rad), dE/dtheta_rad = 3*sin(3*theta_rad), period 120 deg
+        deg = torch.linspace(5.0, 115.0, 8, dtype=torch.float64).unsqueeze(-1)
+        rad = deg * (math.pi / 180.0)
+        raw_y = -torch.cos(3.0 * rad).squeeze(-1)
+        grads = (3.0 * torch.sin(3.0 * rad))  # (8, 1) eV/rad
+
+        sym = (3,)
+        periods = torch.tensor([120.0], dtype=torch.float64)
+        train_x = torch.remainder(deg, periods) / periods
+        neg = (-raw_y)[:, None]
+        y_std = neg.std(dim=0, keepdim=True)
+        neg_mean = neg.mean(dim=0, keepdim=True)
+        train_y = (neg - neg_mean) / y_std
+        energy_cap = torch.full_like(raw_y, 10.0)
+
+        gp = _fit_gradient_gp(
+            train_x, train_y, raw_y, energy_cap, grads, y_std, symmetry_orders=sym
+        )
+        # Predict at 60 deg (= u=0.5, true E = -cos(pi) = +1.0) vs 180 deg (equivalent!)
+        u_test = torch.tensor([[0.5], [0.0]], dtype=torch.float64).unsqueeze(1)
+        with torch.no_grad():
+            mu_std = gp.posterior(u_test).mean.reshape(-1)
+        e_pred = -(mu_std * y_std.item() + neg_mean.item())
+        assert float(e_pred[0]) == pytest.approx(1.0, abs=0.05)   # 60 deg -> +1.0
+        assert float(e_pred[1]) == pytest.approx(-1.0, abs=0.05)  # 0 deg -> -1.0
+
+    def test_symmetry_scaled_prior_averages_equivalent_angles(self):
+        """A folded u scores the MEAN density over its m equivalent full-turn angles."""
+        pm = DihedralPriorModule(
+            dim=2,
+            univariate_assignments={0: "sp3_sp3", 1: "sp3_sp2"},
+            bivariate_assignments={},
+            univariate_priors={},
+            bivariate_priors={},
+            input_in_degrees=False,
+        )
+        wrapped = _SymmetryScaledPrior(pm, (3, 2))
+        u = torch.tensor([[[0.5, 0.5]]], dtype=torch.float64)
+        # Folded (0.5, 0.5) under (C3, C2) = {60, 180, 300} deg x {90, 270} deg.
+        reps0 = [60.0, 180.0, 300.0]
+        reps1 = [90.0, 270.0]
+
+        def factor(d, deg):  # per-dim log density via a 1-D-informative module
+            x = torch.zeros(1, 1, 2, dtype=torch.float64)
+            x[..., d] = deg / 360.0
+            return pm.univariate_dists[d].log_prob(pm._to_radians(x[..., d]))
+
+        lp0 = torch.logsumexp(torch.stack([factor(0, a) for a in reps0]), 0) - math.log(3)
+        lp1 = torch.logsumexp(torch.stack([factor(1, a) for a in reps1]), 0) - math.log(2)
+        expected = (lp0 + lp1) / pm.n_active_dims
+        assert torch.allclose(wrapped(u), torch.clamp(expected, min=-20.0), atol=1e-12)
+
+    def test_symmetry_scaled_prior_period_boundaries_agree(self):
+        """u=0 and u=1 are the same physical angle and must score identically,
+        for univariate and (jointly) bivariate factors."""
+        biv = {"t": {"components": [{"mu1_deg": 70.0, "mu2_deg": 200.0, "kappa1": 4.0,
+                                     "kappa2": 3.0, "correlation": 1.5}],
+                     "weights": [1.0]}}
+        pm = DihedralPriorModule(
+            dim=3,
+            univariate_assignments={0: "sp3_sp3"},
+            bivariate_assignments={(1, 2): "t"},
+            univariate_priors={},
+            bivariate_priors=biv,
+            input_in_degrees=False,
+        )
+        wrapped = _SymmetryScaledPrior(pm, (3, 2, 1))
+        lo = torch.tensor([[[0.0, 0.0, 0.3]]], dtype=torch.float64)
+        hi = torch.tensor([[[1.0, 1.0, 0.3]]], dtype=torch.float64)
+        assert torch.allclose(wrapped(lo), wrapped(hi), atol=1e-12)
+
+    def test_order_one_factors_are_unchanged(self):
+        pm = DihedralPriorModule(
+            dim=2, univariate_assignments={0: "sp3_sp3", 1: "sp3_sp2"},
+            bivariate_assignments={}, univariate_priors={}, bivariate_priors={},
+            input_in_degrees=False,
+        )
+        x = torch.rand(4, 1, 2, dtype=torch.float64)
+        assert torch.equal(_SymmetryScaledPrior(pm, (1, 1))(x), pm(x))
+
+    def test_ensemble_periodic_distance_folds_symmetric_rotors(self):
+        periods = torch.tensor([180.0, 120.0], dtype=torch.float64)
+        minima = torch.tensor([[10.0, 20.0]], dtype=torch.float64)
+        # (190, 140) is symmetry-equivalent to (10, 20) under (C2, C3) -> distance 0
+        equiv = torch.tensor([190.0, 140.0], dtype=torch.float64)
+        assert float(_periodic_min_dist(equiv, minima, periods_deg=periods)) == pytest.approx(0.0, abs=1e-12)
+        # _diversity_factor suppresses at u = (10/180, 20/120)
+        u_at = torch.tensor([[[10.0 / 180.0, 20.0 / 120.0]]], dtype=torch.float64)
+        assert float(_diversity_factor(u_at, minima, 0.5, periods_deg=periods)) == pytest.approx(0.5, abs=1e-9)
+
+    def test_plan_initial_points_dedups_symmetric_peaks(self):
+        pm = DihedralPriorModule(
+            dim=1,
+            univariate_assignments={0: "sp3_sp3"},  # peaks at 60, 180, 300
+            bivariate_assignments={},
+            univariate_priors={},
+            bivariate_priors={},
+        )
+        pts = plan_initial_points(
+            pm, 1, np.array([0.0]), init_steps=5, grid_budget=64, seed=0,
+            symmetry_orders=(3,),
+        )
+        # 60, 180, 300 all fold to 60 mod 120 -> single unique peak!
+        assert len(pts) == 1
+        assert float(pts[0, 0]) == pytest.approx(60.0)
+
+    def test_low_energy_subspace_dedups_symmetric_copies(self):
+        ss = LowEnergySubspace(n_dihedrals=2, dedup_thresh_deg=15.0, symmetry_orders=(2, 3))
+        coords = np.array([[10.0, 20.0], [190.0, 140.0], [90.0, 80.0]])
+        energies = np.array([0.0, 0.01, 0.02])
+        ss.update(coords, energies)
+        # Row 1 is symmetry-equivalent to row 0 -> only 2 elite conformers kept
+        assert ss.n_elite == 2
+
+
+class TestSymmetryLengthscaleCompensation:
+    @pytest.mark.parametrize("arm", ["product", "ard"])
+    def test_value_kernel_periodicity_and_local_curvature(self, arm):
+        """m_j^2 compensation keeps 360/m_j periodicity AND matches nosym local curvature."""
+        from bouquet.surrogate import make_covar_module
+
+        sym = (1, 2, 3)
+        k_sym = make_covar_module(3, arm=arm, symmetry_orders=sym).double()
+        k_nosym = make_covar_module(3, arm=arm, symmetry_orders=None).double()
+
+        # Set identical period=1.0, outputscale=1.0, and base lengthscales
+        for k in (k_sym, k_nosym):
+            k.outputscale = 1.0
+        base_ls = torch.tensor([[0.8, 1.1, 0.6]], dtype=torch.float64) if arm == "ard" else 0.8
+        k_sym.base_kernel.period_length = 1.0
+        k_sym.base_kernel.lengthscale = base_ls
+        if arm == "ard":
+            k_nosym.base_kernel.period_length = 1.0
+            k_nosym.base_kernel.lengthscale = base_ls
+        else:
+            k_nosym.base_kernel.base_kernel.period_length = 1.0
+            k_nosym.base_kernel.base_kernel.lengthscale = base_ls
+
+        # Small physical perturbation dtheta in degrees -> identical kernel value to O(eps^4)
+        theta0 = torch.tensor([[25.0, 40.0, 15.0]], dtype=torch.float64)
+        dtheta = torch.tensor([[1.0, -0.8, 0.5]], dtype=torch.float64)  # small angles (deg)
+        periods = torch.tensor([360.0, 180.0, 120.0], dtype=torch.float64)
+
+        u0 = torch.remainder(theta0, periods) / periods
+        u1 = torch.remainder(theta0 + dtheta, periods) / periods
+        x0 = theta0 / 360.0
+        x1 = (theta0 + dtheta) / 360.0
+
+        val_sym = k_sym(u0, u1).to_dense().item()
+        val_nosym = k_nosym(x0, x1).to_dense().item()
+        assert val_sym == pytest.approx(val_nosym, rel=1e-3, abs=1e-5)
+
+        # Exact periodicity at 360/m_j
+        u_shift = torch.remainder(theta0 + periods, periods) / periods
+        assert k_sym(u0, u_shift).to_dense().item() == pytest.approx(1.0, abs=1e-12)
+
+        # diag=True matches diagonal of full Gram matrix, including batched queries
+        U = torch.rand(4, 3, dtype=torch.float64)
+        assert torch.allclose(
+            k_sym(U, U, diag=True), k_sym(U, U).to_dense().diag(), atol=1e-12
+        )
+        Ub = torch.rand(5, 2, 3, dtype=torch.float64)
+        assert torch.allclose(
+            k_sym(Ub, Ub, diag=True),
+            torch.diagonal(k_sym(Ub, Ub).to_dense(), dim1=-2, dim2=-1),
+            atol=1e-12,
+        )
+
+    @pytest.mark.parametrize("ard", [False, True])
+    def test_grad_kernel_matches_autograd_with_symmetry_orders(self, ard):
+        """PeriodicKernelGrad(symmetry_orders=...) matches autograd across all blocks."""
+        from torch.func import jacrev
+
+        from bouquet.periodic_grad_kernel import PeriodicKernelGrad
+
+        torch.manual_seed(42)
+        sym = (1, 2, 3)
+        d = len(sym)
+        sym_sq = torch.tensor([1.0, 4.0, 9.0], dtype=torch.float64)
+        base_ell = torch.tensor([0.7, 1.1, 0.5], dtype=torch.float64) if ard else torch.tensor([0.7], dtype=torch.float64)
+        eff_ell = base_ell * sym_sq
+        period = torch.ones(d, dtype=torch.float64)
+
+        kern = (
+            PeriodicKernelGrad(ard_num_dims=d, symmetry_orders=sym)
+            if ard
+            else PeriodicKernelGrad(symmetry_orders=sym)
+        ).double()
+        kern.lengthscale = base_ell.reshape(1, -1)
+        kern.period_length = torch.ones((1, d if ard else 1), dtype=torch.float64)
+
+        X = torch.rand(4, d, dtype=torch.float64)
+        K = kern.forward(X, X)
+
+        def k_scalar(a, b):
+            u = math.pi * (a - b) / period
+            return torch.exp((-2.0 * torch.sin(u).pow(2) / eff_ell).sum())
+
+        gA = jacrev(k_scalar, argnums=0)
+        gB = jacrev(k_scalar, argnums=1)
+        H = jacrev(jacrev(k_scalar, argnums=0), argnums=1)
+        blk = d + 1
+        ref = torch.zeros(4 * blk, 4 * blk, dtype=torch.float64)
+        for i in range(4):
+            for j in range(4):
+                b = torch.zeros(blk, blk, dtype=torch.float64)
+                b[0, 0] = k_scalar(X[i], X[j])
+                b[0, 1:] = gB(X[i], X[j])
+                b[1:, 0] = gA(X[i], X[j])
+                b[1:, 1:] = H(X[i], X[j])
+                ref[i * blk : (i + 1) * blk, j * blk : (j + 1) * blk] = b
+
+        assert torch.allclose(K, ref, atol=1e-9)
+        assert torch.allclose(kern.forward(X, X, diag=True), ref.diag(), atol=1e-9)
+        assert torch.allclose(kern.value_value(X, X), ref[::blk, ::blk], atol=1e-9)
+
+        # Batched diag=True with unbatched kernel
+        Xb = torch.rand(3, 2, d, dtype=torch.float64)
+        K_b = kern.forward(Xb, Xb)
+        assert torch.allclose(
+            kern.forward(Xb, Xb, diag=True),
+            torch.diagonal(K_b, dim1=-2, dim2=-1),
+            atol=1e-9,
+        )
+
+
+class TestDropTrivialHC3Rotors:
+    def _kept_orders(self, smiles: str) -> list[int]:
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
+        return sorted(d.symmetry_order for d in detect_dihedrals(mol, drop_h_c3=True))
+
+    def test_drops_h_only_c3_and_preserves_heavy_and_c2_rotors(self):
+        assert self._kept_orders("CCCC") == [1]                  # 2 -CH3 dropped
+        assert self._kept_orders("Cc1ccccc1") == []              # toluene -> 0D
+        assert self._kept_orders("CC[NH3+]") == []               # -CH3 and -NH3+ dropped
+        assert self._kept_orders("CCO") == [1]                   # -CH3 dropped, -OH kept
+        assert self._kept_orders("CC(C)(C)c1ccccc1") == [2]      # 3 -CH3 dropped, Ph C2 kept
+        assert self._kept_orders("FC(F)(F)c1ccccc1") == [6]      # -CF3 is heavy -> kept
+        assert self._kept_orders("Nc1ccccc1") == [2]             # -NH2 is not C3 -> kept
+        assert self._kept_orders("C([C@@H](C(=O)[O-])[NH3+])S") == [1, 1, 2]  # -NH3+ dropped, -CO2- C2 kept
+
+    def test_mixed_isotope_methyl_not_dropped(self):
+        # -CH2D is NOT C3-symmetric and must be kept; -CD3 IS C3-symmetric
+        mol_ch2d = Chem.AddHs(Chem.MolFromSmiles("[2H]CC(F)(F)F"))
+        assert len(detect_dihedrals(mol_ch2d, drop_h_c3=True)) == 1
+        mol_cd3 = Chem.AddHs(Chem.MolFromSmiles("[2H]C([2H])([2H])C(F)(F)F"))
+        assert len(detect_dihedrals(mol_cd3, drop_h_c3=True)) == 0
+
+    def test_cli_flag_default_and_opt_out(self):
+        from bouquet.cli import build_parser
+
+        parser = build_parser()
+        assert parser.parse_args(["--smiles", "CCCC"]).drop_h_c3 is True
+        assert parser.parse_args(["--smiles", "CCCC", "--drop-h-rotors"]).drop_h_c3 is True
+        assert parser.parse_args(["--smiles", "CCCC", "--no-drop-h-rotors"]).drop_h_c3 is False
+
+    def test_zero_active_rotors_runs_cleanly(self):
+        from bouquet.setup import get_initial_structure
+        from bouquet.solver import run_optimization
+
+        atoms, mol = get_initial_structure("Cc1ccccc1", seed=1)
+        dihs = detect_dihedrals(mol, drop_h_c3=True)
+        assert dihs == []
+        calc = RDKitMMFFCalculator(mol)
+        final_atoms = run_optimization(
+            atoms, dihs, n_steps=5, calc=calc, relaxCalc=calc,
+            init_steps=2, out_dir=None, relax=True, seed=1, mol=mol,
+        )
+        assert len(final_atoms) == len(atoms)

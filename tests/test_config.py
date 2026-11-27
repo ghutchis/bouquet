@@ -8,8 +8,9 @@ from bouquet.config import (
     Configuration,
     DEFAULT_NUM_STEPS,
     DEFAULT_INIT_STEPS,
-    AUTO_STEPS_THRESHOLDS,
-    AUTO_STEPS_DEFAULT,
+    AUTO_STEPS_FLOOR,
+    AUTO_STEPS_CAP,
+    auto_total_budget,
 )
 
 
@@ -43,7 +44,10 @@ class TestConfiguration:
         assert config.energy_method == "gfn2"
         assert config.optimizer_method == "gfnff"
         assert config.num_steps == DEFAULT_NUM_STEPS
-        assert config.init_steps == DEFAULT_INIT_STEPS
+        assert config.init_steps is None
+        assert config.resolve_init_steps(1) == DEFAULT_INIT_STEPS
+        assert config.resolve_init_steps(7) == 9
+        assert config.resolve_init_steps(15) == 12
         assert config.auto_steps is False
         assert config.relax is True
         assert config.num_threads == 4
@@ -108,38 +112,28 @@ class TestComputeAutoSteps:
         assert result == 50
 
     def test_auto_steps_few_dihedrals(self):
-        """Test auto_steps with few dihedrals (<=3)."""
-        config = Configuration(smiles="C", auto_steps=True)
-        result = config.compute_auto_steps(num_dihedrals=2, num_initial=5)
-        # Should use threshold of 25, minus initial guesses
-        assert result == 25 - 5
-
-    def test_auto_steps_medium_dihedrals(self):
-        """Test auto_steps with medium dihedrals (<=5)."""
+        """Test auto_steps with few dihedrals: budget = round(1.95*d^3) minus initial."""
         config = Configuration(smiles="C", auto_steps=True)
         result = config.compute_auto_steps(num_dihedrals=4, num_initial=5)
-        # Should use threshold of 50, minus initial guesses
-        assert result == 50 - 5
+        assert result == auto_total_budget(4) - 5  # 125 - 5
 
-    def test_auto_steps_many_dihedrals(self):
-        """Test auto_steps with many dihedrals (<=7)."""
+    def test_auto_steps_d1_floor(self):
+        """d=1 gets the fixed floor budget, not the near-zero power law."""
         config = Configuration(smiles="C", auto_steps=True)
-        result = config.compute_auto_steps(num_dihedrals=6, num_initial=5)
-        # Should use threshold of 100, minus initial guesses
-        assert result == 100 - 5
+        result = config.compute_auto_steps(num_dihedrals=1, num_initial=5)
+        assert result == AUTO_STEPS_FLOOR - 5
 
-    def test_auto_steps_very_many_dihedrals(self):
-        """Test auto_steps with very many dihedrals (>7)."""
+    def test_auto_steps_high_d_cap(self):
+        """Very high d saturates at the cap."""
         config = Configuration(smiles="C", auto_steps=True)
-        result = config.compute_auto_steps(num_dihedrals=10, num_initial=5)
-        # Should use default of 200, minus initial guesses
-        assert result == AUTO_STEPS_DEFAULT - 5
+        result = config.compute_auto_steps(num_dihedrals=15, num_initial=5)
+        assert result == AUTO_STEPS_CAP - 5
 
     def test_auto_steps_returns_zero_minimum(self):
         """Test that auto_steps doesn't return negative values."""
         config = Configuration(smiles="C", auto_steps=True)
         result = config.compute_auto_steps(num_dihedrals=2, num_initial=100)
-        # Should return max(0, 25 - 100) = 0
+        # budget(2)=16, so max(0, 16 - 100) = 0
         assert result == 0
 
 
@@ -158,17 +152,43 @@ class TestConstants:
         # rdkit force fields have no optional deps, so they're always available
         assert {"mmff", "uff"} <= set(avail)
 
-    def test_auto_steps_thresholds_ordering(self):
-        """Test that auto_steps thresholds are properly ordered."""
-        thresholds = sorted(AUTO_STEPS_THRESHOLDS.keys())
-        assert thresholds == [3, 5, 7]
-
-        # Values should increase with thresholds
-        values = [AUTO_STEPS_THRESHOLDS[k] for k in thresholds]
-        assert values == sorted(values)
+    def test_auto_steps_budget_monotonic_floor_cap(self):
+        """The budget is non-decreasing in d, floored at d=1 and capped at high d."""
+        vals = [auto_total_budget(d) for d in range(0, 16)]
+        assert vals == sorted(vals)                      # non-decreasing
+        assert auto_total_budget(0) == AUTO_STEPS_FLOOR   # floor
+        assert auto_total_budget(1) == AUTO_STEPS_FLOOR
+        assert auto_total_budget(4) == 125                # round(1.95*64)
+        assert max(vals) <= AUTO_STEPS_CAP
+        assert auto_total_budget(20) == AUTO_STEPS_CAP    # saturates
 
     def test_default_values(self):
         """Test default constants are reasonable."""
         assert DEFAULT_NUM_STEPS > 0
         assert DEFAULT_INIT_STEPS > 0
-        assert AUTO_STEPS_DEFAULT > max(AUTO_STEPS_THRESHOLDS.values())
+        assert AUTO_STEPS_CAP > AUTO_STEPS_FLOOR
+
+
+class TestCliAndAutoResolution:
+    """Tests for CLI defaults and auto-resolution under --no-relax."""
+
+    def test_cli_relax_defaults_true_and_supports_no_relax(self):
+        from bouquet.cli import build_parser
+
+        parser = build_parser()
+        assert parser.parse_args(["--smiles", "CCCC"]).relax is True
+        assert parser.parse_args(["--smiles", "CCCC", "--no-relax"]).relax is False
+        assert parser.parse_args(["--smiles", "CCCC", "--relax"]).relax is True
+
+    def test_auto_collective_moves_disable_when_relax_false(self):
+        from bouquet.config import RunOptions
+
+        opts = RunOptions()
+        assert opts.resolve_lowmode_prob(15, relax=True) > 0.0
+        assert opts.resolve_lowmode_prob(15, relax=False) == 0.0
+        groups = [list(range(6))] + [[i] for i in range(6, 16)]
+        assert opts.resolve_category_prob(16, groups, relax=True) > 0.0
+        assert opts.resolve_category_prob(16, groups, relax=False) == 0.0
+        # Explicit user value still passes through (so solver raises clearly).
+        explicit = RunOptions(lowmode_prob=0.3)
+        assert explicit.resolve_lowmode_prob(15, relax=False) == 0.3

@@ -19,7 +19,7 @@ import logging
 import time
 from dataclasses import dataclass, field, InitVar
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -27,14 +27,18 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator
 
 from bouquet.assess import (
+    _reset_calculators,
     evaluate_energy,
     evaluate_energy_with_gradient,
     relax_structure,
 )
 from bouquet.config import (
     ACQ_NUM_RESTARTS,
+    GRADIENT_MATRIX_CAP,
+    GRADIENT_WINDOW_MIN,
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
+    DEFAULT_GC_WARMUP,
     DEFAULT_RELAXATION_STEPS,
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
@@ -50,31 +54,32 @@ from bouquet.io import (
     initialize_structure_log,
     save_structure,
 )
+from bouquet.clash import build_feasibility
 from bouquet.priors import DihedralPriorModule
-from bouquet.setup import DihedralInfo, bonds_broken, geometry_bond_set
+from bouquet.setup import (
+    DihedralInfo, bonds_broken, geometry_bond_set,
+)
+
+if TYPE_CHECKING:
+    from rdkit import Chem
 
 # The GP/acquisition, collective-move, and ensemble machinery split out of this
-# file. Imported here both because the loop/orchestrator below call into them and
-# to re-export the moved names from ``bouquet.solver`` (tests and external callers
-# still import several via ``solver._name``).
+# file. Imported here because the loop/orchestrator below call into them (plus a
+# minimal set of historical re-exports still imported via ``solver.*`` by tests).
 from bouquet.surrogate import (
-    _GP_FIT_STEPS,
-    _cert_sobol_pool,
-    _compute_certificate,
+    _FEASIBLE_MAX_CHUNKS,
     _fit_gradient_gp,
-    _fit_value_gp,
     _periodic_covar_module,
-    _restrict_gradient_mask,
+    _periods_deg_array,
     _select_next_points_botorch,
-    _suppress_fit_warnings,
 )
 from bouquet.solver_moves import (
     _build_category_groups,
     _category_move,
-    _collective_kick_relax,
-    _collective_result,
     _low_mode_move,
-    _sample_category_z_from_prior,
+    _propose_gc_crossover,
+    _species_guard,
+    build_graph_cuts,
 )
 from bouquet.solver_ensemble import (
     _build_selection_gp,
@@ -84,8 +89,6 @@ from bouquet.solver_ensemble import (
     _perform_ensemble_exploration,
     _perform_ensemble_relaxation,
     _select_ensemble_candidates,
-    _select_exploration_point,
-    _valid_observation_idx,
     tight_optimize_and_weight,
 )
 
@@ -122,12 +125,29 @@ class OptimizationState:
     device: torch.device = field(default_factory=_get_device)
     init_steps: int = 0
     best_step: int = 0
-    # --retain-bonds: the covalent bond set of the initial structure that every
-    # evaluated geometry must preserve (None disables the check). Broken-bond
-    # evaluations get a failure energy so they're never selected. n_bond_breaks
-    # counts how many were rejected (logged once at the end).
+    # Species guard: the covalent bond set of the initial structure, used as the
+    # reference for both directions of connectivity change (None disables both
+    # checks). Rejected evaluations get a failure energy so they're never selected.
+    #
+    # check_bond_forms (default on) rejects geometries that gained a bond -- a
+    # relaxation that drove atoms through each other. This is not a rare edge
+    # case: in the d=8-12 benchmark it was an absorbing state, one run entering
+    # it at step 0 and spending 1159 of 1232 steps there, and one such run was
+    # reported as a *success* at -4856 kcal/mol.
+    #
+    # check_bond_breaks (--retain-bonds, default off) additionally rejects
+    # geometries that lost a bond. Left opt-in because dissociation is sometimes
+    # legitimate chemistry on these surfaces (zwitterion proton transfer), so
+    # forcing it on would change answers for reasons unrelated to the collapse.
     required_bonds: set | None = None
+    check_bond_forms: bool = True
+    check_bond_breaks: bool = False
     n_bond_breaks: int = 0
+    n_bond_forms: int = 0
+    n_collective_clash_rejects: int = 0
+    # Steric-clash feasibility test restricting the acquisition domain to the
+    # clash-free region (None searches the full torsion box). See bouquet.clash.
+    clash_feasibility: Callable | None = None
     add_entry: Callable | None = None
     # Optional per-BO-step stopping-rule certificate logger (see
     # _run_optimization_loop / io.create_certificate_logger). When set, each step
@@ -164,10 +184,13 @@ class OptimizationState:
     # Acquisition-optimizer effort (optimize_acqf); see Configuration.
     acq_num_restarts: int = ACQ_NUM_RESTARTS
     acq_raw_samples: int = ACQ_RAW_SAMPLES
+    kernel_arm: str = "product"
     # High-leverage gradient subset: keep gradients for only this many points
     # (0 = all). gradient_keep = recent|best|both. See _restrict_gradient_mask.
     gradient_window: int = 0
-    gradient_keep: str = "recent"
+    gradient_matrix_cap: int = GRADIENT_MATRIX_CAP
+    gradient_window_min: int = GRADIENT_WINDOW_MIN
+    gradient_keep: str = "both"
     # Value-only-GP lengthscale prior: "none" (free fit, historical) or
     # "dim_scaled" (Hvarfner dimensionality-scaled LogNormal). See
     # _periodic_covar_module.
@@ -215,10 +238,25 @@ class OptimizationState:
     _cat_Z: list = field(default_factory=list)
     _cat_Y: list = field(default_factory=list)
 
+    # Graph-aware genetic subtree crossover (Phase 3): every gc_every BO steps
+    # (starting at step >= gc_warmup), proposes an MMFF-screened novel clash-free
+    # subtree cross of top distinct basins and evaluates it on the same BO surface.
+    gc_every: int = 0
+    gc_warmup: int = DEFAULT_GC_WARMUP
+    gc_cuts: list | None = None
+    gc_mol: object | None = None
+    gc_geom: object | None = None
+    gc_rng: np.random.Generator | None = None
+    gc_count: int = 0
+    gc_best_count: int = 0
+
     # PiBO fields
     prior_module: DihedralPriorModule | None = None
     prior_exponent: float = DEFAULT_PRIOR_EXPONENT
     prior_decay: float = DEFAULT_PRIOR_DECAY
+    # Exact per-dihedral rotational symmetry orders (m_j in {1, 2, 3, 6});
+    # each dihedral j has irreducible period 360 / m_j degrees.
+    symmetry_orders: tuple[int, ...] | None = None
 
     # Observation buffers: pre-sized tensors whose first `_n` rows are the logical
     # observations (exposed via the observed_* properties). init=False -- populated
@@ -344,7 +382,10 @@ class OptimizationState:
         self.grad_refit_every = opts.grad_refit_every
         self.acq_num_restarts = opts.acq_num_restarts
         self.acq_raw_samples = opts.acq_raw_samples
+        self.kernel_arm = opts.kernel_arm
         self.gradient_window = opts.gradient_window
+        self.gradient_matrix_cap = opts.gradient_matrix_cap
+        self.gradient_window_min = opts.gradient_window_min
         self.gradient_keep = opts.gradient_keep
         self.lengthscale_prior = lengthscale_prior
 
@@ -378,6 +419,7 @@ def _setup_initial_state(
     relax: bool,
     out_dir: Path | None,
     use_gradients: bool = False,
+    structure_log_path: Path | None = None,
 ) -> OptimizationState:
     """Perform initial relaxation, evaluate starting point, and set up logging.
 
@@ -405,24 +447,27 @@ def _setup_initial_state(
         init_atoms = atoms
 
     # Evaluate initial point (with dE/dtheta when gradients are enabled, so the
-    # start contributes a gradient observation like every other point).
+    # start contributes a gradient observation like every other point). When
+    # relax=True we already relaxed init_atoms above, so evaluate directly at
+    # its geometry without repeating a redundant 10-step relaxation.
     start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
     logger.info(f"Initial dihedral angles: {start_coords}")
     if use_gradients:
         start_energy, start_atoms, start_gradient = evaluate_energy_with_gradient(
-            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax
+            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax=False
         )
     else:
         start_energy, start_atoms = evaluate_energy(
-            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax
+            start_coords, init_atoms, dihedrals, calc, relaxCalc, relax=False
         )
         start_gradient = np.full(len(start_coords), np.nan, dtype=float)
     logger.info(f"Computed initial energy: {start_energy}")
 
-    # Set up logging if output directory provided
+    # Set up logging if an output directory (or an explicit structure-log path,
+    # used by the kernel benchmarks to collect every trial's trail) is provided.
     add_entry = None
-    if out_dir is not None:
-        log_path, ens_path = initialize_structure_log(out_dir)
+    if out_dir is not None or structure_log_path is not None:
+        log_path, ens_path = initialize_structure_log(out_dir, structure_log_path)
         add_entry = create_structure_logger(log_path, ens_path, start_energy)
         add_entry(start_coords, start_atoms, start_energy)
 
@@ -445,6 +490,7 @@ def _setup_initial_state(
         device=device,
         best_step=0,
         add_entry=add_entry,
+        symmetry_orders=tuple(d.symmetry_order for d in dihedrals),
     )
     # Keep observed_atoms aligned with the initial [0.0] observation.
     state.observed_atoms.append(start_atoms.copy())
@@ -459,6 +505,7 @@ def plan_initial_points(
     grid_budget: int,
     seed: int,
     max_points: int | None = None,
+    symmetry_orders: tuple[int, ...] | list[int] | None = None,
 ) -> np.ndarray:
     """Plan initial dihedral guesses from the peaks of a dihedral prior.
 
@@ -494,6 +541,7 @@ def plan_initial_points(
     """
     axes, uniform_dims = prior_module.peak_modes()
     start_coords = np.asarray(start_coords, dtype=float)
+    periods_deg = _periods_deg_array(n_dihedrals, symmetry_orders)
     rng = np.random.default_rng(seed)
 
     grid_size = 1
@@ -512,15 +560,21 @@ def plan_initial_points(
             key=lambda combo: float(np.prod([w for _v, w in combo])),
             reverse=True,
         )
-        if max_points is not None:
-            combos = combos[:max_points]
         points = []
+        seen = set()
         for combo in combos:
             pt = start_coords.copy()
             for (dims, _c), (values, _w) in zip(axes, combo):
                 for dim, val in zip(dims, values):
                     pt[dim] = val
-            points.append(pt % 360.0)
+            pt = pt % periods_deg
+            key = tuple(np.round(pt, 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            points.append(pt)
+            if max_points is not None and len(points) >= max_points:
+                break
         return np.array(points)
 
     # Weighted sampling from the peaks. With no peaked axes at all this degrades
@@ -540,12 +594,12 @@ def plan_initial_points(
             break
         pt = start_coords.copy()
         for d in uniform_dims:
-            pt[d] = rng.uniform(0.0, 360.0)
+            pt[d] = rng.uniform(0.0, float(periods_deg[d]))
         for (dims, candidates), weights in zip(axes, axis_weights):
             values, _w = candidates[rng.choice(len(candidates), p=weights)]
             for dim, val in zip(dims, values):
                 pt[dim] = val
-        pt = pt % 360.0
+        pt = pt % periods_deg
         # Dedup on rounded coordinates: independent draws collide when peaks are
         # few, but distinct uniform-dim values keep otherwise-equal points apart.
         key = tuple(np.round(pt, 3))
@@ -581,18 +635,92 @@ def _evaluate_point(
             guess, state.start_atoms, dihedrals, calc, relaxCalc, relax
         )
         gradient = None
-    # --retain-bonds: a relaxed geometry that changed connectivity is a different
+    # Species guard: a relaxed geometry that changed connectivity is a different
     # species, not a conformer; give it a failure energy so it can never be picked
-    # as best (and drop its gradient so it doesn't bias the GP).
-    if (
-        state.required_bonds is not None
-        and energy < RELAX_FAILURE_ENERGY_EV
-        and bonds_broken(cur_atoms, state.required_bonds)
-    ):
-        state.n_bond_breaks += 1
+    # as best (and drop its gradient so it doesn't bias the GP). Without this a
+    # collapsed geometry reports a hugely negative energy, becomes the incumbent,
+    # and the search never leaves it. The guard also resets the calculators on a
+    # rejected or failed evaluation.
+    if _species_guard(state, cur_atoms, energy, calc, relaxCalc):
         energy = RELAX_FAILURE_ENERGY_EV
         gradient = None
     return energy, cur_atoms, gradient
+
+
+# Perturbation widths tried, in order, when resampling clashed initial guesses.
+# Starts at the ordinary INITIAL_GUESS_STD so a molecule whose guesses are already
+# feasible behaves exactly as before, then narrows. Narrowing is guaranteed to
+# succeed eventually because the start geometry is itself feasible -- and it has to
+# narrow, because on a crowded molecule the feasible fraction collapses with width:
+# measured on m279_d12 (d=12) it is 4.8% at 90 degrees but 72% at 15, and on the
+# bulkier m278_d12, 0.2% at 90 versus 72% at 15. Resampling at a fixed 90 degrees
+# therefore starves the initial design exactly where the search can least afford it.
+_INIT_RESAMPLE_WIDTHS = (INITIAL_GUESS_STD, 60.0, 45.0, 30.0, 20.0, 15.0, 10.0)
+# Oversampling factor per round: draw more than the shortfall so a round with a low
+# acceptance rate can still fill the quota.
+_INIT_RESAMPLE_OVERSAMPLE = 4
+
+
+def _screen_initial_guesses(
+    state: OptimizationState,
+    guesses: list[np.ndarray],
+    rng_seed: int,
+    label: str,
+) -> list[np.ndarray]:
+    """Replace clashed initial guesses with feasible ones drawn near the start.
+
+    Keeps the requested number of guesses: infeasible ones are resampled rather
+    than dropped, so the initial design does not silently shrink. Resampling
+    ANNEALS the perturbation width (see ``_INIT_RESAMPLE_WIDTHS``) instead of
+    retrying at a fixed one -- a narrow feasible guess is worth far more than no
+    guess, and infinitely more than a clashed one, which would be rejected anyway
+    and can leave the calculator in a broken state.
+
+    The trade is diversity: a guess drawn at 15 degrees explores less than one at
+    90. That is the right trade only because the alternative on these molecules is
+    not a wider guess, it is no guess at all.
+    """
+    feasible = state.clash_feasibility
+    guess_array = np.asarray(guesses, dtype=float)
+    keep = feasible(guess_array)
+    n_wanted = len(guess_array)
+    kept = list(guess_array[keep])
+
+    rng = np.random.default_rng(rng_seed + 1)
+    widths_used = []
+    for width in _INIT_RESAMPLE_WIDTHS:
+        if len(kept) >= n_wanted:
+            break
+        shortfall = n_wanted - len(kept)
+        draw = rng.normal(
+            state.start_coords, width,
+            size=(shortfall * _INIT_RESAMPLE_OVERSAMPLE, guess_array.shape[1]),
+        ) % 360.0
+        accepted = draw[feasible(draw)]
+        if len(accepted):
+            kept.extend(accepted[:shortfall])
+            widths_used.append(width)
+
+    n_rejected = n_wanted - int(keep.sum())
+    kept = kept[:n_wanted]
+    if n_rejected:
+        detail = (f" (resampled at {'/'.join(f'{w:g}' for w in widths_used)} deg)"
+                  if widths_used else "")
+        logger.info(
+            f"Clash constraint: {n_rejected} of {n_wanted} initial guesses "
+            f"({label}) were sterically infeasible; {len(kept) - int(keep.sum())} "
+            f"resampled{detail}, {len(kept)} usable."
+        )
+    if len(kept) < n_wanted:
+        # Only screened points are returned: a rejected guess is never sent to the
+        # calculator (it could poison the SCF restart). With none left, the search
+        # simply continues from the start observation already in the state.
+        logger.warning(
+            f"Clash constraint: only {len(kept)} of {n_wanted} initial guesses "
+            f"({label}) are feasible"
+            + ("; continuing from the start structure alone." if not kept else ".")
+        )
+    return kept
 
 
 def _evaluate_initial_guesses(
@@ -627,6 +755,7 @@ def _evaluate_initial_guesses(
     # only the source and a log label differ, so a single evaluation loop follows.
     # Conformer angles are used as reported by get_angle; peak/random guesses are
     # wrapped to [0, 360) so standardization later sees a consistent range.
+    periods_deg = _periods_deg_array(len(dihedrals), state.symmetry_orders)
     if initial_conformers is not None:
         guesses = [
             np.array([d.get_angle(conformer) for d in dihedrals])
@@ -634,17 +763,39 @@ def _evaluate_initial_guesses(
         ]
         label = "provided conformer"
     elif initial_dihedrals is not None:
-        guesses = [np.asarray(g, dtype=float) % 360.0 for g in initial_dihedrals]
+        guesses = [np.asarray(g, dtype=float) % periods_deg for g in initial_dihedrals]
         label = "prior-peak guess"
     else:
         rng = np.random.default_rng(seed)
+        guess_std = np.minimum(INITIAL_GUESS_STD, periods_deg / 2.0)
         guesses = list(
             rng.normal(
-                state.start_coords, INITIAL_GUESS_STD, size=(init_steps, len(dihedrals))
+                state.start_coords, guess_std, size=(init_steps, len(dihedrals))
             )
-            % 360.0
+            % periods_deg
         )
         label = "random initial guess"
+
+    # Screen the initial guesses through the same feasibility region as the BO
+    # candidates. This is not a nicety: the random init design is drawn blind, so
+    # it is the most likely source of a badly clashed geometry, and evaluating one
+    # can leave the calculator in a broken state that corrupts the whole run (see
+    # _reset_calculators). Conformer guesses are screened too: only their TORSIONS
+    # transfer -- _evaluate_point rebuilds every guess on state.start_atoms -- so a
+    # vetted conformer can still clash once its angles land on the start geometry.
+    # User-provided seeds are never replaced by random draws; a clashed one is
+    # dropped.
+    if state.clash_feasibility is not None and guesses:
+        if initial_conformers is not None:
+            keep = np.asarray(state.clash_feasibility(np.asarray(guesses)), dtype=bool)
+            if not keep.all():
+                logger.warning(
+                    f"Clash constraint: dropped {int((~keep).sum())} of {len(guesses)} "
+                    f"provided conformers whose torsions clash on the start structure."
+                )
+            guesses = [g for g, ok in zip(guesses, keep) if ok]
+        else:
+            guesses = _screen_initial_guesses(state, guesses, rng_seed=seed, label=label)
 
     state.init_steps = len(guesses)
     state.reserve(len(guesses))  # size the buffers once for this phase's appends
@@ -727,6 +878,7 @@ def _run_optimization_loop(
     relaxCalc: Calculator,
     relax: bool,
     out_dir: Path | None,
+    seed: int = 0,
 ) -> None:
     """Run the Bayesian optimization loop, updating state in-place.
 
@@ -799,6 +951,7 @@ def _run_optimization_loop(
         #             embedding, available from step 0); takes precedence when enabled.
         #   Phase 2.5 low-mode move -- kick along a data-derived PCA soft mode.
         collective_result = None
+        used_gc = False
         t_collective = 0.0
         if (
             state.category_prob > 0
@@ -841,31 +994,49 @@ def _run_optimization_loop(
             cert_out = ({"t_select": 0.0, "t_eval": 0.0, "t_collective": t_collective}
                         if state.cert_log is not None else None)
         else:
-            # ---- standard BO step: fit the GP and optimize the acquisition ----
+            # ---- standard BO step (or scheduled graph-subtree crossover) ----
+            next_coords = None
             cert_out = {} if state.cert_log is not None else None
-            # Time the two cost centers separately: GP fit/condition + acquisition
-            # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
             _t0 = time.perf_counter()
-            next_coords = _select_next_points_botorch(
-                state.observed_coords, state.observed_energies,
-                prior_module=state.prior_module,
-                prior_exponent=state.prior_exponent,
-                observed_gradients=state.observed_gradients,
-                use_gradients=step_uses_gradients,
-                gp_frozen_hypers=frozen_hypers,
-                gp_hyper_out=hyper_out,
-                cert_out=cert_out,
-                cert_betas=state.cert_betas,
-                acq_num_restarts=state.acq_num_restarts,
-                acq_raw_samples=state.acq_raw_samples,
-                gradient_window=state.gradient_window,
-                gradient_keep=state.gradient_keep,
-                lengthscale_prior=state.lengthscale_prior,
-            )
+            if (
+                state.gc_every > 0
+                and step >= state.gc_warmup
+                and (step % state.gc_every == 0)
+            ):
+                next_coords = _propose_gc_crossover(state, dihedrals)
+                if next_coords is not None:
+                    # No GP fit ran on a GC step, so cert_out keeps no posterior
+                    # fields; the timings are filled in below as for a BO step.
+                    used_gc = True
+                    state.gc_count += 1
+            if next_coords is None:
+                # Time the two cost centers separately: GP fit/condition + acquisition
+                # optimization (t_select) vs the xTB energy evaluation + relaxation (t_eval).
+                next_coords = _select_next_points_botorch(
+                    state.observed_coords, state.observed_energies,
+                    prior_module=state.prior_module,
+                    prior_exponent=state.prior_exponent,
+                    observed_gradients=state.observed_gradients,
+                    use_gradients=step_uses_gradients,
+                    gp_frozen_hypers=frozen_hypers,
+                    gp_hyper_out=hyper_out,
+                    cert_out=cert_out,
+                    cert_betas=state.cert_betas,
+                    acq_num_restarts=state.acq_num_restarts,
+                    acq_raw_samples=state.acq_raw_samples,
+                    gradient_window=state.gradient_window,
+                    gradient_matrix_cap=state.gradient_matrix_cap,
+                    gradient_window_min=state.gradient_window_min,
+                    gradient_keep=state.gradient_keep,
+                    lengthscale_prior=state.lengthscale_prior,
+                    feasible=state.clash_feasibility,
+                    kernel_arm=state.kernel_arm,
+                    feasible_seed_offset=seed + step * _FEASIBLE_MAX_CHUNKS,
+                    symmetry_orders=state.symmetry_orders,
+                )
+                if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
+                    state.grad_gp_hypers = hyper_out["hypers"]
             t_select = time.perf_counter() - _t0
-            if hyper_out:  # a cold fit; carry its hyperparameters forward to freeze
-                state.grad_gp_hypers = hyper_out["hypers"]
-            # logger.info(f'Selected next point: {next_coords}')
 
             _t0 = time.perf_counter()
             energy, cur_atoms, gradient = _evaluate_point(
@@ -873,7 +1044,7 @@ def _run_optimization_loop(
             )
             t_eval = time.perf_counter() - _t0
             if cert_out is not None:
-                cert_out["t_select"] = t_select  # GP + acquisition (incl. certificate)
+                cert_out["t_select"] = t_select  # GP + acquisition (or GC proposal)
                 cert_out["t_eval"] = t_eval      # xTB energy + relaxation
                 # Any collective attempt(s) this step returned None (failed), so we fell
                 # through to the standard BO step. Their attempt time still elapsed, so
@@ -886,6 +1057,8 @@ def _run_optimization_loop(
 
         if rel_energy < state.observed_energies.min().item():
             state.best_step = step
+            if used_gc:
+                state.gc_best_count += 1
             if out_dir is not None:
                 save_structure(out_dir, cur_atoms, "current_best.xyz")
             # Geometry trail: this BO point is a new best-so-far. n_calls matches the
@@ -930,6 +1103,11 @@ def _run_optimization_loop(
             f"Phase 3: {state.category_count} category-tied move(s) of {n_steps} BO "
             f"steps over {n_groups} categor(y/ies) for {len(dihedrals)} dihedrals."
         )
+    if state.gc_every > 0:
+        logger.info(
+            f"Graph-subtree crossover: {state.gc_count} move(s) of {n_steps} BO "
+            f"steps ({state.gc_best_count} set new best)."
+        )
 
 
 def _perform_final_relaxation(
@@ -972,17 +1150,50 @@ def _perform_final_relaxation(
     # Seed from the actual best observation (aligned with best_idx/best_coords),
     # which may come from the initial point, a seeded conformer, a random guess,
     # or the BO loop -- best_step only tracks BO-loop wins, so don't key off it here.
-    best_energy, best_atoms = evaluate_energy(
-        best_coords, state.observed_atoms[best_idx], dihedrals, calc, relaxCalc, steps=None
+    observed_atoms = state.observed_atoms[best_idx].copy()
+    # observed_energies stores E-E0 (relative); convert to absolute energy so
+    # comparisons and E/E-E0 bookkeeping stay consistent.
+    observed_energy = state.observed_energies[best_idx].item() + state.start_energy
+    observed_bonds = geometry_bond_set(observed_atoms)
+
+    constrained_energy, constrained_atoms = evaluate_energy(
+        best_coords, observed_atoms, dihedrals, calc, relaxCalc, steps=None
     )
+    # Guard the constrained tight relaxation against calculator failures,
+    # connectivity changes, or energy regressions (e.g. FixInternals + BFGS
+    # stepping onto a higher-energy surface while still returning a finite energy
+    # below RELAX_FAILURE_ENERGY_EV). Reverting BEFORE releasing constraints lets
+    # the unconstrained relaxation start from the clean best observed geometry.
+    if not np.isfinite(constrained_energy) or constrained_energy >= RELAX_FAILURE_ENERGY_EV:
+        revert_reason = (
+            "Final constrained relaxation failed (calculator error, e.g. SCF "
+            "non-convergence); seeding unconstrained relaxation from best observed."
+        )
+    elif constrained_energy > observed_energy + 1e-6:
+        revert_reason = (
+            f"Final constrained relaxation regressed in energy "
+            f"({constrained_energy - observed_energy:+.4f} eV vs best observed); "
+            f"reverting to best observed geometry."
+        )
+    elif geometry_bond_set(constrained_atoms) != observed_bonds:
+        revert_reason = (
+            "Final constrained relaxation changed connectivity vs best observed; "
+            "reverting to best observed geometry."
+        )
+    else:
+        revert_reason = None
+    if revert_reason is not None:
+        logger.warning(revert_reason)
+        constrained_atoms = observed_atoms.copy()
+        constrained_energy = observed_energy
+
     # (E-E0 is logged once at the end, after any failed-relax fallback, so the value
     # the sweep log-parser reads is always the trustworthy final energy.)
     if state.add_entry is not None:
-        state.add_entry(best_coords, best_atoms, best_energy)
+        state.add_entry(best_coords, constrained_atoms, constrained_energy)
 
     # Relaxation without dihedral constraints
-    constrained_atoms = best_atoms.copy()  # retained-bonds fallback
-    constrained_energy = best_energy  # its energy, restored alongside if we revert
+    best_atoms = constrained_atoms.copy()
     best_atoms.set_constraint()
     # Relax the released geometry directly. Going through evaluate_energy would
     # reapply FixInternals (relax=True re-pins the dihedrals via
@@ -991,27 +1202,22 @@ def _perform_final_relaxation(
     # released one.
     best_energy, best_atoms = relax_structure(best_atoms, calc, relaxCalc, None)
     # If the final tight relaxation walked into a geometry the calculator cannot
-    # evaluate (SCF non-convergence -> sentinel failure energy), the released
-    # structure is garbage and would be written to final.xyz with a nonsense
-    # energy. Fall back to the best geometry we can still trust: the constrained
-    # final relaxation if it succeeded, otherwise the lowest structure actually
-    # observed during the search (which was evaluated successfully to be selected).
-    if best_energy >= RELAX_FAILURE_ENERGY_EV:
-        if constrained_energy < RELAX_FAILURE_ENERGY_EV:
-            logger.warning(
-                "Final unconstrained relaxation failed (calculator error, e.g. SCF "
-                "non-convergence); reverting to the constrained final relaxation."
-            )
-            best_atoms, best_energy = constrained_atoms, constrained_energy
-        else:
-            logger.warning(
-                "Final relaxation failed (calculator error, e.g. SCF non-convergence); "
-                "reverting to the best structure observed during the search."
-            )
-            best_atoms = state.observed_atoms[best_idx].copy()
-            # observed_energies stores E-E0 (relative); restore the absolute energy so
-            # the E/E-E0 bookkeeping below (return, add_entry, logging) stays consistent.
-            best_energy = state.observed_energies[best_idx].item() + state.start_energy
+    # evaluate (SCF non-convergence -> sentinel failure energy) or regressed to a
+    # higher finite energy than the geometry it started from, revert to the
+    # lower-energy constrained/observed geometry.
+    if not np.isfinite(best_energy) or best_energy >= RELAX_FAILURE_ENERGY_EV:
+        logger.warning(
+            "Final unconstrained relaxation failed (calculator error, e.g. SCF "
+            "non-convergence); reverting to the constrained/observed best."
+        )
+        best_atoms, best_energy = constrained_atoms, constrained_energy
+    elif best_energy > constrained_energy + 1e-6:
+        logger.warning(
+            f"Final unconstrained relaxation regressed in energy "
+            f"({best_energy - constrained_energy:+.4f} eV vs constrained/observed best); "
+            f"reverting to the lower-energy geometry."
+        )
+        best_atoms, best_energy = constrained_atoms, constrained_energy
 
     # Species guard (always on): if releasing the dihedral constraints let the
     # geometry FORM or BREAK any bond relative to the constrained final geometry
@@ -1034,9 +1240,13 @@ def _perform_final_relaxation(
         best_atoms, best_energy = constrained_atoms, constrained_energy
 
     # --retain-bonds: if releasing the dihedral constraints let the geometry
-    # rearrange, keep the constrained (bond-preserving) result instead.
-    if state.required_bonds is not None and bonds_broken(
-        best_atoms, state.required_bonds
+    # rearrange, keep the constrained (bond-preserving) result instead (only if
+    # the constrained relaxation actually succeeded).
+    if (
+        state.check_bond_breaks
+        and state.required_bonds is not None
+        and constrained_energy < RELAX_FAILURE_ENERGY_EV
+        and bonds_broken(best_atoms, state.required_bonds)
     ):
         logger.warning(
             "Final unconstrained relaxation broke a bond; "
@@ -1085,6 +1295,8 @@ def run_optimization(
     return_ensemble: bool = False,
     ensemble_seed_geometries: list[Atoms] | None = None,
     opts: RunOptions | None = None,
+    *,
+    mol: Chem.Mol | None = None,
 ) -> Atoms | tuple[Atoms, list[tuple[Atoms, float, float]]]:
     """Optimize the structure of a molecule by iteratively changing the dihedral angles.
 
@@ -1170,17 +1382,19 @@ def run_optimization(
         # current_best.xyz / geometry-trail frame that _perform_final_relaxation's
         # caller emits.
         coords = np.zeros(n_dihedrals, dtype=float)
+        if out_dir is not None or opts.structure_log_path is not None:
+            log_path, ens_path = initialize_structure_log(out_dir, opts.structure_log_path)
+            add_entry = create_structure_logger(log_path, ens_path, energy)
+            add_entry(coords, best_atoms, energy)
         if out_dir is not None:
             if relax:
                 save_structure(out_dir, best_atoms, "relaxed.xyz")
-            log_path, ens_path = initialize_structure_log(out_dir)
-            add_entry = create_structure_logger(log_path, ens_path, energy)
-            add_entry(coords, best_atoms, energy)
             save_structure(out_dir, best_atoms, "current_best.xyz")
         # Benchmark geometry trail (no-op unless --geom-log is set): one 'final'
         # frame, matching _log_improvement_geometry(state, best_atoms, "final").
         if opts.geom_log_path is not None:
             geom_log_path = Path(opts.geom_log_path)
+            geom_log_path.parent.mkdir(parents=True, exist_ok=True)
             geom_log_path.open("w").close()
             append_xyz_frame(
                 geom_log_path, best_atoms, "n_calls=1 e_e0_eV=0.000000 kind=final"
@@ -1197,14 +1411,16 @@ def run_optimization(
     # from torlib SMARTS (category_assignments), independent of the fitted priors;
     # legacy callers that pass only a prior_module still work via its assignments.
     lengthscale_prior = opts.resolve_lengthscale_prior(n_dihedrals)
-    lowmode_prob = opts.resolve_lowmode_prob(n_dihedrals)
+    lowmode_prob = opts.resolve_lowmode_prob(n_dihedrals, relax=relax)
     if category_assignments is None and prior_module is not None:
         category_assignments = getattr(prior_module, "univariate_assignments", None)
     category_groups = (
         _build_category_groups(category_assignments, n_dihedrals)
         if category_assignments is not None else None
     )
-    category_prob = opts.resolve_category_prob(n_dihedrals, category_groups)
+    category_prob = opts.resolve_category_prob(
+        n_dihedrals, category_groups, relax=relax
+    )
 
     # A low-mode move is a kick followed by a constrained + UNCONSTRAINED relaxation
     # (see _low_mode_move); it is meaningless without relaxation and would silently
@@ -1240,7 +1456,9 @@ def run_optimization(
 
     # Setup initial state (relaxation, starting point, logging)
     state = _setup_initial_state(
-        atoms, dihedrals, calc, relaxCalc, relax, out_dir, use_gradients=opts.use_gradients
+        atoms, dihedrals, calc, relaxCalc, relax, out_dir,
+        use_gradients=opts.use_gradients,
+        structure_log_path=opts.structure_log_path,
     )
     # Wire the resolved search/surrogate/move knobs onto the state and seed the
     # collective-move RNGs (see OptimizationState.apply_run_options).
@@ -1259,11 +1477,53 @@ def run_optimization(
             f"{len(state.category_groups)})."
         )
 
-    # --retain-bonds: adopt the (relaxed) start structure's covalent bond set as the
-    # reference every later evaluation must preserve. The start is computed inside
-    # _setup_initial_state above and defines the molecule's connectivity.
-    if opts.retain_bonds:
+    # Species guard: adopt the (relaxed) start structure's covalent bond set as the
+    # reference every later evaluation is compared against. The start is computed
+    # inside _setup_initial_state above and defines the molecule's connectivity.
+    # The bond-formation half runs by default; --retain-bonds adds the breaking half.
+    state.check_bond_forms = opts.species_guard
+    state.check_bond_breaks = opts.retain_bonds
+    if state.check_bond_forms or state.check_bond_breaks:
         state.required_bonds = geometry_bond_set(state.start_atoms)
+
+    # Steric-clash feasibility region for the acquisition optimizer. Needs the
+    # RDKit mol for exact topological distances and polar-H perception; callers
+    # that don't supply one simply search the unconstrained box.
+    if opts.clash_constraint and mol is not None:
+        state.clash_feasibility = build_feasibility(
+            state.start_atoms, mol, dihedrals,
+            threshold=opts.clash_threshold,
+            exclude_hbonds=opts.clash_exclude_hbonds,
+        )
+        if state.clash_feasibility is not None:
+            logger.info(
+                f"Clash constraint active: acquisition restricted to geometries "
+                f"with no non-bonded contact below {opts.clash_threshold:.2f} x "
+                f"sum(vdW) ({state.clash_feasibility.detector.n_pairs} pairs "
+                f"screened, H-bond pairs "
+                f"{'excluded' if opts.clash_exclude_hbonds else 'included'})."
+            )
+    elif opts.clash_constraint:
+        logger.info(
+            "Clash constraint requested but no RDKit mol was supplied to "
+            "run_optimization; searching the unconstrained torsion box."
+        )
+
+    # Graph-aware genetic subtree crossover (Phase 3): auto-enables at d >= 6
+    # when mol is available (or forced via opts.gc_every > 0; 0 disables).
+    gc_every = opts.resolve_gc_every(n_dihedrals, has_mol=mol is not None)
+    if gc_every > 0:
+        gc_cuts = build_graph_cuts(mol, dihedrals)
+        if gc_cuts:
+            state.gc_every = gc_every
+            state.gc_warmup = opts.gc_warmup
+            state.gc_cuts = gc_cuts
+            state.gc_mol = mol
+            state.gc_rng = np.random.default_rng(seed + 77773)
+            logger.info(
+                f"Graph-subtree crossover enabled: every {gc_every} BO step(s) "
+                f"(warmup {opts.gc_warmup}, {len(gc_cuts)} graph cut(s))."
+            )
 
     # Optional per-step stopping-rule certificate log (calibration benchmark).
     if opts.cert_log_path is not None:
@@ -1275,6 +1535,7 @@ def run_optimization(
     # RMSD-identity / distinct-conformer analysis.
     if opts.geom_log_path is not None:
         state.geom_log_path = Path(opts.geom_log_path)
+        state.geom_log_path.parent.mkdir(parents=True, exist_ok=True)
         state.geom_log_path.open("w").close()
 
     # Add prior settings to state
@@ -1289,12 +1550,31 @@ def run_optimization(
     )
 
     # Run Bayesian optimization loop
-    _run_optimization_loop(state, n_steps, dihedrals, calc, relaxCalc, relax, out_dir)
+    _run_optimization_loop(
+        state, n_steps, dihedrals, calc, relaxCalc, relax, out_dir, seed=seed
+    )
 
-    if state.required_bonds is not None and state.n_bond_breaks:
+    if state.n_bond_forms:
+        logger.info(
+            f"Species guard: rejected {state.n_bond_forms} evaluation(s) whose "
+            f"relaxation formed a new bond (collapsed geometry)."
+        )
+    if state.n_bond_breaks:
         logger.info(
             f"--retain-bonds: rejected {state.n_bond_breaks} evaluation(s) that "
-            f"changed connectivity."
+            f"broke a bond."
+        )
+    if state.n_collective_clash_rejects:
+        logger.info(
+            f"Clash constraint: rejected {state.n_collective_clash_rejects} collective "
+            f"move(s) before evaluation."
+        )
+    if state.clash_feasibility is not None and state.clash_feasibility.n_screened:
+        f = state.clash_feasibility
+        logger.info(
+            f"Clash constraint: screened {f.n_screened} candidate geometries, "
+            f"rejected {f.n_rejected} ({100.0 * f.n_rejected / f.n_screened:.1f}%) "
+            f"before any energy evaluation."
         )
 
     if return_ensemble:
@@ -1303,7 +1583,7 @@ def run_optimization(
         # newly discovered basins before the harvest reads it.
         if opts.ensemble_steps != 0:
             _perform_ensemble_exploration(
-                state, dihedrals, calc, relaxCalc, relax, opts
+                state, dihedrals, calc, relaxCalc, relax, opts, seed=seed
             )
         # Select and tightly optimize the low-energy ensemble. The best member
         # is the lowest-energy conformer; fall back to single-best relaxation if

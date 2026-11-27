@@ -23,14 +23,29 @@ normalization, the maximize sign-flip, the value standardization, and the
 matching ``2*pi/std`` gradient scaling), so the plotted GP *is* the acquisition
 GP. The next point is the argmax of LogExpectedImprovement on the plotted grid.
 
+With ``--slice`` the synthetic surface is replaced by a real-molecule 2D dihedral
+slice built by ``scripts/build_bo_slice.py`` (bouquet's own constrained-relaxed
+GFN2 objective, the other rotors anchored at the CREST global minimum); energies
+and gradients are then exact grid lookups and the slice grid is the plotting /
+acquisition grid. ``--composite`` adds a multi-frame summary panel and
+``--seeds`` a convergence curve over random initial designs.
+
 Run:
     KMP_DUPLICATE_LIB_OK=TRUE PYTHONPATH=. pixi run python scripts/plot_bo_2d.py
+
+    # real-molecule slice, manuscript output
+    KMP_DUPLICATE_LIB_OK=TRUE PYTHONPATH=. pixi run python scripts/plot_bo_2d.py \\
+        --slice data/bo_slices/m139_d06_slice_1_2.npz \\
+        --out ~/Devel/bouquet-manuscript/figures/bo_2d \\
+        --n-total 30 --e-max 12 --init 225 325 180 315 305 85 \\
+        --composite 3 10 20 30 --seeds 20
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import sys
 from pathlib import Path
 from typing import List, Tuple
 
@@ -43,11 +58,13 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from botorch.acquisition.analytic import LogExpectedImprovement
-from botorch.models import SingleTaskGP
-from botorch.optim.fit import fit_gpytorch_mll_torch
-from gpytorch.mlls import ExactMarginalLogLikelihood
 
-from bouquet.solver import _periodic_covar_module, _fit_gradient_gp
+from bouquet.config import ENERGY_CLIP_OFFSET
+from bouquet.surrogate import _fit_gradient_gp, _fit_value_gp, make_covar_module
+
+# bo_slice_common is imported only on the --slice / --seeds paths that use it, so the
+# synthetic-surface default runs without it.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 torch.set_default_dtype(torch.float64)
 
@@ -130,7 +147,7 @@ def fit_arm(
     raw_y = torch.tensor(obs_eV, dtype=torch.float64)  # (n,) eV
     x = train_X / 360.0
 
-    energy_cap = 2.0 + torch.log10(torch.clamp(raw_y, min=1.0))
+    energy_cap = ENERGY_CLIP_OFFSET + torch.log10(torch.clamp(raw_y, min=1.0))
     neg = (-1.0 * torch.minimum(raw_y, energy_cap)).unsqueeze(-1)  # (n,1)
     neg_mean = neg.mean(dim=0, keepdim=True)
     y_std = neg.std(dim=0, keepdim=True)
@@ -141,11 +158,7 @@ def fit_arm(
         grad = torch.tensor(obs_grad, dtype=torch.float64)  # (n, 2) eV/rad
         gp = _fit_gradient_gp(x, train_y, raw_y, energy_cap, grad, y_std)
     else:
-        gp = SingleTaskGP(x, train_y, covar_module=_periodic_covar_module(2))
-        mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
-        fit_gpytorch_mll_torch(
-            mll, step_limit=200, optimizer=lambda p: torch.optim.Adam(p, lr=0.01)
-        )
+        gp = _fit_value_gp(x, train_y, covar_module=make_covar_module(2))
     gp.eval()
 
     # Batch query points as (M, 1, d) so each is its own q=1 posterior -- avoids
@@ -223,6 +236,19 @@ def _overlay_points(ax, obs_deg, n_init, next_deg=None, star_color=C_NEXT):
                    c=star_color, edgecolors="white", linewidths=0.8, zorder=6)
 
 
+def _capped_arrows(g, grad_scale, max_deg=45.0):
+    """Downhill arrow components (-gradient), with drawn length capped at ``max_deg``.
+
+    Display only: near clash walls the torsion gradient is orders of magnitude
+    above the median, and an uncapped arrow spans the whole torus. Direction is
+    preserved; the GP itself always conditions on the true gradient.
+    """
+    v = -np.asarray(g, dtype=float)
+    length = np.linalg.norm(v, axis=-1, keepdims=True) / grad_scale  # degrees
+    factor = np.minimum(1.0, max_deg / np.maximum(length, 1e-12))
+    return v * factor
+
+
 def _axfmt(ax, xlabel=True, ylabel=True):
     ax.set_xlim(0, 360)
     ax.set_ylim(0, 360)
@@ -257,15 +283,15 @@ def plot_frame(
     )
 
     # --- true surface ---
-    cf = ax_t.contourf(T1, T2, true_k, levels=e_levels, cmap="viridis")
+    cf = ax_t.contourf(T1, T2, true_k, levels=e_levels, cmap="viridis", extend="max")
     ax_t.contour(T1, T2, true_k, levels=e_levels, colors="white",
                  linewidths=0.3, alpha=0.4)
     ax_t.set_title("True energy surface")
     if use_gradients:
         # downhill arrows (-gradient) at each observation
-        g = obs_grad  # (n,2) eV/rad
+        v = _capped_arrows(obs_grad, grad_scale)  # (n,2), from eV/rad
         ax_t.quiver(
-            obs_deg[:, 0], obs_deg[:, 1], -g[:, 0], -g[:, 1],
+            obs_deg[:, 0], obs_deg[:, 1], v[:, 0], v[:, 1],
             color=C_GRAD, angles="xy", scale_units="xy", scale=grad_scale,
             width=0.006, zorder=4,
         )
@@ -302,84 +328,183 @@ def plot_frame(
     plt.close(fig)
 
 
+def plot_composite(
+    T1, T2, true_k, frames, show_n, n_init, e_levels, out_path, mol_img=None,
+):
+    """Summary figure: GP posterior mean at selected evaluation counts, both arms.
+
+    Rows are the two arms, columns the requested evaluation counts; a leading
+    column shows the true surface (top) and the molecule with the scanned bonds
+    highlighted (bottom), when a depiction is supplied.
+    """
+    names = [("no_gradients", "Value-only GP"), ("gradients", "Gradient-enhanced GP")]
+    lead = 1
+    ncol = len(show_n) + lead
+    fig, axes = plt.subplots(2, ncol, figsize=(3.0 * ncol + 0.8, 6.4),
+                             constrained_layout=True, squeeze=False)
+    M = T1.shape
+
+    ax = axes[0, 0]
+    cf = ax.contourf(T1, T2, true_k, levels=e_levels, cmap="viridis", extend="max")
+    gmin = np.unravel_index(int(true_k.argmin()), M)
+    ax.scatter([T1[gmin]], [T2[gmin]], marker="x", s=60, c="white", lw=2, zorder=6)
+    ax.set_title("True energy surface", fontsize=11)
+    _axfmt(ax, xlabel=False)
+    ax = axes[1, 0]
+    if mol_img is not None:
+        ax.imshow(mol_img)
+        ax.set_title(r"$\theta_1$ red, $\theta_2$ blue", fontsize=10)
+    ax.axis("off")
+
+    for r, (name, label) in enumerate(names):
+        by_n = {f["n"]: f for f in frames[name]}
+        for c, n in enumerate(show_n):
+            ax = axes[r, lead + c]
+            f = by_n[n]
+            res = f["res"]
+            mean_k = (res.mean_eV * EV2KCAL).reshape(M)
+            ax.contourf(T1, T2, mean_k, levels=e_levels, cmap="viridis", extend="both")
+            ax.contour(T1, T2, mean_k, levels=e_levels, colors="white",
+                       linewidths=0.3, alpha=0.4)
+            if name == "gradients":
+                v = _capped_arrows(f["obs_grad"], f["grad_scale"])
+                ax.quiver(f["obs_deg"][:, 0], f["obs_deg"][:, 1], v[:, 0], v[:, 1],
+                          color=C_GRAD, angles="xy", scale_units="xy",
+                          scale=f["grad_scale"], width=0.008, zorder=4)
+            nd = res.next_deg if n < max(by_n) else None
+            _overlay_points(ax, f["obs_deg"], n_init, nd)
+            ax.scatter([T1[gmin]], [T2[gmin]], marker="x", s=50, c="white", lw=1.8, zorder=6)
+            _axfmt(ax, xlabel=(r == 1), ylabel=False)
+            ax.set_title(f"{n} evaluations (best {res.best_eV * EV2KCAL:.2f})"
+                         if r == 0 else f"best {res.best_eV * EV2KCAL:.2f} kcal/mol",
+                         fontsize=10)
+            if c == 0:
+                ax.set_ylabel(f"{label}\n" + r"$\theta_2$ (degrees)")
+    fig.colorbar(cf, ax=axes[:, -1], shrink=0.7, label="kcal/mol")
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # BO driver
 # ---------------------------------------------------------------------------
 def run_arm(
     use_gradients, init_deg, n_total, T1, T2, query_deg, true_k,
     e_levels, sigma_vmax, grad_scale, out_dir,
-) -> list[tuple[int, float]]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    energy_fn=true_energy, grad_fn=true_gradient,
+) -> tuple[list[tuple[int, float]], list[dict]]:
+    """Run one BO arm; write a frame per evaluation unless ``out_dir`` is None.
+
+    Returns the (n_obs, best_eV) history and the per-frame records used for the
+    composite figure.
+    """
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
     n_init = len(init_deg)
 
     obs_deg = np.array(init_deg, dtype=float)  # (n,2)
-    obs_eV = true_energy(obs_deg[:, 0], obs_deg[:, 1])
-    obs_grad = true_gradient(obs_deg[:, 0], obs_deg[:, 1])
+    obs_eV = np.asarray(energy_fn(obs_deg[:, 0], obs_deg[:, 1]), dtype=float)
+    obs_grad = np.asarray(grad_fn(obs_deg[:, 0], obs_deg[:, 1]), dtype=float)
 
     history: list[tuple[int, float]] = []
+    frames: list[dict] = []
     while True:
         n = len(obs_deg)
         res = fit_arm(obs_deg, obs_eV, obs_grad, use_gradients, query_deg)
         history.append((n, res.best_eV))
+        frames.append(dict(n=n, res=res, obs_deg=obs_deg.copy(), obs_grad=obs_grad.copy(),
+                           grad_scale=grad_scale))
         last = n >= n_total
-        plot_frame(
-            T1, T2, true_k, res, obs_deg, obs_grad, use_gradients, n, n_init,
-            e_levels, sigma_vmax, grad_scale, out_dir / f"frame_{n:02d}.pdf",
-            show_next=not last,
-        )
+        if out_dir is not None:
+            plot_frame(
+                T1, T2, true_k, res, obs_deg, obs_grad, use_gradients, n, n_init,
+                e_levels, sigma_vmax, grad_scale, out_dir / f"frame_{n:02d}.pdf",
+                show_next=not last,
+            )
         if last:
             break
         nd = res.next_deg
         obs_deg = np.vstack([obs_deg, nd])
-        obs_eV = np.append(obs_eV, true_energy(nd[0], nd[1]))
-        obs_grad = np.vstack([obs_grad, true_gradient(nd[0], nd[1])])
+        obs_eV = np.append(obs_eV, energy_fn(nd[0], nd[1]))
+        obs_grad = np.vstack([obs_grad, grad_fn(nd[0], nd[1])])
 
-    return history
+    return history, frames
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default="figures/bo_2d")
     ap.add_argument("--n-total", type=int, default=24, help="total evaluations per arm")
-    ap.add_argument("--n-grid", type=int, default=80, help="contour grid resolution per axis")
+    ap.add_argument("--n-grid", type=int, default=80,
+                    help="contour grid resolution per axis (synthetic surface only)")
     ap.add_argument(
-        "--init", type=float, nargs="+", default=[30, 60, 150, 40, 60, 300],
-        help="flat list of initial (theta1, theta2) pairs in degrees; both arms share these",
+        "--init", type=float, nargs="+", default=None,
+        help="flat list of initial (theta1, theta2) pairs in degrees; both arms share "
+             "these (default: 30 60 150 40 60 300; with --slice, snapped to the grid)",
     )
+    ap.add_argument("--slice", default=None,
+                    help="real-molecule 2D slice .npz from scripts/build_bo_slice.py")
+    ap.add_argument("--e-max", type=float, default=None,
+                    help="top of the energy colour scale, kcal/mol (default: surface max)")
+    ap.add_argument("--composite", type=int, nargs="+", default=None,
+                    help="evaluation counts to show in composite.pdf")
+    ap.add_argument("--seeds", type=int, default=0,
+                    help="also run this many random initial designs -> convergence.pdf")
+    ap.add_argument("--seed-n-init", type=int, default=3,
+                    help="initial points per random design (--seeds)")
+    ap.add_argument("--seed-min-kcal", type=float, default=1.0,
+                    help="random designs draw initial points only where E exceeds this "
+                         "(kcal/mol above the minimum), so no design starts already within "
+                         "the 1 kcal/mol success threshold")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    if len(args.init) % 2 != 0:
+    init_flat = args.init if args.init is not None else [30, 60, 150, 40, 60, 300]
+    if len(init_flat) % 2 != 0:
         ap.error(
             f"--init must be a flat list of (theta1, theta2) pairs (even length); "
-            f"got {len(args.init)} values: {args.init}"
+            f"got {len(init_flat)} values: {init_flat}"
         )
-    num_pairs = len(args.init) // 2
+    num_pairs = len(init_flat) // 2
     if args.n_total < num_pairs:
         ap.error(
             f"--n-total ({args.n_total}) must be >= the number of initial pairs "
             f"({num_pairs}) from --init"
         )
-    init = np.array(args.init, dtype=float).reshape(-1, 2)
+    init = np.array(init_flat, dtype=float).reshape(-1, 2)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     _style()
 
-    # dense grid for contours / argmax acquisition
-    g = np.linspace(0.0, 360.0, args.n_grid, endpoint=False)
+    surface = None
+    if args.slice:
+        from bo_slice_common import SliceSurface
+
+        surface = SliceSurface(args.slice)
+        if surface.ndim != 2:
+            ap.error(f"{args.slice} is a {surface.ndim}D slice; use plot_bo_1d.py")
+        g = surface.grid_deg
+        energy_fn, grad_fn = surface.energy, surface.gradient
+        init = surface.snap(init)
+    else:
+        g = np.linspace(0.0, 360.0, args.n_grid, endpoint=False)
+        energy_fn, grad_fn = true_energy, true_gradient
     T1, T2 = np.meshgrid(g, g, indexing="ij")
     query_deg = np.column_stack([T1.ravel(), T2.ravel()])  # (M,2)
-    true_k = true_energy(T1, T2) * EV2KCAL
-    e_levels = np.linspace(0.0, float(true_k.max()), 21)
+    true_k = energy_fn(T1, T2) * EV2KCAL
+    e_max = args.e_max if args.e_max is not None else float(true_k.max())
+    e_levels = np.linspace(0.0, e_max, 21)
 
     gmin = np.unravel_index(int(true_k.argmin()), true_k.shape)
-    print(f"Global minimum near ({g[gmin[0]]:.0f}, {g[gmin[1]]:.0f}) deg; "
+    where = f" [{surface.label()}]" if surface else ""
+    print(f"Global minimum near ({g[gmin[0]]:.0f}, {g[gmin[1]]:.0f}) deg{where}; "
           f"initial points:\n{init}\n")
 
     # Reference uncertainty scale: max sigma from the initial-only value GP, so the
     # sigma colorbar is shared across all frames AND both arms (shows the collapse).
-    ref = fit_arm(init, true_energy(init[:, 0], init[:, 1]),
-                  true_gradient(init[:, 0], init[:, 1]), False, query_deg)
+    ref = fit_arm(init, energy_fn(init[:, 0], init[:, 1]),
+                  grad_fn(init[:, 0], init[:, 1]), False, query_deg)
     sigma_vmax = float((ref.sigma_eV * EV2KCAL).max())
 
     # Quiver scale: map a *typical* (median) gradient magnitude to ~30 deg, so
@@ -387,17 +512,18 @@ def main():
     # clearly visible. Using the global max instead lets the few steep ridges
     # dominate the scale and shrinks every other arrow to near-invisibility;
     # the median is robust to those outliers (steeper points just draw longer).
-    gmag = np.linalg.norm(true_gradient(query_deg[:, 0], query_deg[:, 1]), axis=-1)
+    gmag = np.linalg.norm(grad_fn(query_deg[:, 0], query_deg[:, 1]), axis=-1)
     grad_scale = float(np.median(gmag)) / 30.0
 
-    out_root = Path(args.out)
-    hist = {}
+    out_root = Path(args.out).expanduser()
+    hist, frames = {}, {}
     for use_grad, name in [(False, "no_gradients"), (True, "gradients")]:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
-        hist[name] = run_arm(
+        hist[name], frames[name] = run_arm(
             use_grad, [row for row in init], args.n_total, T1, T2, query_deg,
             true_k, e_levels, sigma_vmax, grad_scale, out_root / name,
+            energy_fn, grad_fn,
         )
         print(f"[{name}] wrote {len(hist[name])} frames to {out_root / name}")
 
@@ -407,6 +533,43 @@ def main():
         reached = next((n for n, b in hist[name] if b <= thr_eV), None)
         msg = f"{reached} evaluations" if reached else f"not within budget ({args.n_total})"
         print(f"  {name:13s}: {msg}")
+
+    if args.composite:
+        bad = [n for n in args.composite if not num_pairs <= n <= args.n_total]
+        if bad:
+            ap.error(f"--composite counts {bad} outside [{num_pairs}, {args.n_total}]")
+        if surface:
+            from bo_slice_common import draw_molecule
+        mol_img = draw_molecule(surface) if surface else None
+        plot_composite(T1, T2, true_k, frames, args.composite, num_pairs, e_levels,
+                       out_root / "composite.pdf", mol_img=mol_img)
+        print(f"\nwrote {out_root / 'composite.pdf'}")
+
+    if args.seeds:
+        from bo_slice_common import plot_convergence
+
+        rng = np.random.default_rng(args.seed)
+        H = {"no_gradients": [], "gradients": []}
+        designs = []
+        for s in range(args.seeds):
+            allowed = np.flatnonzero(true_k.ravel() > args.seed_min_kcal)
+            pick = rng.choice(allowed, size=args.seed_n_init, replace=False)
+            init_s = [row for row in query_deg[pick]]
+            designs.append(query_deg[pick])
+            for use_grad, name in [(False, "no_gradients"), (True, "gradients")]:
+                torch.manual_seed(args.seed + s)
+                h, _ = run_arm(use_grad, init_s, args.n_total, T1, T2, query_deg, true_k,
+                               e_levels, sigma_vmax, grad_scale, None, energy_fn, grad_fn)
+                H[name].append([b * EV2KCAL for _, b in h])
+            print(f"  seed {s + 1}/{args.seeds} done", flush=True)
+        H = {k: np.array(v) for k, v in H.items()}
+        np.savez(out_root / "convergence.npz", designs_deg=np.array(designs), **H)
+        title = surface.label() if surface else "Synthetic 2D surface"
+        print(f"\nConvergence over {args.seeds} random designs "
+              f"(n_init={args.seed_n_init}, initial E > {args.seed_min_kcal:g} kcal/mol):")
+        plot_convergence(H, out_root / "convergence.pdf", f"2D: {title}",
+                         n0=args.seed_n_init)
+        print(f"wrote {out_root / 'convergence.pdf'}")
 
 
 if __name__ == "__main__":

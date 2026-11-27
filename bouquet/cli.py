@@ -1,13 +1,11 @@
-from argparse import SUPPRESS, ArgumentParser
-from datetime import datetime
+from argparse import BooleanOptionalAction, SUPPRESS, ArgumentParser
+import secrets
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-from rdkit import Chem
-
 from bouquet.calculator import CalculatorFactory
 from bouquet.config import (
+    DEFAULT_CLASH_RATIO,
     ACQ_NUM_RESTARTS,
     ACQ_RAW_SAMPLES,
     DEFAULT_CERTIFICATE_BETAS,
@@ -15,7 +13,6 @@ from bouquet.config import (
     DEFAULT_ENSEMBLE_DIVERSITY,
     DEFAULT_ENSEMBLE_EXPLORE_MODE,
     DEFAULT_ENSEMBLE_STEPS,
-    ENSEMBLE_EXPLORE_MODES,
     DEFAULT_INIT_CONFORMER_CAP,
     DEFAULT_INIT_GRID_BUDGET,
     DEFAULT_INIT_METHOD,
@@ -27,28 +24,17 @@ from bouquet.config import (
     DEFAULT_PRIOR_DECAY,
     DEFAULT_PRIOR_EXPONENT,
     DEFAULT_PRIOR_MAX_CONCENTRATION,
+    ENSEMBLE_EXPLORE_MODES,
+    GRADIENT_MATRIX_CAP,
+    GRADIENT_WINDOW_MIN,
+    INIT_METHODS,
+    MAX_AUTO_INIT_STEPS,
+    KERNEL_ARMS,
     Configuration,
     RunOptions,
     format_certificate_betas,
     parse_certificate_betas,
 )
-from bouquet.io import (
-    create_output_directory,
-    save_ensemble,
-    save_run_parameters,
-    save_structure,
-    setup_logging,
-)
-from bouquet.setup import (
-    apply_charge_spin,
-    default_multiplicity,
-    detect_dihedrals,
-    get_conformers_from_file,
-    get_initial_candidates,
-    get_initial_structure_from_file,
-    select_initial_structure,
-)
-from bouquet.solver import plan_initial_points, run_optimization
 
 
 def _resolve_priors_arg(value: Optional[str]) -> Optional[Path]:
@@ -66,13 +52,23 @@ def _resolve_priors_arg(value: Optional[str]) -> Optional[Path]:
     return Path(value)
 
 
-def main():
-    # Parse the command line arguments
+def build_parser() -> ArgumentParser:
+    """Build the bouquet CLI argument parser (kept free of heavy imports)."""
+    available_methods = CalculatorFactory.available_methods()
+
     parser = ArgumentParser(
         description="Optimize molecular conformers using Bayesian optimization"
     )
     parser.add_argument(
-        "--seed", type=int, default=datetime.now().microsecond, help="Random seed"
+        "--list-methods",
+        action="store_true",
+        help="List installed energy/optimizer methods and exit",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed (default: cryptographically random)",
     )
     parser.add_argument(
         "--smiles", type=str, help="SMILES string of molecule to optimize"
@@ -84,10 +80,30 @@ def main():
         "--name", type=str, help="Output name (defaults to SMILES or input file name)"
     )
     parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Explicit output directory (default: solutions/<name>-<seed>-<method>-<hash>)",
+    )
+    parser.add_argument(
         "--conformer-file",
         type=str,
         help="File containing multiple conformers to use as initial guesses "
         "(instead of random sampling). Overrides --init-steps.",
+    )
+    parser.add_argument(
+        "--max-conformers",
+        type=int,
+        default=0,
+        help="Cap on conformers taken from --conformer-file (0 = all). A ring-seed "
+        ".json is cut with --select-rule; other formats are truncated.",
+    )
+    parser.add_argument(
+        "--select-rule",
+        default="energy",
+        help="How to choose which ring-seed conformers to keep under --max-conformers "
+        "(ring-seed .json only): energy, coverage, novelty, diversity, population, "
+        "geometry, hybrid. Default: energy.",
     )
     parser.add_argument(
         "--auto",
@@ -103,18 +119,19 @@ def main():
     parser.add_argument(
         "--init-steps",
         type=int,
-        default=DEFAULT_INIT_STEPS,
-        help="Number of initial guesses to make (ignored if --conformer-file is provided)",
+        default=None,
+        help="Number of initial guesses to make (default: auto-scaled "
+        f"min({MAX_AUTO_INIT_STEPS}, max({DEFAULT_INIT_STEPS}, d + 2)) from the active dihedral count; "
+        "pass an explicit integer to override; ignored if --conformer-file is provided)",
     )
-    # "How to generate initial guesses: 'random' (Gaussian around the "
-    # "start) or 'peaks' (systematic grid / weighted sampling from the "
-    # "dihedral prior peaks). 'peaks' uses built-in priors if --priors is "
-    # "not given, and is ignored when --conformer-file is provided."
     parser.add_argument(
         "--init-method",
-        choices=["random", "peaks"],
+        choices=list(INIT_METHODS),
         default=DEFAULT_INIT_METHOD,
-        help=SUPPRESS,
+        help="How to generate initial guesses (ignored if --conformer-file is "
+        "provided): 'etkdg' (default; dimension-scaled ETKDGv3 + MMFF94 pool "
+        "clustered in symmetry-reduced torsion space), 'random' (Gaussian draws "
+        "around the start geometry), or 'peaks' (prior-peak grid / sampling).",
     )
     # "Maximum systematic peak-grid size for --init-method peaks before "
     # "falling back to weighted sampling of --init-steps points."
@@ -136,21 +153,21 @@ def main():
     )
     parser.add_argument(
         "--method",
-        choices=CalculatorFactory.available_methods(),
+        choices=available_methods,
         default=None,
         help="Shorthand that sets both --energy and --optimizer to the same "
         "method. An explicit --energy or --optimizer overrides it for that role.",
     )
     parser.add_argument(
         "--energy",
-        choices=CalculatorFactory.available_methods(),
+        choices=available_methods,
         default=None,
         help="Energy method (only methods whose dependencies are installed are "
         f"listed). Default: {DEFAULT_ENERGY_METHOD}, or --method if given.",
     )
     parser.add_argument(
         "--optimizer",
-        choices=CalculatorFactory.available_methods(),
+        choices=available_methods,
         default=None,
         help="Optimizer method (only methods whose dependencies are installed "
         f"are listed). Default: {DEFAULT_OPTIMIZER_METHOD}, or --method if given.",
@@ -174,8 +191,20 @@ def main():
     )
     parser.add_argument(
         "--relax",
-        action="store_true",
-        help="Relax the non-dihedral degrees of freedom before computing energy",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Relax non-dihedral degrees of freedom before computing energy "
+        "(default: on; pass --no-relax for rigid torsion scans)",
+    )
+    parser.add_argument(
+        "--drop-h-rotors",
+        dest="drop_h_c3",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Exclude trivial terminal H-only C3 rotors (-CH3, -NH3+, -SiH3) "
+        "from the BO dihedral search when --relax is active so local relaxation "
+        "places them instead of spending BO dimensions on methyl hydrogens "
+        "(default: on; pass --no-drop-h-rotors to include all rotatable bonds).",
     )
     parser.add_argument(
         "--solvent",
@@ -317,6 +346,15 @@ def main():
         help="Enable PiBO priors. Bare --priors uses the bundled fitted priors "
         "(gfn2_priors.json); pass a path for a custom JSON. Omit to leave priors off.",
     )
+    parser.add_argument(
+        "--bivariate-priors",
+        type=str,
+        default=None,
+        help="Path to a JSON file of correlated (2D) dihedral priors. Each entry "
+        "carries a SMARTS pattern, a topology, and a bivariate von Mises mixture; "
+        "matched dihedral pairs are steered jointly instead of independently. "
+        "May be given with or without --priors.",
+    )
     # Initial prior exponent for PiBO (0 to disable, default is 0.5)
     parser.add_argument(
         "--prior-exponent",
@@ -408,6 +446,14 @@ def main():
         default=None,
         help=SUPPRESS,
     )
+    # Hidden (SUPPRESS): benchmark-only. Redirects the per-evaluation
+    # (coords, energy) trail so a sweep can collect every trial in one place.
+    parser.add_argument(
+        "--structure-log",
+        type=str,
+        default=None,
+        help=SUPPRESS,
+    )
     # Hidden (SUPPRESS): acq24 (24 restarts / 24 raw samples) is the validated
     # default -- a paired sweep vs the old 64/64 showed no quality change at ~2x
     # speed (see scripts/acq_sweep.py) -- so it is not a knob worth exposing. Kept
@@ -429,9 +475,26 @@ def main():
         "--gradient-window",
         type=int,
         default=0,  # 0 = no window, default for now
-        help="Gradient GP: keep gradients for only this many high-leverage points "
-        "(0 = all). Shrinks the augmented GP to n + window*d -- a high-d speedup "
-        "that keeps gradients in the active region.",
+        help="Gradient GP: keep gradients for only this many high-leverage points. "
+        "0 (default) derives the window from --gradient-matrix-cap instead; a "
+        "positive value pins it and ignores the cap. Shrinks the augmented GP to "
+        "n + window*d -- a high-d speedup that keeps gradients in the active region.",
+    )
+    parser.add_argument(
+        "--gradient-matrix-cap",
+        type=int,
+        default=GRADIENT_MATRIX_CAP,
+        help="Gradient GP: cap the augmented covariance at N = n + window*d points, "
+        f"deriving the window as (cap - n)/d (default {GRADIENT_MATRIX_CAP}, "
+        "0 = uncapped). Capping N rather than the point count is what bounds cost, "
+        "since per-step acquisition time is ~linear in N and a fixed window still "
+        "grows with d.",
+    )
+    parser.add_argument(
+        "--gradient-window-min",
+        type=int,
+        default=GRADIENT_WINDOW_MIN,
+        help=SUPPRESS,
     )
     parser.add_argument(
         "--gradient-keep",
@@ -440,15 +503,82 @@ def main():
         help=SUPPRESS,
     )
     parser.add_argument(
+        "--kernel",
+        choices=KERNEL_ARMS,
+        default="product",
+        help="GP covariance. 'product' (default) is a product of per-torsion "
+        "periodic kernels sharing ONE lengthscale; 'ard' gives each torsion its own. "
+        "ARD was the only alternative never worse than product in the end-to-end "
+        "search benchmark (54-59%% of paired trials better at every budget) but was "
+        "not significant at the endpoint, so it stays opt-in.",
+    )
+    parser.add_argument(
+        "--gc-every",
+        type=int,
+        default=None,
+        help="Run MMFF-screened graph-subtree crossover every N BO steps to "
+        "recombine distinct low-energy basins (default: auto = every 5 steps "
+        "for d >= 6, off below; set 0 to disable or a positive integer to force "
+        "at any d >= 2).",
+    )
+    parser.add_argument(
         "--retain-bonds",
         action="store_true",
-        help="Reject any evaluated geometry whose covalent bond graph differs from "
-        "the initial structure (the optimizer can rearrange/dissociate strained or "
-        "unusual species into a spurious lower minimum). Such points get a failure "
-        "energy so they're never selected; a final relaxation that breaks bonds "
-        "reverts to the constrained best.",
+        help="Also reject any evaluated geometry that BROKE a bond relative to the "
+        "initial structure (the optimizer can dissociate strained or unusual species "
+        "into a spurious lower minimum). Such points get a failure energy so they're "
+        "never selected; a final relaxation that breaks bonds reverts to the "
+        "constrained best. Bond *formation* is already rejected by default -- see "
+        "--no-species-guard.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-species-guard",
+        dest="species_guard",
+        action="store_false",
+        help="Disable the default rejection of geometries whose relaxation formed a "
+        "new bond. Such a collapse reports a spuriously huge negative energy, becomes "
+        "the incumbent, and traps the search there for the rest of the budget.",
+    )
+    parser.add_argument(
+        "--no-clash-constraint",
+        dest="clash_constraint",
+        action="store_false",
+        help="Search the full torsion box instead of restricting the acquisition "
+        "optimizer to sterically feasible geometries.",
+    )
+    parser.add_argument(
+        "--clash-threshold",
+        type=float,
+        default=DEFAULT_CLASH_RATIO,
+        metavar="RATIO",
+        help="Worst permitted non-bonded contact, as a fraction of the summed van der "
+        "Waals radii, for the acquisition feasibility region. Applied to the rigid "
+        "geometry before relaxation, so it must be looser than a relaxed conformer "
+        f"would show (default {DEFAULT_CLASH_RATIO}; 0.8 is far too tight and "
+        "discards most of the good conformers).",
+    )
+    parser.add_argument(
+        "--clash-include-hbonds",
+        dest="clash_exclude_hbonds",
+        action="store_false",
+        help="Include polar-H...(N,O,F,S) pairs in the clash test. Off by default "
+        "because a real intramolecular H-bond sits near 0.5x the summed vdW radii, so "
+        "screening those pairs rejects exactly the folded conformers worth finding.",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.list_methods:
+        for name, desc in sorted(CalculatorFactory.describe_methods().items()):
+            print(f"{name:10s} {desc}")
+        return
+
+    if args.seed is None:
+        args.seed = secrets.randbelow(2**31)
 
     # --method is shorthand for setting both roles at once. An explicit
     # --energy/--optimizer wins for its role; otherwise fall back to --method,
@@ -466,66 +596,102 @@ def main():
     if args.spin is not None and args.spin < 1:
         parser.error(f"--spin/--multiplicity must be a positive integer, got {args.spin}")
 
-    # Gradient window is a count of points to keep gradients for (0 = all); a
-    # negative value is meaningless and would corrupt the GP windowing logic.
-    if args.gradient_window < 0:
-        parser.error(
-            f"--gradient-window must be >= 0 (0 = all), got {args.gradient_window}"
-        )
-
     # Search / surrogate / benchmark knobs handed to run_optimization (lowmode_modes
-    # has no CLI flag, so it keeps its RunOptions default).
-    run_opts = RunOptions(
-        use_gradients=args.use_gradients,
-        gradient_steps=args.gradient_steps,
-        grad_refit_dense_until=args.grad_refit_dense_until,
-        grad_refit_every=args.grad_refit_every,
-        gradient_window=args.gradient_window,
-        gradient_keep=args.gradient_keep,
-        acq_num_restarts=args.acq_num_restarts,
-        acq_raw_samples=args.acq_raw_samples,
-        lengthscale_prior=args.lengthscale_prior,
-        lowmode_prob=args.lowmode_prob,
-        lowmode_warmup=args.lowmode_warmup,
-        lowmode_kick_deg=args.lowmode_kick_deg,
-        lowmode_kick_dir=args.lowmode_kick_dir,
-        category_prob=args.category_prob,
-        category_warmup=args.category_warmup,
-        category_min_moves=args.category_min_moves,
-        initial_prior_exponent=args.prior_exponent,
-        prior_exponent_decay=args.prior_decay,
-        cert_log_path=Path(args.certificate_log) if args.certificate_log else None,
-        cert_betas=parse_certificate_betas(args.certificate_betas),
-        geom_log_path=Path(args.geometry_log) if args.geometry_log else None,
-        retain_bonds=args.retain_bonds,
-        ensemble_steps=args.ensemble_steps,
-        ensemble_diversity=args.ensemble_diversity,
-        ensemble_explore_mode=args.ensemble_explore_mode,
-    )
+    # has no CLI flag, so it keeps its RunOptions default). Validation lives in
+    # RunOptions.__post_init__ and Configuration.__post_init__.
+    try:
+        run_opts = RunOptions(
+            use_gradients=args.use_gradients,
+            gradient_steps=args.gradient_steps,
+            grad_refit_dense_until=args.grad_refit_dense_until,
+            grad_refit_every=args.grad_refit_every,
+            gradient_window=args.gradient_window,
+            gradient_matrix_cap=args.gradient_matrix_cap,
+            gradient_window_min=args.gradient_window_min,
+            gradient_keep=args.gradient_keep,
+            acq_num_restarts=args.acq_num_restarts,
+            acq_raw_samples=args.acq_raw_samples,
+            lengthscale_prior=args.lengthscale_prior,
+            lowmode_prob=args.lowmode_prob,
+            lowmode_warmup=args.lowmode_warmup,
+            lowmode_kick_deg=args.lowmode_kick_deg,
+            lowmode_kick_dir=args.lowmode_kick_dir,
+            category_prob=args.category_prob,
+            category_warmup=args.category_warmup,
+            category_min_moves=args.category_min_moves,
+            gc_every=args.gc_every,
+            initial_prior_exponent=args.prior_exponent,
+            prior_exponent_decay=args.prior_decay,
+            cert_log_path=Path(args.certificate_log) if args.certificate_log else None,
+            cert_betas=parse_certificate_betas(args.certificate_betas),
+            geom_log_path=Path(args.geometry_log) if args.geometry_log else None,
+            structure_log_path=Path(args.structure_log) if args.structure_log else None,
+            retain_bonds=args.retain_bonds,
+            kernel_arm=args.kernel,
+            species_guard=args.species_guard,
+            clash_constraint=args.clash_constraint,
+            clash_threshold=args.clash_threshold,
+            clash_exclude_hbonds=args.clash_exclude_hbonds,
+            ensemble_steps=args.ensemble_steps,
+            ensemble_diversity=args.ensemble_diversity,
+            ensemble_explore_mode=args.ensemble_explore_mode,
+        )
+        config = Configuration(
+            smiles=args.smiles,
+            input_file=Path(args.file) if args.file else None,
+            name=args.name,
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            conformer_file=Path(args.conformer_file) if args.conformer_file else None,
+            max_conformers=args.max_conformers,
+            max_conformer_rule=args.select_rule,
+            energy_method=args.energy,
+            optimizer_method=args.optimizer,
+            num_steps=args.num_steps,
+            init_steps=args.init_steps,
+            init_method=args.init_method,
+            init_grid_budget=args.init_grid_budget,
+            init_conformer_cap=args.init_conformers,
+            auto_steps=args.auto,
+            relax=args.relax,
+            drop_h_c3=args.drop_h_c3,
+            solvent=args.solvent,
+            seed=args.seed,
+            priors_file=_resolve_priors_arg(args.priors),
+            bivariate_priors_file=(
+                Path(args.bivariate_priors) if args.bivariate_priors else None
+            ),
+            prior_max_concentration=args.prior_max_concentration,
+            prior_background_weight=args.prior_background_weight,
+            ensemble=args.ensemble,
+            run=run_opts,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
-    # Create configuration from parsed arguments
-    config = Configuration(
-        smiles=args.smiles,
-        input_file=Path(args.file) if args.file else None,
-        name=args.name,
-        conformer_file=Path(args.conformer_file) if args.conformer_file else None,
-        energy_method=args.energy,
-        optimizer_method=args.optimizer,
-        num_steps=args.num_steps,
-        init_steps=args.init_steps,
-        init_method=args.init_method,
-        init_grid_budget=args.init_grid_budget,
-        init_conformer_cap=args.init_conformers,
-        auto_steps=args.auto,
-        relax=args.relax,
-        solvent=args.solvent,
-        seed=args.seed,
-        priors_file=_resolve_priors_arg(args.priors),
-        prior_max_concentration=args.prior_max_concentration,
-        prior_background_weight=args.prior_background_weight,
-        ensemble=args.ensemble,
-        run=run_opts,
+    # Defer heavy scientific-stack imports (numpy, rdkit, torch, botorch, ase)
+    # until after argument parsing and validation succeed.
+    import numpy as np
+    from rdkit import Chem
+
+    from bouquet.io import (
+        create_output_directory,
+        save_ensemble,
+        save_run_parameters,
+        save_structure,
+        setup_logging,
     )
+    from bouquet.setup import (
+        align_conformers_to_mol,
+        apply_charge_spin,
+        default_multiplicity,
+        detect_dihedrals,
+        get_conformers_from_file,
+        get_initial_candidates,
+        get_initial_structure_from_file,
+        plan_etkdg_initial_points,
+        select_initial_structure,
+    )
+    from bouquet.solver import plan_initial_points, run_optimization
 
     # Gradient labels are only consistent with the energy objective when the
     # geometry is a constrained minimum of the *energy* calculator. With
@@ -566,11 +732,15 @@ def main():
             "--optimizer (e.g. gfn2/gfnff, which support --solvent directly)."
         )
 
-    # Make an output directory
-    out_dir = create_output_directory(
-        config.name, config.seed, config.energy_method, args.__dict__
-    )
-    config.out_dir = out_dir
+    # Make an output directory (respecting explicit --out-dir if provided)
+    if config.out_dir is not None:
+        out_dir = config.out_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = create_output_directory(
+            config.name, config.seed, config.energy_method, args.__dict__
+        )
+        config.out_dir = out_dir
 
     save_run_parameters(out_dir, args.__dict__)
 
@@ -622,31 +792,37 @@ def main():
     # Pick the lowest-energy ETKDG embedding as the starting structure.
     init_atoms, _ = select_initial_structure(candidates, calc)
 
-    # Detect the dihedral angles
-    dihedrals = detect_dihedrals(mol)
-    logger.info(f"Detected {len(dihedrals)} dihedral angles")
+    # Detect the dihedral angles (drop trivial H-only C3 tops when relaxing
+    # unless opted out via --no-drop-h-rotors).
+    dihedrals = detect_dihedrals(mol, drop_h_c3=config.drop_h_c3 and config.relax)
+    logger.info(f"Detected {len(dihedrals)} active dihedral angles")
 
     # Load conformers if provided
     initial_conformers = None
     if config.conformer_file is not None:
-        initial_conformers = get_conformers_from_file(str(config.conformer_file))
-        logger.info(
-            f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}"
+        initial_conformers = get_conformers_from_file(
+            str(config.conformer_file),
+            max_conformers=config.max_conformers,
+            select_rule=config.max_conformer_rule,
         )
+        picked = (f" (capped at {config.max_conformers} by '{config.max_conformer_rule}')"
+                  if config.max_conformers else "")
+        logger.info(
+            f"Loaded {len(initial_conformers)} conformers from {config.conformer_file}{picked}"
+        )
+        # Torsions index atoms in mol's order: verify each conformer corresponds
+        # atom-for-atom (reordering it if needed; unmappable ones are rejected).
+        initial_conformers = align_conformers_to_mol(initial_conformers, mol, init_atoms)
         # Stamp charge/spin on conformer atoms too, so xtb reads them per-eval.
         for conf in initial_conformers:
             apply_charge_spin(conf, config.charge, config.multiplicity)
-        # Validate that conformers have the same number of atoms
-        for i, conf in enumerate(initial_conformers):
-            if len(conf) != len(init_atoms):
-                raise ValueError(
-                    f"Conformer {i} has {len(conf)} atoms, expected {len(init_atoms)}"
-                )
 
     # Create prior module if priors file provided. This drives PiBO acquisition
     # steering and is only built when --priors is given.
     prior_module = None
-    if config.priors_file is not None:
+    if dihedrals and (
+        config.priors_file is not None or config.bivariate_priors_file is not None
+    ):
         from bouquet.priors import create_prior_module
 
         # Get dihedral atom tuples
@@ -661,10 +837,16 @@ def main():
             mol=mol,
             dihedrals=dihedral_tuples,
             univariate_file=config.priors_file,
+            bivariate_file=config.bivariate_priors_file,
             max_concentration=max_conc,
             background_weight=config.prior_background_weight,
         )
-        logger.info(f"Created prior module from {config.priors_file}")
+        sources = [
+            str(f)
+            for f in (config.priors_file, config.bivariate_priors_file)
+            if f is not None
+        ]
+        logger.info(f"Created prior module from {', '.join(sources)}")
         logger.info(prior_module.describe())
 
     # Assign torsion-library SMARTS categories to every dihedral. This ties chemically-
@@ -679,12 +861,53 @@ def main():
         f"{len(dihedrals)} dihedrals"
     )
 
-    # Plan prior-peak initial guesses (opt-in via --init-method peaks).
-    # Conformers take precedence. Peak-seeding is decoupled from PiBO
-    # acquisition: when no --priors file is given we build a built-ins-only
-    # module purely for seeding, leaving acquisition steering off.
+    # Plan initial guesses from ETKDG+MMFF94 distinct clusters (default) or
+    # prior peaks (--init-method peaks). Conformers take precedence; --init-method
+    # random leaves initial_dihedrals=None for Gaussian draws around the start.
+    init_steps = config.resolve_init_steps(len(dihedrals))
     initial_dihedrals = None
-    if config.init_method == "peaks" and initial_conformers is None:
+    # Under --auto, cap the number of seeded points so the initial design can't
+    # consume the whole budget and leave zero BO refinement (worst on small
+    # molecules, where a peak grid can be >= the auto total).
+    auto_init_cap = (
+        max(1, config.auto_total(len(dihedrals)) - DEFAULT_MIN_AUTO_BO_STEPS)
+        if config.auto_steps
+        else None
+    )
+    if dihedrals and config.init_method == "etkdg" and initial_conformers is None:
+        from bouquet.clash import build_feasibility
+
+        feasible = (
+            build_feasibility(
+                init_atoms,
+                mol,
+                dihedrals,
+                threshold=config.run.clash_threshold,
+                exclude_hbonds=config.run.clash_exclude_hbonds,
+            )
+            if config.run.clash_constraint
+            else None
+        )
+        max_init = init_steps if auto_init_cap is None else min(init_steps, auto_init_cap)
+        planned = plan_etkdg_initial_points(
+            mol,
+            init_atoms,
+            dihedrals,
+            max_points=max_init,
+            seed=config.seed,
+            feasible=feasible,
+        )
+        if len(planned) > 0:
+            initial_dihedrals = planned
+        else:
+            # Carry the --auto cap into the random fallback (max_init == init_steps
+            # outside --auto), so it is also the count the BO budget is reduced by.
+            init_steps = max_init
+            logger.info(
+                "ETKDG cluster seeding found no distinct clash-free clusters; "
+                "falling back to random initial guesses."
+            )
+    elif dihedrals and config.init_method == "peaks" and initial_conformers is None:
         from bouquet.priors import create_prior_module
 
         planning_module = prior_module
@@ -693,22 +916,18 @@ def main():
                 mol=mol, dihedrals=[d.chain for d in dihedrals]
             )
         start_coords = np.array([d.get_angle(init_atoms) for d in dihedrals])
-        # Under --auto, cap the number of seeded points so a large systematic grid
-        # can't consume the whole budget and leave zero BO refinement (worst on
-        # small molecules, where grid size >= the auto total). The grid is
-        # best-first, so the cap keeps the most probable mode combinations.
-        max_init = None
-        if config.auto_steps:
-            total = config.auto_total(len(dihedrals))
-            max_init = max(1, total - DEFAULT_MIN_AUTO_BO_STEPS)
+        # The grid is best-first, so the --auto cap keeps the most probable mode
+        # combinations.
+        max_init = auto_init_cap
         initial_dihedrals = plan_initial_points(
             planning_module,
             len(dihedrals),
             start_coords,
-            config.init_steps,
+            init_steps,
             config.init_grid_budget,
             config.seed,
             max_points=max_init,
+            symmetry_orders=[d.symmetry_order for d in dihedrals],
         )
         logger.info(
             f"Planned {len(initial_dihedrals)} prior-peak initial guesses "
@@ -724,7 +943,7 @@ def main():
     elif initial_dihedrals is not None:
         initial_count = len(initial_dihedrals)
     else:
-        initial_count = config.init_steps
+        initial_count = init_steps
     num_steps = config.compute_auto_steps(len(dihedrals), initial_count)
 
     # Save the initial guess
@@ -750,7 +969,7 @@ def main():
         num_steps,
         calc,
         relaxCalc,
-        config.init_steps,
+        init_steps,
         out_dir,
         relax=config.relax,
         seed=config.seed,
@@ -760,6 +979,7 @@ def main():
         category_assignments=category_assignments,
         return_ensemble=config.ensemble,
         ensemble_seed_geometries=ensemble_seed_geometries,
+        mol=mol,
         opts=config.run,
     )
 

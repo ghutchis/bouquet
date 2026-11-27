@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from bouquet.config import AUTO_STEPS_DEFAULT, AUTO_STEPS_THRESHOLDS  # noqa: E402
+from bouquet.config import auto_total_budget  # noqa: E402
 
 KCAL = 23.060541945  # eV -> kcal/mol
 RHOS = (0.90, 0.95, 0.99)
@@ -178,11 +178,58 @@ def _reopt_curve_worker(task: dict):
     return out
 
 
+def _reopt_curves_for(df: pd.DataFrame, args) -> pd.DataFrame:
+    """Re-optimize trajectory geometries for the (name, seed) trials present in ``df``
+    and return their curves (name, seed, d, n_calls, e_abs). Trials whose molecule lacks
+    a manifest row or a reference E* are skipped (they cannot be scored). Prints a
+    progress line at ~5% increments with a running ETA."""
+    from concurrent.futures import ProcessPoolExecutor
+    import time
+
+    man = pd.read_csv(args.manifest).set_index("mol_id")
+    ref_abs = load_reference_abs(args.reference)
+    tasks = []
+    for (name, seed), _g in df.groupby(["name", "seed"]):
+        if name not in man.index or name not in ref_abs:
+            continue
+        tasks.append({
+            "name": name, "seed": int(seed), "d": int(_g["d"].iloc[0]),
+            "config": _g["config"].iloc[0], "smiles": man.loc[name, "raw_smiles"],
+            "geom_dir": str(args.geom_dir), "method": args.reopt_method,
+            "conn_tol": args.conn_tol,
+        })
+    cols = ["name", "seed", "d", "n_calls", "e_abs"]
+    ntask = len(tasks)
+    if ntask == 0:
+        return pd.DataFrame(columns=cols)
+    print(f"Re-optimizing trajectory geometries for {ntask} trials "
+          f"({args.reopt_method}, {args.workers} workers)...", flush=True)
+    rows = []
+    t0 = time.time()
+    step = max(1, ntask // 20)              # ~5% increments (log-friendly, no \r)
+    with ProcessPoolExecutor(max_workers=args.workers) as ex:
+        for i, o in enumerate(ex.map(_reopt_curve_worker, tasks), 1):
+            for n_calls, e_abs in o["curve"]:
+                rows.append({"name": o["name"], "seed": o["seed"], "d": o["d"],
+                             "n_calls": n_calls, "e_abs": e_abs})
+            if i % step == 0 or i == ntask:
+                el = time.time() - t0
+                eta = el / i * (ntask - i)
+                print(f"  reopt {i}/{ntask} ({100*i//ntask}%)  "
+                      f"elapsed {el:.0f}s  eta ~{eta:.0f}s", flush=True)
+    return pd.DataFrame(rows, columns=cols)
+
+
 def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
     """Energy-criterion events using UNCONSTRAINED re-optimized trajectory geometries
     (the ``--reopt`` path). Same schema as :func:`build_events`, but the hitting time is
     the first n_calls at which the running-min *unconstrained* energy comes within eps of
-    the absolute reference E*. Requires --manifest (SMILES) and --geom-dir."""
+    the absolute reference E*. Requires --manifest (SMILES) and --geom-dir.
+
+    Caching (``--reopt-cache``): three modes. ``--reopt-refresh`` recomputes everything.
+    ``--reopt-incremental`` reuses the cache and computes only the (name, seed) trials
+    missing from it, appending them (ideal as the benchmark grows). The default reuses
+    the cache and DROPS any trial missing from it (fast, for a frozen cache)."""
     from concurrent.futures import ProcessPoolExecutor
 
     # All three inputs are consumed below (reference even on the cache path, via
@@ -198,38 +245,35 @@ def build_events_reopt(df: pd.DataFrame, args) -> pd.DataFrame:
                  "(--manifest SMILES, --geom-dir trajectories, --reference with E_start_eV)")
 
     cache = out_cache = getattr(args, "reopt_cache", None)
-    if cache and Path(cache).exists() and not getattr(args, "reopt_refresh", False):
-        print(f"Reusing cached reopt curves: {cache}")
-        curves = pd.read_csv(cache)
+    refresh = getattr(args, "reopt_refresh", False)
+    incremental = getattr(args, "reopt_incremental", False)
+
+    if cache and Path(cache).exists() and not refresh:
+        cached = pd.read_csv(cache)
         df_pairs = set(zip(df["name"].astype(str), df["seed"].astype(int)))
-        cache_pairs = set(zip(curves["name"].astype(str), curves["seed"].astype(int)))
+        cache_pairs = set(zip(cached["name"].astype(str), cached["seed"].astype(int)))
         missing = df_pairs - cache_pairs
-        if missing:
-            print(f"WARNING: {len(missing)} current trial(s) from {args.cert} are "
-                  f"missing from cached reopt curves {cache} and will be dropped; "
-                  f"re-run with --reopt-refresh to rebuild the cache.")
+        if incremental and missing:
+            # Compute ONLY the trials absent from the cache, then append them.
+            key = list(zip(df["name"].astype(str), df["seed"].astype(int)))
+            miss_df = df[pd.Series([k in missing for k in key], index=df.index)]
+            print(f"Incremental reopt: {len(cache_pairs)} trial(s) reused from cache, "
+                  f"{len(missing)} new to compute.", flush=True)
+            new = _reopt_curves_for(miss_df, args)
+            curves = pd.concat([cached, new], ignore_index=True)
+            if out_cache:
+                curves.to_csv(out_cache, index=False)
+                print(f"updated reopt cache -> {out_cache} ({len(curves)} rows)")
+        else:
+            print(f"Reusing cached reopt curves: {cache}")
+            curves = cached
+            if missing:
+                print(f"WARNING: {len(missing)} current trial(s) from {args.cert} are "
+                      f"missing from cached reopt curves {cache} and will be dropped; "
+                      f"re-run with --reopt-incremental (compute+append the new trials) "
+                      f"or --reopt-refresh (rebuild from scratch).")
     else:
-        man = pd.read_csv(args.manifest).set_index("mol_id")
-        ref_abs = load_reference_abs(args.reference)
-        tasks = []
-        for (name, seed), _g in df.groupby(["name", "seed"]):
-            if name not in man.index or name not in ref_abs:
-                continue
-            tasks.append({
-                "name": name, "seed": int(seed), "d": int(_g["d"].iloc[0]),
-                "config": _g["config"].iloc[0], "smiles": man.loc[name, "raw_smiles"],
-                "geom_dir": str(args.geom_dir), "method": args.reopt_method,
-                "conn_tol": args.conn_tol,
-            })
-        print(f"Re-optimizing trajectory geometries for {len(tasks)} trials "
-              f"({args.reopt_method}, {args.workers} workers)...")
-        rows = []
-        with ProcessPoolExecutor(max_workers=args.workers) as ex:
-            for o in ex.map(_reopt_curve_worker, tasks):
-                for n_calls, e_abs in o["curve"]:
-                    rows.append({"name": o["name"], "seed": o["seed"], "d": o["d"],
-                                 "n_calls": n_calls, "e_abs": e_abs})
-        curves = pd.DataFrame(rows)
+        curves = _reopt_curves_for(df, args)
         if out_cache:
             curves.to_csv(out_cache, index=False)
             print(f"wrote reopt curves -> {out_cache}")
@@ -314,11 +358,9 @@ def build_events(df: pd.DataFrame, eps: float) -> pd.DataFrame:
 
 
 def auto_total(d: int) -> int:
-    """Current --auto total evaluation budget for dihedral count d (baseline)."""
-    for thr, steps in sorted(AUTO_STEPS_THRESHOLDS.items()):
-        if d <= thr:
-            return steps
-    return AUTO_STEPS_DEFAULT
+    """Current --auto total evaluation budget for dihedral count d (baseline). Delegates
+    to bouquet.config so this baseline always tracks the shipped AUTO_STEPS formula."""
+    return auto_total_budget(d)
 
 
 def _first_true(mask: np.ndarray):
@@ -429,7 +471,12 @@ def nstar_table(ev: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("d").reset_index(drop=True)
 
 
-def fit_scaling(d, y, through_origin=True):
+# Exponent-grid bounds for fit_scaling; a fitted p on either edge is not an estimate.
+SCALING_PMIN = 0.5
+SCALING_PMAX = 6.0
+
+
+def fit_scaling(d, y, through_origin=True, pmax=SCALING_PMAX):
     """Fit n* ~ a + b*d^p (least squares over a p grid). Returns (a,b,p,rmse).
 
     ``through_origin`` (default) forces a=0: a molecule with no dihedrals needs no
@@ -437,6 +484,11 @@ def fit_scaling(d, y, through_origin=True):
     fit can return an unphysical negative intercept (usually an artifact of an
     under-populated/outlier d-bin -- filter those out before fitting). Forcing the
     origin is typically within a few percent RMSE of the free fit on clean data.
+
+    ``pmax`` bounds the exponent grid. It was 3.0, and on the d1-9 GFN2 data BOTH the
+    rho=0.90 and rho=0.95 fits returned p = 3.00 exactly -- pinned to the bound, so the
+    reported exponent was the grid edge, not an estimate. A fitted p equal to pmax (or
+    to the 0.5 floor) means the fit is censored and must not be quoted as the law.
     """
     d = np.asarray(d, float)
     y = np.asarray(y, float)
@@ -445,7 +497,8 @@ def fit_scaling(d, y, through_origin=True):
     if len(d) < 3:
         return None
     best = None
-    for p in np.linspace(0.5, 3.0, 101):
+    for p in np.linspace(SCALING_PMIN, pmax,
+                         int(round((pmax - SCALING_PMIN) / 0.025)) + 1):
         if through_origin:
             X = (d ** p)[:, None]
             b = np.linalg.lstsq(X, y, rcond=None)[0]
@@ -554,6 +607,10 @@ def cmd_nstar(df, args, out: Path):
     tab = nstar_table(ev, args.bootstrap, args.seed)
     tab_fit = nstar_table(ev_fit, args.bootstrap, args.seed) if ev_fit is not ev else tab
     tab.to_csv(out / "nstar.csv", index=False)
+    # The scaling law is fitted on tab_fit, NOT on the table printed above. Write that
+    # out too, or a published exponent cannot be reconciled with any file on disk.
+    if tab_fit is not tab:
+        tab_fit.to_csv(out / "nstar_fitclasses.csv", index=False)
     print("n*(d; rho) [xTB calls], censoring-aware (nan = censoring prevents rho):")
     with pd.option_context("display.width", 200):
         print(tab[["d", "n_trials", "n_hit", "reliability",
@@ -562,13 +619,20 @@ def cmd_nstar(df, args, out: Path):
     # that distorts the scaling law (and drove the earlier negative intercept).
     ft = tab_fit[tab_fit.n_trials >= args.min_fit_trials]
     origin = not args.free_intercept
+    if tab_fit is not tab:
+        print("n*(d) restricted to the fit classes (THIS is what the scaling law uses):")
+        with pd.option_context("display.width", 200):
+            print(tab_fit[["d", "n_trials", "n_hit", "reliability",
+                           "nstar_90", "nstar_95", "nstar_99"]].to_string(index=False))
     fits = {}
     for r in RHOS:
         f = fit_scaling(ft.d, ft[f"nstar_{int(r*100)}"], through_origin=origin)
         if f:
             fits[r] = f
+            edge = "  [PINNED TO GRID EDGE -- not an estimate]" if (
+                abs(f[2] - SCALING_PMIN) < 1e-9 or abs(f[2] - SCALING_PMAX) < 1e-9) else ""
             print(f"  scaling n*_{int(r*100)} ~ {f[0]:.1f} + {f[1]:.2f}*d^{f[2]:.2f} "
-                  f"(rmse {f[3]:.1f}{', origin' if origin else ''})")
+                  f"(rmse {f[3]:.1f}{', origin' if origin else ''}){edge}")
     _plot_nstar(tab, fits, out / "nstar.pdf")
     (out / "fitted.json").write_text(json.dumps(
         {"eps_kcal": args.eps,
@@ -1076,6 +1140,10 @@ def main():
                    "the expensive xTB replay runs once (default <out-dir>/reopt_curves.csv)")
     p.add_argument("--reopt-refresh", action="store_true",
                    help="Ignore any --reopt-cache and re-run the re-optimization")
+    p.add_argument("--reopt-incremental", action="store_true",
+                   help="Reuse --reopt-cache and compute ONLY the (name,seed) trials "
+                   "missing from it, appending them to the cache. Ideal for re-runs as "
+                   "the benchmark grows (pays only for new molecules).")
     p.add_argument("--workers", "-w", type=int, default=8,
                    help="Parallel workers for the --reopt re-optimization (default 8)")
     p.add_argument("--conn-tol", type=float, default=1.3,

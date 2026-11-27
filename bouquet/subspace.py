@@ -45,16 +45,16 @@ and level-set ensembles (:meth:`level_set`).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 
 from bouquet.config import KCAL_TO_EV as _KCAL_TO_EV
 
 
-def _wrap_to_pi(x: np.ndarray) -> np.ndarray:
-    """Wrap radians to (-π, π]."""
-    return (x + np.pi) % (2.0 * np.pi) - np.pi
+def _wrap_to_pi(x: np.ndarray, period_rad: np.ndarray | float = 2.0 * np.pi) -> np.ndarray:
+    """Wrap radians to (-period/2, period/2] (default (-π, π])."""
+    half = 0.5 * period_rad
+    return (x + half) % period_rad - half
 
 
 @dataclass
@@ -71,6 +71,8 @@ class LowEnergySubspace:
         temperature_kcal: Boltzmann temperature (kcal/mol) for the covariance weights
             ``exp(-ΔE/kT)``. Smaller = sharper emphasis on the valley floor; ``None``
             uses uniform weights. ΔE is measured from the elite-set minimum.
+        symmetry_orders: Optional per-dihedral rotational symmetry orders
+            ``m_j`` (period = ``2*pi / m_j`` radians).
 
     Populate with :meth:`update` (or :meth:`from_state`), then query
     :meth:`pca_basis` / :meth:`gradient_modes` / :meth:`level_set`. Bases are returned
@@ -82,6 +84,7 @@ class LowEnergySubspace:
     capacity: int = 400
     dedup_thresh_deg: float = 15.0
     temperature_kcal: float | None = 5.0
+    symmetry_orders: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         self._theta: np.ndarray | None = None      # elite torsions, radians (m, d)
@@ -89,6 +92,11 @@ class LowEnergySubspace:
         self._grad: np.ndarray | None = None        # elite gradients, eV/rad (m, d) or NaN
         self._incumbent: np.ndarray | None = None   # radians (d,)
         self._tangent: np.ndarray | None = None     # wrapped Δθ about incumbent (m, d)
+        self._period_rad: np.ndarray | float = (
+            (2.0 * np.pi) / np.asarray(self.symmetry_orders, dtype=float)
+            if self.symmetry_orders is not None and any(m > 1 for m in self.symmetry_orders)
+            else 2.0 * np.pi
+        )
 
     # ---- ingestion -----------------------------------------------------------
     @classmethod
@@ -139,7 +147,7 @@ class LowEnergySubspace:
         self._grad = grads[keep] if grads is not None else None
         # Incumbent = lowest-energy elite point; tangent = wrapped Δθ about it.
         self._incumbent = self._theta[np.argmin(self._energy)].copy()
-        self._tangent = _wrap_to_pi(self._theta - self._incumbent)
+        self._tangent = _wrap_to_pi(self._theta - self._incumbent, self._period_rad)
         return self
 
     def _select_elite(self, theta: np.ndarray, energy: np.ndarray) -> np.ndarray:
@@ -150,20 +158,23 @@ class LowEnergySubspace:
         if self.dedup_thresh_deg <= 0:
             return order[: self.capacity]
         thresh = np.deg2rad(self.dedup_thresh_deg)
-        kept: list[int] = []
-        kept_theta: list[np.ndarray] = []
+        max_k = min(self.capacity, len(order))
+        kept = np.empty(max_k, dtype=int)
+        kept_theta = np.empty((max_k, theta.shape[1]), dtype=float)
+        m = 0
         for i in order:
             ti = theta[i]
-            if kept_theta:
-                d = _wrap_to_pi(np.asarray(kept_theta) - ti)  # (len, d)
+            if m > 0:
+                d = _wrap_to_pi(kept_theta[:m] - ti, self._period_rad)  # (m, d)
                 rms = np.sqrt((d ** 2).mean(axis=1))
                 if rms.min() < thresh:
                     continue
-            kept.append(int(i))
-            kept_theta.append(ti)
-            if len(kept) >= self.capacity:
+            kept[m] = int(i)
+            kept_theta[m] = ti
+            m += 1
+            if m >= max_k:
                 break
-        return np.asarray(kept, dtype=int)
+        return kept[:m]
 
     # ---- weights -------------------------------------------------------------
     @property
@@ -247,7 +258,8 @@ class LowEnergySubspace:
             )
         g = g[valid]
         w = self._weights()[valid]
-        w = w / w.sum()
+        w_sum = float(w.sum())
+        w = (w / w_sum) if w_sum > 0.0 else np.full(len(w), 1.0 / len(w))
         C = (g * w[:, None]).T @ g                   # (d, d), uncentered active subspace
         vals, vecs = np.linalg.eigh(C)               # ascending = soft first
         return vecs[:, :k] if soft else vecs[:, ::-1][:, :k]
