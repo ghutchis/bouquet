@@ -6,7 +6,7 @@ import numpy as np
 from rdkit import Chem
 
 from bouquet.clash import build_feasibility
-from bouquet.config import DEFAULT_INIT_METHOD, etkdg_seed_pool_size
+from bouquet.config import DEFAULT_INIT_METHOD, auto_init_steps, etkdg_seed_pool_size
 from bouquet.setup import (
     _periodic_torsion_rms_deg,
     detect_dihedrals,
@@ -21,6 +21,16 @@ def test_etkdg_seed_pool_size_scales_and_clamps():
     assert etkdg_seed_pool_size(6) == 72
     assert etkdg_seed_pool_size(9) == 108
     assert etkdg_seed_pool_size(15) == 128
+
+
+def test_auto_init_steps_scales_and_clamps():
+    assert auto_init_steps(1) == 5
+    assert auto_init_steps(3) == 5
+    assert auto_init_steps(4) == 6
+    assert auto_init_steps(6) == 8
+    assert auto_init_steps(9) == 11
+    assert auto_init_steps(10) == 12
+    assert auto_init_steps(20) == 12
 
 
 def test_plan_etkdg_initial_points_distinct_clash_free_and_deterministic():
@@ -86,3 +96,5 @@ def test_cli_init_method_default_and_choices():
         parser.parse_args(["--smiles", "CCCC", "--init-method", "peaks"]).init_method
         == "peaks"
     )
+    assert parser.parse_args(["--smiles", "CCCC"]).init_steps is None
+    assert parser.parse_args(["--smiles", "CCCC", "--init-steps", "7"]).init_steps == 7

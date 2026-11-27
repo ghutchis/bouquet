@@ -24,6 +24,7 @@ RELAX_FAILURE_ENERGY_EV = 1000.0
 # Optimization defaults
 DEFAULT_NUM_STEPS = 32
 DEFAULT_INIT_STEPS = 5
+MAX_AUTO_INIT_STEPS = 12
 DEFAULT_RELAXATION_STEPS = 10
 DEFAULT_FMAX = 5e-2
 TIGHT_FMAX = 1e-3
@@ -166,6 +167,17 @@ DEFAULT_ETKDG_FALLBACK_CLUSTER_DEG = 20.0
 # Maximum systematic peak-grid size for --init-method peaks before falling back
 # to weighted sampling (e.g. 3 modes x 3 dihedrals = 27 fits; x4 = 81 does not).
 DEFAULT_INIT_GRID_BUDGET = 64
+
+
+def auto_init_steps(num_dihedrals: int) -> int:
+    """Dimension-scaled initial guess count for BO seeding.
+
+    Returns ``min(MAX_AUTO_INIT_STEPS, max(DEFAULT_INIT_STEPS, d + 2))``
+    (5 for ``d <= 3``, 6..11 for ``d = 4..9``, capped at 12 for ``d >= 10``).
+    Benchmarked against fixed 5 and ``2*d`` at matched total budget on ``d = 6..9``
+    (``d + 2`` beat both fixed 5 and over-seeding ``2*d``).
+    """
+    return min(MAX_AUTO_INIT_STEPS, max(DEFAULT_INIT_STEPS, int(num_dihedrals) + 2))
 
 
 def etkdg_seed_pool_size(num_dihedrals: int) -> int:
@@ -538,7 +550,7 @@ class Configuration:
 
     # Optimization parameters
     num_steps: int = DEFAULT_NUM_STEPS
-    init_steps: int = DEFAULT_INIT_STEPS
+    init_steps: Optional[int] = None
     init_method: str = DEFAULT_INIT_METHOD
     init_grid_budget: int = DEFAULT_INIT_GRID_BUDGET
     init_conformer_cap: int = DEFAULT_INIT_CONFORMER_CAP
@@ -607,6 +619,13 @@ class Configuration:
                 self.name = self.smiles
             elif self.input_file is not None:
                 self.name = self.input_file.stem
+
+    def resolve_init_steps(self, num_dihedrals: int) -> int:
+        """Resolve the initial guess count: explicit ``init_steps`` if set, else
+        :func:`auto_init_steps` scaled from the active dihedral count."""
+        if self.init_steps is not None:
+            return self.init_steps
+        return auto_init_steps(num_dihedrals)
 
     def auto_total(self, num_dihedrals: int) -> int:
         """Total --auto evaluation budget (initial guesses + BO steps).

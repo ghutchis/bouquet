@@ -120,8 +120,10 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--init-steps",
         type=int,
-        default=DEFAULT_INIT_STEPS,
-        help="Number of initial guesses to make (ignored if --conformer-file is provided)",
+        default=None,
+        help="Number of initial guesses to make (default: auto-scaled "
+        f"min({12}, max({DEFAULT_INIT_STEPS}, d + 2)) from the active dihedral count; "
+        "pass an explicit integer to override; ignored if --conformer-file is provided)",
     )
     parser.add_argument(
         "--init-method",
@@ -855,6 +857,7 @@ def main(argv=None):
     # Plan initial guesses from ETKDG+MMFF94 distinct clusters (default) or
     # prior peaks (--init-method peaks). Conformers take precedence; --init-method
     # random leaves initial_dihedrals=None for Gaussian draws around the start.
+    init_steps = config.resolve_init_steps(len(dihedrals))
     initial_dihedrals = None
     if dihedrals and config.init_method == "etkdg" and initial_conformers is None:
         from bouquet.clash import build_feasibility
@@ -870,7 +873,7 @@ def main(argv=None):
             if config.run.clash_constraint
             else None
         )
-        max_init = config.init_steps
+        max_init = init_steps
         if config.auto_steps:
             total = config.auto_total(len(dihedrals))
             max_init = min(max_init, max(1, total - DEFAULT_MIN_AUTO_BO_STEPS))
@@ -912,7 +915,7 @@ def main(argv=None):
             planning_module,
             len(dihedrals),
             start_coords,
-            config.init_steps,
+            init_steps,
             config.init_grid_budget,
             config.seed,
             max_points=max_init,
@@ -932,7 +935,7 @@ def main(argv=None):
     elif initial_dihedrals is not None:
         initial_count = len(initial_dihedrals)
     else:
-        initial_count = config.init_steps
+        initial_count = init_steps
     num_steps = config.compute_auto_steps(len(dihedrals), initial_count)
 
     # Save the initial guess
@@ -958,7 +961,7 @@ def main(argv=None):
         num_steps,
         calc,
         relaxCalc,
-        config.init_steps,
+        init_steps,
         out_dir,
         relax=config.relax,
         seed=config.seed,

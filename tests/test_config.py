@@ -44,7 +44,10 @@ class TestConfiguration:
         assert config.energy_method == "gfn2"
         assert config.optimizer_method == "gfnff"
         assert config.num_steps == DEFAULT_NUM_STEPS
-        assert config.init_steps == DEFAULT_INIT_STEPS
+        assert config.init_steps is None
+        assert config.resolve_init_steps(1) == DEFAULT_INIT_STEPS
+        assert config.resolve_init_steps(7) == 9
+        assert config.resolve_init_steps(15) == 12
         assert config.auto_steps is False
         assert config.relax is True
         assert config.num_threads == 4
